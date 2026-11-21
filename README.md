@@ -82,7 +82,7 @@ fn run_script() {
 Contributions are welcome! Whether you are fixing a typo, adding a new Python built-in, or improving docs for fellow Rust learners, feel free to open an issue or submit a pull request.
 
 
-## Licanse
+## License
 
 Licensed under either of Apache License, Version 2.0
 
