@@ -1,6 +1,8 @@
 # Target configuration
 EMBEDDED_TARGET := thumbv7em-none-eabihf
 
+FILE ?= hello.py
+
 .PHONY: all check test run build-embedded clean
 
 # Default target: run host tests and verify bare-metal compilation
@@ -15,9 +17,9 @@ check:
 test:
 	cargo test
 
-# Run the host CLI runner (src/main.rs)
+# Run the host CLI runner (src/main.rs) with a Python script
 run:
-	cargo run
+	cargo run -- $(FILE)
 
 # Verify that src/lib.rs compiles cleanly in strict #![no_std] mode
 build-embedded:

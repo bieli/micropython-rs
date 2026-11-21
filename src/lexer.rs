@@ -9,6 +9,7 @@ pub enum Token<'a> {
     Ident(&'a str),
     Str(&'a str),
     Int(i64),
+    Assign,
     LParen,
     RParen,
     Comma,
@@ -37,7 +38,6 @@ impl<'a> Lexer<'a> {
     }
 
     pub fn next_token(&mut self) -> Result<Token<'a>, Error> {
-        // Skip horizontal whitespace (spaces/tabs)
         while let Some(ch) = self.peek() {
             if ch == ' ' || ch == '\t' || ch == '\r' {
                 self.advance();
@@ -54,12 +54,12 @@ impl<'a> Lexer<'a> {
             '(' => Ok(Token::LParen),
             ')' => Ok(Token::RParen),
             ',' => Ok(Token::Comma),
+            '=' => Ok(Token::Assign),
             '\n' => Ok(Token::Newline),
             '\'' | '"' => self.lex_string(ch),
             '0'..='9' => self.lex_int(ch),
             c if c.is_ascii_alphabetic() || c == '_' => self.lex_ident(c),
             '#' => {
-                // Skip comments until newline
                 while let Some(c) = self.peek() {
                     if c == '\n' {
                         break;
@@ -77,7 +77,7 @@ impl<'a> Lexer<'a> {
         while let Some(ch) = self.peek() {
             if ch == quote {
                 let end = self.pos;
-                self.advance(); // consume closing quote
+                self.advance();
                 return Ok(Token::Str(&self.src[start..end]));
             }
             self.advance();
