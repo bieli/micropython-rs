@@ -68,13 +68,13 @@ fn run_script() {
 
 ## TODO list
 
-[x] Zero-copy Lexer (print, strings, integers, comments)
-[x] Stack-allocated AST Parser & Evaluator
-[x] #![no_std] ARM Cortex-M build verification
-[ ] running external hello.py file with Python code by interpreter (instead of hardcoded version!)
-[ ] Variables and basic arithmetic (+, -, *, /)
-[ ] Control flow (if / else, while loops with indentation tracking)
-[ ] Compact Bytecode Compiler & Stack VM
+- [x] Zero-copy Lexer (print, strings, integers, comments)
+- [x] Stack-allocated AST Parser & Evaluator
+- [x] #![no_std] ARM Cortex-M build verification
+- [ ] running external hello.py file with Python code by interpreter (instead of hardcoded version!)
+- [ ] Variables and basic arithmetic (+, -, *, /)
+- [ ] Control flow (if / else, while loops with indentation tracking)
+- [ ] Compact Bytecode Compiler & Stack VM
 
 
 ## Contributing
