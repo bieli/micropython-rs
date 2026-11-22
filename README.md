@@ -1,4 +1,11 @@
 # micropython-rs
+
+![CI status](https://github.com/bieli/micropython-rs/actions/workflows/ci.yml/badge.svg)
+![github_tag](https://img.shields.io/github/v/tag/bieli/micropython-rs)
+[![Crates.io](https://img.shields.io/crates/v/micropython_rs.svg)](https://crates.io/crates/micropython_rs)
+[![docs.rs](https://img.shields.io/docsrs/micropython_rs)](https://docs.rs/micropython_rs)
+
+
 MicroPython virtual machine written in RUST language for embedded systems
 
 
