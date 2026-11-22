@@ -20,6 +20,9 @@ pub enum Token<'a> {
     Pass,
     Def,
     Return,
+    Import,
+    From,
+    As,
     And,
     Or,
     Not,
@@ -56,6 +59,8 @@ pub enum Token<'a> {
     RParen,
     Comma,
     Colon,
+    /// `.` in `module.name`
+    Dot,
     /// `;` between statements on one line
     Semicolon,
     Newline,
@@ -163,6 +168,7 @@ impl<'a> Lexer<'a> {
             ',' => Token::Comma,
             ':' => Token::Colon,
             ';' => Token::Semicolon,
+            '.' => Token::Dot,
             '~' => Token::Tilde,
             '\n' => Token::Newline,
             '=' => self.op_or_eq(Token::Assign, Token::EqEq),
@@ -303,6 +309,9 @@ impl<'a> Lexer<'a> {
             "pass" => Token::Pass,
             "def" => Token::Def,
             "return" => Token::Return,
+            "import" => Token::Import,
+            "from" => Token::From,
+            "as" => Token::As,
             "and" => Token::And,
             "or" => Token::Or,
             "not" => Token::Not,
@@ -462,6 +471,31 @@ mod tests {
     fn test_comment_at_eof_without_newline() {
         let (tokens, count) = collect_tokens::<4>("42 # comment at very end");
         assert_eq!(&tokens[..count], &[Token::Int(42)]);
+    }
+
+    #[test]
+    fn test_import_tokens() {
+        let (tokens, count) = collect_tokens::<12>("import display as d\nfrom m import x\n");
+        assert_eq!(
+            &tokens[..count],
+            &[
+                Token::Import,
+                Token::Ident("display"),
+                Token::As,
+                Token::Ident("d"),
+                Token::Newline,
+                Token::From,
+                Token::Ident("m"),
+                Token::Import,
+                Token::Ident("x"),
+                Token::Newline,
+            ]
+        );
+        let (tokens, count) = collect_tokens::<4>("d.line");
+        assert_eq!(
+            &tokens[..count],
+            &[Token::Ident("d"), Token::Dot, Token::Ident("line")]
+        );
     }
 
     #[test]

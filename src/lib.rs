@@ -34,6 +34,12 @@ pub enum Error {
     ValueError,
     /// A hardware operation failed, e.g. an I2C device did not answer.
     IoError,
+    /// `import` of a module the bridge doesn't provide, or `from m import x`
+    /// of a name the module doesn't have.
+    ImportError,
+    /// `module.name` for a name the module doesn't have, or `.` on a value
+    /// that isn't a module.
+    AttributeError,
 }
 
 pub trait Output {
@@ -122,6 +128,20 @@ const fn count_params(params: &str) -> u8 {
     count
 }
 
+/// A native module, written in Rust and imported by scripts with `import`:
+/// `import display` then `display.line(0, 0, 10, 10)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Module {
+    pub name: &'static str,
+    /// One-line description for `help()`.
+    pub doc: &'static str,
+    /// Functions, called through `HardwareBridge::call_module`. Argument
+    /// counts are checked before the call.
+    pub functions: &'static [HwFn],
+    /// Integer constants, e.g. `display.WIDTH`.
+    pub constants: &'static [(&'static str, i64)],
+}
+
 /// Connects scripts to hardware. Implement `call` for integer-only functions,
 /// or `call_args` to also receive strings. All methods have defaults, so a
 /// bridge implements only what it needs.
@@ -153,6 +173,23 @@ pub trait HardwareBridge {
     /// Variables with the same name take precedence.
     fn constants(&self) -> &[(&'static str, i64)] {
         &[]
+    }
+
+    /// Native modules scripts can `import`.
+    fn modules(&self) -> &[Module] {
+        &[]
+    }
+
+    /// Called for `module.function(args)` (also through an alias or
+    /// `from module import function`), with the module's real name. The
+    /// function exists in the module's table and the argument count fits.
+    fn call_module(
+        &mut self,
+        _module: &str,
+        _name: &str,
+        _args: &[Arg<'_>],
+    ) -> Result<Option<i64>, Error> {
+        Err(Error::UnknownIdentifier)
     }
 }
 

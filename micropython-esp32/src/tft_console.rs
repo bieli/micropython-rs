@@ -1,8 +1,8 @@
 use embedded_graphics::{
     mono_font::{ascii::FONT_6X10, MonoTextStyleBuilder},
-    pixelcolor::Rgb565,
+    pixelcolor::{raw::RawU16, Rgb565},
     prelude::*,
-    primitives::{PrimitiveStyle, Rectangle},
+    primitives::{Circle, Line, PrimitiveStyle, Rectangle, StyledDrawable, Triangle},
     text::{Baseline, Text},
 };
 use embedded_hal_bus::spi::ExclusiveDevice;
@@ -39,6 +39,23 @@ const DEFAULT_COLOR: Rgb565 = Rgb565::CSS_LIGHT_GREEN;
 /// Lines to move up when the screen is full. Redrawing the text area costs
 /// ~25 ms, so scrolling half a screen at a time keeps long output fast.
 const SCROLL_LINES: i32 = MAX_ROWS / 2;
+
+/// The whole screen, used to clip drawing: mipidsi doesn't clip per-pixel
+/// drawing itself, so pixels off the screen would wrap around.
+const SCREEN: Rectangle = Rectangle::new(
+    Point::new(0, 0),
+    Size::new(SCREEN_WIDTH as u32, SCREEN_HEIGHT as u32),
+);
+
+/// A script color (RGB565 as a 16-bit integer) as an embedded-graphics color.
+pub fn color_from_rgb565(value: u16) -> Rgb565 {
+    RawU16::new(value).into()
+}
+
+/// 8-bit RGB components packed as RGB565, like MicroPython's `color565()`.
+pub fn rgb565(r: u8, g: u8, b: u8) -> u16 {
+    Rgb565::new(r >> 3, g >> 2, b >> 3).into_storage()
+}
 
 /// One console line is rendered into this RAM strip (240 x 12 pixels,
 /// 5.6 KB) and sent to the display in a single SPI transfer, instead of one
@@ -172,7 +189,16 @@ impl<'d> TftConsole<'d> {
     /// console's scrolling text. Characters that aren't printable ASCII are
     /// shown as `?`.
     pub fn draw_text(&mut self, x: i32, y: i32, s: &str) {
-        let style = text_style(self.color);
+        self.draw_text_colored(x, y, s, self.color, Rgb565::BLACK);
+    }
+
+    /// `draw_text` with explicit text and background colors.
+    pub fn draw_text_colored(&mut self, x: i32, y: i32, s: &str, fg: Rgb565, bg: Rgb565) {
+        let style = MonoTextStyleBuilder::new()
+            .font(&FONT_6X10)
+            .text_color(fg)
+            .background_color(bg)
+            .build();
         let mut buf = [0u8; MAX_COLS as usize];
         let mut x = x;
         // Draw in chunks so long strings don't need a big buffer
@@ -182,9 +208,53 @@ impl<'d> TftConsole<'d> {
             }
             let text = core::str::from_utf8(&buf[..chunk.len()]).unwrap_or("");
             let _ = Text::with_baseline(text, Point::new(x, y), style, Baseline::Top)
-                .draw(&mut self.display);
+                .draw(&mut self.display.clipped(&SCREEN));
             x += chunk.len() as i32 * CHAR_W;
         }
+    }
+
+    /// Fills the whole screen with `color` and moves the console cursor to the top.
+    pub fn fill_screen(&mut self, color: Rgb565) {
+        let _ = self.display.clear(color);
+        self.col = 0;
+        self.row = 0;
+        self.line_lens = [0; MAX_ROWS as usize];
+        self.dirty = false;
+    }
+
+    pub fn draw_pixel(&mut self, x: i32, y: i32, color: Rgb565) {
+        let _ = Pixel(Point::new(x, y), color).draw(&mut self.display.clipped(&SCREEN));
+    }
+
+    pub fn draw_line(&mut self, from: Point, to: Point, color: Rgb565) {
+        self.paint(&Line::new(from, to), color, false);
+    }
+
+    pub fn draw_rect(&mut self, top_left: Point, size: Size, color: Rgb565, fill: bool) {
+        self.paint(&Rectangle::new(top_left, size), color, fill);
+    }
+
+    /// A circle around `center`; `radius` 0 is a single pixel.
+    pub fn draw_circle(&mut self, center: Point, radius: u32, color: Rgb565, fill: bool) {
+        self.paint(&Circle::with_center(center, 2 * radius + 1), color, fill);
+    }
+
+    pub fn draw_triangle(&mut self, corners: [Point; 3], color: Rgb565, fill: bool) {
+        let [a, b, c] = corners;
+        self.paint(&Triangle::new(a, b, c), color, fill);
+    }
+
+    /// Draws a shape outlined (1 px) or filled, clipped to the screen.
+    fn paint<S>(&mut self, shape: &S, color: Rgb565, fill: bool)
+    where
+        S: StyledDrawable<PrimitiveStyle<Rgb565>, Color = Rgb565>,
+    {
+        let style = if fill {
+            PrimitiveStyle::with_fill(color)
+        } else {
+            PrimitiveStyle::with_stroke(color, 1)
+        };
+        let _ = shape.draw_styled(&style, &mut self.display.clipped(&SCREEN));
     }
 
     /// Fills a rectangle in the current color (`fill == false` clears it to black).
@@ -217,21 +287,21 @@ impl<'d> TftConsole<'d> {
             *len = 0;
         }
         for row in 0..MAX_ROWS {
-            self.draw_line(row);
+            self.render_row(row);
         }
     }
 
     /// Draws the current line if it changed.
     fn flush_line(&mut self) {
         if self.dirty {
-            self.draw_line(self.row);
+            self.render_row(self.row);
             self.dirty = false;
         }
     }
 
     /// Renders one console line into the RAM strip and sends it to the
     /// display in one transfer.
-    fn draw_line(&mut self, row: i32) {
+    fn render_row(&mut self, row: i32) {
         let len = self.line_lens[row as usize] as usize;
         self.strip.px.fill(Rgb565::BLACK);
         // Lines only hold printable ASCII (see `put_char`)

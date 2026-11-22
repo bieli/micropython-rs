@@ -80,8 +80,9 @@ flags |= 1 << 3                   # bitwise & | ^ ~ << >> and augmented assignme
 | Assignment | `x = ...`, and `+= -= *= /= //= %= **= &= \|= ^= <<= >>=` |
 | Statements | `if`/`elif`/`else`, `while`, `break`, `continue`, `pass`, `def`, `return`; `;` between statements (`x = 1; y = 2`) |
 | Calls | `print(...)`, your own `def` functions, and hardware functions from `HardwareBridge` |
+| Modules | `import m`, `import m as x, n`, `from m import f, C as K`; `m.f(...)`, `m.CONST` for native modules written in Rust |
 
-Not supported yet: `for`, lists/dicts/tuples, floats, string operations, `global`, classes, imports.
+Not supported yet: `for`, lists/dicts/tuples, floats, string operations, `global`, classes, importing `.py` files.
 See [ROADMAP.md](ROADMAP.md) for what's planned.
 
 ### Arithmetic operators
@@ -281,6 +282,53 @@ impl HardwareBridge for MyBoard {
 Return `Error::ValueError` for bad values (a pin that doesn't exist) and `Error::IoError` when the hardware fails
 (an I2C device that doesn't answer).
 
+### Native modules (`import`)
+
+A bridge can also offer **modules**: groups of functions and constants written in Rust that scripts load with `import`,
+the way MicroPython's `machine` or `time` work.
+
+```rust
+use micropython_rs::{Arg, Error, HardwareBridge, HwFn, Module};
+
+const LED_MODULE: Module = Module {
+    name: "led",
+    doc: "The onboard LED",
+    functions: &[
+        HwFn::new("on", "", "LED on"),
+        HwFn::with_args("blink", 1, 2, "times, [ms]", "Blink the LED"),
+    ],
+    constants: &[("PIN", 2)],
+};
+
+impl HardwareBridge for MyBoard {
+    fn modules(&self) -> &[Module] { &[LED_MODULE] }
+
+    fn call_module(&mut self, module: &str, name: &str, args: &[Arg<'_>]) -> Result<Option<i64>, Error> {
+        match (module, name) {
+            ("led", "on") => { /* ... */ Ok(None) }
+            ("led", "blink") => { let ms = args.get(1).map_or(Ok(200), |a| a.int())?; /* ... */ Ok(None) }
+            _ => Err(Error::UnknownIdentifier),
+        }
+    }
+}
+```
+
+```python
+import led                  # binds the module to `led`; without import, `led` is unknown
+led.blink(3, 100)
+print(led.PIN, led)         # 2 <module 'led'>
+from led import blink as b  # functions and constants can be imported by name
+b(2)
+help(led)                   # lists the module's functions and constants
+```
+
+* `call_module` always gets the module's real name, also when the script used `import led as l` or `from led import blink`.
+* Argument counts are checked against the module's `HwFn` table before `call_module` runs.
+* `import nope` and `from led import nope` raise `Error::ImportError`. `led.nope` raises `Error::AttributeError`.
+* Modules and their functions are values: `f = led.on; f()` works, and `help()` lists the modules a bridge offers.
+* In the RPN code, `led.blink(3)` becomes `[Ident(led), Int(3), CallAttr { blink, 1 }]`: the module is an ordinary
+  value on the stack, so every item still holds at most one string (24 bytes per item).
+
 ### Building a REPL
 
 `vm.set_interactive(true)` makes top-level expression statements print their value, like Python's prompt
@@ -414,6 +462,7 @@ boot, or run `tools/mpy.py erase`.
 | [`scripts/i2c_scan.py`](micropython-esp32/scripts/i2c_scan.py) | Scanning the I²C bus and reading a register |
 | [`scripts/adc.py`](micropython-esp32/scripts/adc.py) | Averaging ADC samples and converting them to millivolts |
 | [`scripts/tft_clock.py`](micropython-esp32/scripts/tft_clock.py) | An uptime clock drawn with `text()` (TTGO only) |
+| [`scripts/display_demo.py`](micropython-esp32/scripts/display_demo.py) | `import display`: lines, rectangles, circles, triangles, pixels and text, with timings (TTGO only) |
 | [`scripts/watchdog.py`](micropython-esp32/scripts/watchdog.py) | The watchdog resetting a hung script, and `reset_cause()` after the reboot |
 | [`scripts/errors.py`](micropython-esp32/scripts/errors.py) | A forbidden pin reported as `ValueError` with its line number |
 
@@ -432,6 +481,46 @@ Pins are plain GPIO numbers.
 | Watchdog | `wdt_enable(timeout_ms)`, `wdt_feed()`, `wdt_disable()` | The RTC watchdog resets the whole board when it isn't fed in time. `sleep_ms` feeds it automatically every 100 ms |
 | System | `reset()`, `reset_cause()` | `reset_cause()` returns `PWRON_RESET`, `HARD_RESET`, `WDT_RESET`, `DEEPSLEEP_RESET` or `SOFT_RESET` (MicroPython's values). The firmware also prints the reset reason at boot |
 | TFT (`tft` only) | `cls()`, `color(r, g, b)`, `text(x, y, s)`, `rect(x, y, w, h)`, `backlight(on)` | `color` sets the text and fill color (0–255 per channel). `text` and `rect` draw at pixel positions. `WIDTH` and `HEIGHT` are 240 and 135 |
+
+#### Modules
+
+| Module | Builds | Contents |
+|--------|--------|----------|
+| `time` | both | `sleep(s)`, `sleep_ms(ms)`, `sleep_us(us)`, `ticks_ms()`, `ticks_us()`, `ticks_diff(new, old)`, with MicroPython's names, so `import time; time.sleep_ms(100)` works as on MicroPython |
+| `display` | `tft` | Drawing on the 240 × 135 TFT. See below |
+
+```python
+import display
+from display import WIDTH, HEIGHT, rgb
+
+display.fill(display.BLACK)
+display.rect(0, 0, WIDTH, HEIGHT)                            # color is optional: WHITE
+display.line(0, 0, WIDTH - 1, HEIGHT - 1, display.RED)
+display.fill_circle(120, 67, 30, rgb(255, 128, 0))
+display.fill_triangle(170, 120, 230, 120, 200, 70, display.MAGENTA)
+display.text(8, 120, 'hello', display.YELLOW, display.BLUE)  # text color, background
+```
+
+| `display` function | Draws |
+|--------------------|-------|
+| `fill(color)` | The whole screen. Also moves the console cursor to the top |
+| `pixel(x, y, [color])` | One pixel |
+| `line(x0, y0, x1, y1, [color])`, `hline(x, y, w, [color])`, `vline(x, y, h, [color])` | Lines |
+| `rect(x, y, w, h, [color])`, `fill_rect(...)` | Rectangle outline / filled |
+| `circle(x, y, r, [color])`, `fill_circle(...)` | Circle around (x, y) with radius r |
+| `triangle(x0, y0, x1, y1, x2, y2, [color])`, `fill_triangle(...)` | Triangle outline / filled |
+| `text(x, y, s, [color], [bg])` | Text in the 6 × 10 font, top-left corner at (x, y) |
+| `rgb(r, g, b)` | Returns the RGB565 color for 0–255 components |
+
+* Colors are RGB565 integers, like MicroPython's `st7789` drivers. The constants are `BLACK`, `WHITE`, `RED`, `GREEN`,
+  `BLUE`, `YELLOW`, `CYAN`, `MAGENTA`, `ORANGE` and `GRAY`, plus `WIDTH` and `HEIGHT`. The color defaults to `WHITE`.
+* Shapes may extend past the screen edges; drawing is clipped. Coordinates and sizes beyond ±4096 raise `ValueError`,
+  so a typo like `circle(0, 0, 10**9)` can't keep the board busy.
+* Timings on the TTGO: full-screen `fill` 22 ms, a full diagonal line under 1 ms, 20 lines from a script loop 132 ms
+  (mostly the interpreter loop).
+* The console text and the drawing share the screen: `print()` output scrolls over drawings, so call `display.fill()`
+  first and draw after printing.
+* The older flat functions (`cls`, `color`, `text`, `rect`, `backlight`) still work.
 
 Constants: `OUT`, `IN`, `IN_PULLUP`, `IN_PULLDOWN`, `HIGH`, `LOW` and the `*_RESET` values in both builds;
 `LED` (2) and `BOOT_BUTTON` (0) in the generic build; `BUTTON_L` (0), `BUTTON_R` (35), `BAT_ADC` (34) and `ADC_EN` (14) on the TTGO.
@@ -463,9 +552,10 @@ print('stopped after', ticks_ms(), 'ms')
 | File | Purpose |
 |------|---------|
 | `micropython-esp32/src/bin/main.rs` | Entry point. Each board has a `#[cfg(feature = ...)]` `main()`, a `HardwareBridge` adding its own functions on top of `Board`, and its function and constant tables |
-| `micropython-esp32/src/board.rs` | `Board`: time, GPIO, ADC, PWM, I²C, watchdog and reset functions for every build, plus the `board_functions!` and `board_constants!` table macros |
+| `micropython-esp32/src/board.rs` | `Board`: time, GPIO, ADC, PWM, I²C, watchdog and reset functions for every build, the `time` module, and the `board_functions!` and `board_constants!` table macros |
 | `micropython-esp32/src/serial_console.rs` | `EspSerialOut`, an `Output` that writes `print()` text to USB/UART with `esp_println` |
-| `micropython-esp32/src/tft_console.rs` | `TftConsole`: the scrolling text console and drawing functions on the ST7789 (only compiled with `tft`) |
+| `micropython-esp32/src/tft_console.rs` | `TftConsole`: the scrolling text console and drawing primitives on the ST7789 (only compiled with `tft`) |
+| `micropython-esp32/src/display_module.rs` | The `display` module: its function table, constants and argument checks (only compiled with `tft`) |
 | `micropython-esp32/src/repl.rs` | The REPL: boot script, line editing, blocks, paste mode, soft reset, and the raw REPL protocol |
 | `micropython-esp32/src/serial_input.rs` | UART0 receive interrupt: fills a 2 KB ring buffer and sets the global `ABORT` flag on Ctrl-C |
 | `micropython-esp32/src/script_store.rs` | `main.py` in the `nvs` flash partition (`esp-storage`), with a header and checksum |
@@ -684,6 +774,7 @@ help() lists functions. Ctrl-C stops a script, Ctrl-D soft resets, Ctrl-E pastes
 - [x] Scripts loaded from `.py` files at build time (`make flash SCRIPT=...`)
 - [x] REPL over USB serial with Ctrl-C, paste mode and soft reset; MicroPython raw REPL (`mpremote run/exec`)
 - [x] `main.py` saved in flash and uploaded over USB (`tools/mpy.py save`)
+- [x] `import` of native modules written in Rust: `time` and a `display` drawing module (pixels, lines, shapes, text)
 - [ ] Compact Bytecode Compiler & Stack VM
 
 

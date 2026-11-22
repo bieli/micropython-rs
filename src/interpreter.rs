@@ -22,7 +22,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use crate::ast_parser::{
     BinOp, CmpOp, Code, Expr, Item, Parser, Stmt, MAX_CALL_ARGS, MAX_EXPR_ITEMS, MAX_PARAMS,
 };
-use crate::{Arg, Error, HardwareBridge, NoHardware, Output};
+use crate::{Arg, Error, HardwareBridge, Module, NoHardware, Output};
 
 /// Variable slots, shared by globals and the locals of active function calls.
 pub const MAX_VARS: usize = 32;
@@ -42,6 +42,13 @@ pub enum Value<'a> {
     Bool(bool),
     Int(i64),
     Str(&'a str),
+    /// An imported native module (index into `HardwareBridge::modules()`).
+    Module(u8),
+    /// A function of a native module, e.g. after `from display import line`.
+    NativeFn {
+        module: u8,
+        func: u8,
+    },
 }
 
 impl Value<'_> {
@@ -52,6 +59,7 @@ impl Value<'_> {
             Value::Bool(b) => b,
             Value::Int(n) => n != 0,
             Value::Str(s) => !s.is_empty(),
+            Value::Module(_) | Value::NativeFn { .. } => true,
         }
     }
 
@@ -433,6 +441,29 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
             Stmt::While(cond) => {
                 return self.exec_while(cond, start, parser, indent, run, ctx, code)
             }
+            Stmt::Import { names, count } => {
+                if run {
+                    for &(module, bound) in &names[..count] {
+                        let index = self.find_module(module).ok_or(Error::ImportError)?;
+                        self.set_var(bound, Value::Module(index))?;
+                    }
+                }
+            }
+            Stmt::FromImport {
+                module,
+                names,
+                count,
+            } => {
+                if run {
+                    let index = self.find_module(module).ok_or(Error::ImportError)?;
+                    for &(name, bound) in &names[..count] {
+                        let val = self
+                            .module_attr(index, name)
+                            .map_err(|_| Error::ImportError)?;
+                        self.set_var(bound, val)?;
+                    }
+                }
+            }
             Stmt::Def {
                 name,
                 params,
@@ -750,6 +781,22 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
                     args[..argc as usize].copy_from_slice(&stack[sp..sp + argc as usize]);
                     self.call_function(name, &args[..argc as usize])?
                 }
+                Item::GetAttr(attr) => {
+                    sp -= 1;
+                    let module = as_module(stack[sp])?;
+                    self.module_attr(module, attr)?
+                }
+                Item::CallAttr { attr, argc } => {
+                    sp -= argc as usize;
+                    let mut args = [Value::None; MAX_CALL_ARGS];
+                    args[..argc as usize].copy_from_slice(&stack[sp..sp + argc as usize]);
+                    sp -= 1;
+                    let module = as_module(stack[sp])?;
+                    let func = self
+                        .module_func(module, attr)
+                        .ok_or(Error::AttributeError)?;
+                    self.call_native(module, func, &args[..argc as usize])?
+                }
             };
             if sp >= MAX_EVAL_STACK {
                 return Err(Error::OutOfMemory);
@@ -769,6 +816,10 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
     /// Arguments are already evaluated, so a failing argument means nothing is
     /// printed or sent to hardware (like Python).
     fn call_function(&mut self, name: &str, args: &[Value<'a>]) -> Result<Value<'a>, Error> {
+        // A variable holding a module function (`from display import line`)
+        if let Ok(Value::NativeFn { module, func }) = self.get_var(name) {
+            return self.call_native(module, func, args);
+        }
         if let Some(func) = self.find_func(name) {
             return self.call_user_func(func, args);
         }
@@ -785,10 +836,11 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
         }
 
         if name == "help" {
-            if !args.is_empty() {
-                return Err(Error::TypeError);
+            match args {
+                [] => self.print_help(),
+                [Value::Module(module)] => self.print_module_help(*module),
+                _ => return Err(Error::TypeError),
             }
-            self.print_help();
             return Ok(Value::None);
         }
 
@@ -820,6 +872,105 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
         })
     }
 
+    // ------------------------------------------------------------------
+    // Native modules
+    // ------------------------------------------------------------------
+
+    fn modules(&self) -> &[Module] {
+        self.hw.as_ref().map_or(&[], |hw| hw.modules())
+    }
+
+    fn find_module(&self, name: &str) -> Option<u8> {
+        self.modules()
+            .iter()
+            .position(|m| m.name == name)
+            .map(|i| i as u8)
+    }
+
+    fn module_func(&self, module: u8, name: &str) -> Option<u8> {
+        self.modules()
+            .get(module as usize)?
+            .functions
+            .iter()
+            .position(|f| f.name == name)
+            .map(|i| i as u8)
+    }
+
+    /// `module.name`: a constant, or a function value.
+    fn module_attr(&self, module: u8, name: &str) -> Result<Value<'a>, Error> {
+        if let Some(func) = self.module_func(module, name) {
+            return Ok(Value::NativeFn { module, func });
+        }
+        self.modules()
+            .get(module as usize)
+            .and_then(|m| m.constants.iter().find(|(n, _)| *n == name))
+            .map(|&(_, val)| Value::Int(val))
+            .ok_or(Error::AttributeError)
+    }
+
+    /// Calls a native module function after checking its argument count.
+    fn call_native(
+        &mut self,
+        module: u8,
+        func: u8,
+        args: &[Value<'a>],
+    ) -> Result<Value<'a>, Error> {
+        let (module_name, spec) = {
+            let m = &self.modules()[module as usize];
+            (m.name, m.functions[func as usize])
+        };
+        if args.len() < spec.min_args as usize || args.len() > spec.max_args as usize {
+            return Err(Error::TypeError);
+        }
+        let mut hw_args = [Arg::Int(0); MAX_CALL_ARGS];
+        for (slot, val) in hw_args.iter_mut().zip(args) {
+            *slot = match *val {
+                Value::Str(s) => Arg::Str(s),
+                other => Arg::Int(other.as_int().ok_or(Error::TypeError)?),
+            };
+        }
+        let hw = self.hw.as_mut().ok_or(Error::UnknownIdentifier)?;
+        Ok(
+            match hw.call_module(module_name, spec.name, &hw_args[..args.len()])? {
+                Some(n) => Value::Int(n),
+                None => Value::None,
+            },
+        )
+    }
+
+    /// `help(module)`: its functions and constants.
+    fn print_module_help(&mut self, module: u8) {
+        let Some(&m) = self.modules().get(module as usize) else {
+            return;
+        };
+        for part in ["Module ", m.name] {
+            self.out.write_str(part);
+        }
+        if !m.doc.is_empty() {
+            self.out.write_str(" - ");
+            self.out.write_str(m.doc);
+        }
+        self.out.write_str("\n");
+        for f in m.functions {
+            for part in ["  ", m.name, ".", f.name, "(", f.params, ")"] {
+                self.out.write_str(part);
+            }
+            if !f.doc.is_empty() {
+                self.out.write_str(" - ");
+                self.out.write_str(f.doc);
+            }
+            self.out.write_str("\n");
+        }
+        if !m.constants.is_empty() {
+            self.out.write_str("Constants:\n ");
+            for (name, _) in m.constants {
+                self.out.write_str(" ");
+                self.out.write_str(name);
+            }
+            self.out.write_str("\n");
+        }
+    }
+
     /// `help()`: lists built-ins, the script's functions, and the hardware
     /// functions and constants of the bridge.
     fn print_help(&mut self) {
@@ -845,7 +996,16 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
         let Some(hw) = self.hw.as_ref() else {
             return;
         };
-        let (functions, constants) = (hw.functions(), hw.constants());
+        let (functions, constants, modules) = (hw.functions(), hw.constants(), hw.modules());
+        if !modules.is_empty() {
+            self.out
+                .write_str("Modules (import them, then help(module)):\n ");
+            for m in modules {
+                self.out.write_str(" ");
+                self.out.write_str(m.name);
+            }
+            self.out.write_str("\n");
+        }
         if !functions.is_empty() {
             self.out.write_str("Hardware:\n");
         }
@@ -876,6 +1036,23 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
             Value::Bool(false) => self.out.write_str("False"),
             Value::Str(s) => self.out.write_str(s),
             Value::Int(n) => self.write_i64(n),
+            Value::Module(module) => {
+                let name = self.modules().get(module as usize).map_or("?", |m| m.name);
+                for part in ["<module '", name, "'>"] {
+                    self.out.write_str(part);
+                }
+            }
+            Value::NativeFn { module, func } => {
+                let (m, f) = self.modules().get(module as usize).map_or(("?", "?"), |m| {
+                    (
+                        m.name,
+                        m.functions.get(func as usize).map_or("?", |f| f.name),
+                    )
+                });
+                for part in ["<function ", m, ".", f, ">"] {
+                    self.out.write_str(part);
+                }
+            }
         }
     }
 
@@ -922,6 +1099,14 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
     }
 }
 
+/// The module in `val`, for `val.attr`; other values have no attributes.
+fn as_module(val: Value<'_>) -> Result<u8, Error> {
+    match val {
+        Value::Module(module) => Ok(module),
+        _ => Err(Error::AttributeError),
+    }
+}
+
 /// Binary operator on values. Ints and bools mix like in Python (`True + 1 == 2`);
 /// `&`, `|`, `^` on two bools give a bool.
 fn binop<'a>(op: BinOp, lhs: Value<'a>, rhs: Value<'a>) -> Result<Value<'a>, Error> {
@@ -945,7 +1130,10 @@ fn compare(op: CmpOp, lhs: Value<'_>, rhs: Value<'_>) -> Result<bool, Error> {
         _ => match (lhs.as_int(), rhs.as_int()) {
             (Some(a), Some(b)) => a.cmp(&b),
             _ => {
-                let equal = matches!((lhs, rhs), (Value::None, Value::None));
+                // None == None, and a module or function equals itself
+                let equal = matches!((lhs, rhs), (Value::None, Value::None))
+                    || matches!((lhs, rhs), (Value::Module(_) | Value::NativeFn { .. }, _))
+                        && lhs == rhs;
                 return match op {
                     CmpOp::Eq => Ok(equal),
                     CmpOp::Ne => Ok(!equal),
@@ -1993,6 +2181,179 @@ print(fact(7), fib(7))
             run_err("if 1: x = 1; while 1: pass").0,
             Error::InvalidSyntax
         );
+    }
+
+    /// A bridge with two native modules: `gfx` (drawing log) and `clock`.
+    struct ModuleHardware {
+        pixels: i64,
+        last_line: [i64; 5],
+        text: [u8; 16],
+        text_len: usize,
+    }
+
+    const GFX: crate::Module = crate::Module {
+        name: "gfx",
+        doc: "Test drawing",
+        functions: &[
+            crate::HwFn::new("pixel", "x, y", "Set a pixel"),
+            crate::HwFn::with_args("line", 4, 5, "x0, y0, x1, y1, [color]", "Draw a line"),
+            crate::HwFn::new("text", "s", ""),
+            crate::HwFn::new("count", "", "Pixels drawn"),
+        ],
+        constants: &[("WIDTH", 240), ("RED", 0xF800)],
+    };
+    const CLOCK: crate::Module = crate::Module {
+        name: "clock",
+        doc: "",
+        functions: &[crate::HwFn::new("now", "", "")],
+        constants: &[],
+    };
+
+    impl ModuleHardware {
+        fn new() -> Self {
+            Self {
+                pixels: 0,
+                last_line: [0; 5],
+                text: [0; 16],
+                text_len: 0,
+            }
+        }
+    }
+
+    impl HardwareBridge for ModuleHardware {
+        fn modules(&self) -> &[crate::Module] {
+            &[GFX, CLOCK]
+        }
+
+        fn call_module(
+            &mut self,
+            module: &str,
+            name: &str,
+            args: &[Arg<'_>],
+        ) -> Result<Option<i64>, Error> {
+            match (module, name) {
+                ("gfx", "pixel") => {
+                    self.pixels += 1;
+                    Ok(None)
+                }
+                ("gfx", "line") => {
+                    for (slot, arg) in self.last_line.iter_mut().zip(args) {
+                        *slot = arg.int()?;
+                    }
+                    if args.len() == 4 {
+                        self.last_line[4] = 0xFFFF; // default color
+                    }
+                    Ok(None)
+                }
+                ("gfx", "text") => {
+                    let s = args[0].str()?;
+                    self.text[..s.len()].copy_from_slice(s.as_bytes());
+                    self.text_len = s.len();
+                    Ok(None)
+                }
+                ("gfx", "count") => Ok(Some(self.pixels)),
+                ("clock", "now") => Ok(Some(1234)),
+                _ => Err(Error::UnknownIdentifier),
+            }
+        }
+    }
+
+    #[test]
+    fn test_import_and_module_calls() {
+        let mut out = MockOut::new();
+        let mut hw = ModuleHardware::new();
+        let mut vm = Interpreter::with_hardware(&mut out, &mut hw);
+        let src = r#"
+import gfx
+gfx.pixel(1, 2)
+gfx.pixel(3, 4)
+gfx.line(0, 0, gfx.WIDTH - 1, 10, gfx.RED)
+print(gfx.count(), gfx.WIDTH)
+
+import gfx as g, clock
+g.text('hi')
+print(clock.now())
+
+from gfx import pixel, line as ln, RED, WIDTH as W
+pixel(5, 6)
+ln(1, 2, 3, 4)
+print(RED, W, gfx.count())
+
+def draw(n):
+    i = 0
+    while i < n:
+        pixel(i, i)
+        i += 1
+    return gfx.count()
+
+print(draw(3))
+f = gfx.pixel
+f(0, 0)
+print(gfx.count(), gfx, f, ln)
+print(gfx == g, gfx == clock, f == gfx.pixel)
+"#;
+        vm.eval(src).unwrap();
+        assert_eq!(
+            out.as_str(),
+            "2 240\n1234\n63488 240 3\n6\n7 <module 'gfx'> <function gfx.pixel> <function gfx.line>\nTrue False True\n"
+        );
+        assert_eq!(hw.last_line, [1, 2, 3, 4, 0xFFFF]);
+        assert_eq!(&hw.text[..hw.text_len], b"hi");
+    }
+
+    #[test]
+    fn test_import_errors() {
+        let mut out = MockOut::new();
+        let mut hw = ModuleHardware::new();
+        let mut vm = Interpreter::with_hardware(&mut out, &mut hw);
+        // Modules must be imported before use
+        assert_eq!(vm.eval("gfx.pixel(1, 2)"), Err(Error::UnknownIdentifier));
+        assert_eq!(vm.eval("import nope"), Err(Error::ImportError));
+        assert_eq!(vm.eval("from nope import x"), Err(Error::ImportError));
+        assert_eq!(vm.eval("from gfx import nope"), Err(Error::ImportError));
+        vm.eval("import gfx\nx = 5").unwrap();
+        assert_eq!(vm.eval("gfx.nope(1)"), Err(Error::AttributeError));
+        assert_eq!(vm.eval("print(gfx.NOPE)"), Err(Error::AttributeError));
+        assert_eq!(vm.eval("x.pixel(1, 2)"), Err(Error::AttributeError));
+        // Argument counts come from the module table
+        assert_eq!(vm.eval("gfx.pixel(1)"), Err(Error::TypeError));
+        assert_eq!(vm.eval("gfx.line(1, 2, 3)"), Err(Error::TypeError));
+        assert_eq!(vm.eval("gfx.line(1, 2, 3, 4, 5, 6)"), Err(Error::TypeError));
+        assert_eq!(vm.eval("gfx.text(1)"), Err(Error::TypeError));
+        assert_eq!(vm.eval("gfx + 1"), Err(Error::TypeError));
+        assert_eq!(vm.error_line(), Some(1));
+
+        // Without a bridge there are no modules
+        let mut out = MockOut::new();
+        let mut vm = Interpreter::new(&mut out);
+        assert_eq!(vm.eval("import gfx"), Err(Error::ImportError));
+    }
+
+    #[test]
+    fn test_module_help_and_repl_echo() {
+        let mut out = MockOut::new();
+        let mut hw = ModuleHardware::new();
+        let mut vm = Interpreter::with_hardware(&mut out, &mut hw);
+        vm.eval("import gfx\nhelp(gfx)").unwrap();
+        vm.set_interactive(true);
+        vm.eval("gfx").unwrap();
+        vm.eval("gfx.WIDTH").unwrap();
+        assert_eq!(vm.eval("help(5)"), Err(Error::TypeError));
+        assert_eq!(
+            out.as_str(),
+            "Module gfx - Test drawing\n  gfx.pixel(x, y) - Set a pixel\n  \
+             gfx.line(x0, y0, x1, y1, [color]) - Draw a line\n  gfx.text(s)\n  \
+             gfx.count() - Pixels drawn\nConstants:\n  WIDTH RED\n<module 'gfx'>\n240\n"
+        );
+
+        let mut out = MockOut::new();
+        let mut hw = ModuleHardware::new();
+        Interpreter::with_hardware(&mut out, &mut hw)
+            .eval("help()")
+            .unwrap();
+        assert!(out
+            .as_str()
+            .ends_with("Modules (import them, then help(module)):\n  gfx clock\n"));
     }
 
     #[test]

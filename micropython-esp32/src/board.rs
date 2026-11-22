@@ -22,7 +22,7 @@ use esp_hal::{
     time::{Duration, Instant, Rate},
     Blocking,
 };
-use micropython_rs::{Arg, Error};
+use micropython_rs::{Arg, Error, HwFn, Module};
 
 /// Pin modes for `pin_mode(pin, mode)`; also exported as script constants.
 pub const OUT: i64 = 1;
@@ -36,6 +36,21 @@ pub const HARD_RESET: i64 = 2;
 pub const WDT_RESET: i64 = 3;
 pub const DEEPSLEEP_RESET: i64 = 4;
 pub const SOFT_RESET: i64 = 5;
+
+/// `import time`: MicroPython's `time` module names for the time functions.
+pub const TIME_MODULE: Module = Module {
+    name: "time",
+    doc: "Delays and timestamps (MicroPython names)",
+    functions: &[
+        HwFn::new("sleep", "s", "Wait s seconds"),
+        HwFn::new("sleep_ms", "ms", "Wait ms milliseconds"),
+        HwFn::new("sleep_us", "us", "Wait us microseconds"),
+        HwFn::new("ticks_ms", "", "Milliseconds since boot"),
+        HwFn::new("ticks_us", "", "Microseconds since boot"),
+        HwFn::new("ticks_diff", "new, old", "new - old"),
+    ],
+    constants: &[],
+};
 
 /// Pins wired to the ADC: the input-only GPIO34/36/39, so analog inputs
 /// never collide with digital outputs.
@@ -246,6 +261,24 @@ impl<'d> Board<'d> {
             }
             "reset" => esp_hal::system::software_reset(),
             "reset_cause" => Ok(Some(reset_cause())),
+            _ => Err(Error::UnknownIdentifier),
+        }
+    }
+
+    /// Runs a function of a module from `board.rs` (`time`).
+    pub fn call_module(
+        &mut self,
+        module: &str,
+        name: &str,
+        args: &[Arg<'_>],
+    ) -> Result<Option<i64>, Error> {
+        match (module, name) {
+            ("time", "sleep") => {
+                let ms = args[0].int()?.checked_mul(1000).ok_or(Error::ValueError)?;
+                self.sleep_ms(ms).map(|()| None)
+            }
+            // The other `time` functions are the flat ones with the same name
+            ("time", _) => self.call(name, args),
             _ => Err(Error::UnknownIdentifier),
         }
     }

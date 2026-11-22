@@ -13,4 +13,6 @@ pub mod serial_input;
 pub static ABORT: AtomicBool = AtomicBool::new(false);
 
 #[cfg(feature = "tft")]
+pub mod display_module;
+#[cfg(feature = "tft")]
 pub mod tft_console;

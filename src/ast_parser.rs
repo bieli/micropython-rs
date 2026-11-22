@@ -42,6 +42,8 @@ use crate::Error;
 pub const MAX_CALL_ARGS: usize = 8;
 /// Maximum number of parameters of a `def` function.
 pub const MAX_PARAMS: usize = MAX_CALL_ARGS;
+/// Maximum number of names in one `import` / `from ... import` statement.
+pub const MAX_IMPORTS: usize = 8;
 /// Maximum number of RPN items (operands + operators) in one statement.
 pub const MAX_EXPR_ITEMS: usize = 32;
 /// Maximum nesting of parentheses / unary operators (bounds parser recursion).
@@ -114,6 +116,15 @@ pub enum Item<'a> {
     /// Function call: pops `argc` arguments, pushes the return value.
     Call {
         name: &'a str,
+        argc: u8,
+    },
+    /// `.attr`: pops a module, pushes its attribute (`[Ident(d), GetAttr(WIDTH)]`).
+    GetAttr(&'a str),
+    /// `.attr(args)`: pops `argc` arguments and the module below them, calls
+    /// the module function (`[Ident(d), args..., CallAttr { line, argc }]`).
+    /// One string per item keeps `Item` at 24 bytes.
+    CallAttr {
+        attr: &'a str,
         argc: u8,
     },
 }
@@ -217,6 +228,17 @@ pub enum Stmt<'a> {
     Def {
         name: &'a str,
         params: [&'a str; MAX_PARAMS],
+        count: usize,
+    },
+    /// `import a, b as c`: `(module, bound name)` pairs.
+    Import {
+        names: [(&'a str, &'a str); MAX_IMPORTS],
+        count: usize,
+    },
+    /// `from m import a, b as c`: `(name in module, bound name)` pairs.
+    FromImport {
+        module: &'a str,
+        names: [(&'a str, &'a str); MAX_IMPORTS],
         count: usize,
     },
 }
@@ -378,6 +400,22 @@ impl<'a> Parser<'a> {
                 return Ok(Some(Stmt::Else));
             }
             Token::Def => return self.parse_def().map(Some),
+            Token::Import => {
+                self.advance()?;
+                let (names, count) = self.parse_import_names()?;
+                Stmt::Import { names, count }
+            }
+            Token::From => {
+                self.advance()?;
+                let module = self.expect_ident()?;
+                self.expect(Token::Import)?;
+                let (names, count) = self.parse_import_names()?;
+                Stmt::FromImport {
+                    module,
+                    names,
+                    count,
+                }
+            }
             Token::Pass | Token::Break | Token::Continue => {
                 let stmt = match self.current {
                     Token::Pass => Stmt::Pass,
@@ -426,6 +464,39 @@ impl<'a> Parser<'a> {
 
         self.expect_stmt_end()?;
         Ok(Some(stmt))
+    }
+
+    /// import_names := IDENT ['as' IDENT] (',' IDENT ['as' IDENT])*
+    #[allow(clippy::type_complexity)]
+    fn parse_import_names(&mut self) -> Result<([(&'a str, &'a str); MAX_IMPORTS], usize), Error> {
+        let mut names = [("", ""); MAX_IMPORTS];
+        let mut count = 0;
+        loop {
+            if count >= MAX_IMPORTS {
+                return Err(Error::TooManyArguments);
+            }
+            let name = self.expect_ident()?;
+            let bound = if self.current == Token::As {
+                self.advance()?;
+                self.expect_ident()?
+            } else {
+                name
+            };
+            names[count] = (name, bound);
+            count += 1;
+            if self.current != Token::Comma {
+                return Ok((names, count));
+            }
+            self.advance()?;
+        }
+    }
+
+    fn expect_ident(&mut self) -> Result<&'a str, Error> {
+        let Token::Ident(name) = self.current else {
+            return Err(Error::InvalidSyntax);
+        };
+        self.advance()?;
+        Ok(name)
     }
 
     /// def := 'def' IDENT '(' [IDENT (',' IDENT)* [',']] ')' ':'
@@ -657,6 +728,19 @@ impl<'a> Parser<'a> {
                 if self.current == Token::LParen {
                     return self.nested(|p| p.parse_call(name, code));
                 }
+                if self.current == Token::Dot {
+                    // `module.attr` or `module.function(args)`
+                    self.advance()?;
+                    let attr = self.expect_ident()?;
+                    code.push(Item::Ident(name))?;
+                    if self.current == Token::LParen {
+                        return self.nested(|p| {
+                            let argc = p.parse_args(code)?;
+                            code.push(Item::CallAttr { attr, argc })
+                        });
+                    }
+                    return code.push(Item::GetAttr(attr));
+                }
                 return code.push(Item::Ident(name));
             }
             Token::LParen => {
@@ -674,6 +758,12 @@ impl<'a> Parser<'a> {
     ///
     /// Arguments are emitted first, then `Call { name, argc }`.
     fn parse_call(&mut self, name: &'a str, code: &mut Code<'a>) -> Result<(), Error> {
+        let argc = self.parse_args(code)?;
+        code.push(Item::Call { name, argc })
+    }
+
+    /// '(' [expr (',' expr)* [',']] ')': emits the arguments, returns their count.
+    fn parse_args(&mut self, code: &mut Code<'a>) -> Result<u8, Error> {
         // Consume '('
         self.advance()?;
 
@@ -695,10 +785,7 @@ impl<'a> Parser<'a> {
 
         // Consume ')'
         self.advance()?;
-        code.push(Item::Call {
-            name,
-            argc: argc as u8,
-        })
+        Ok(argc as u8)
     }
 
     /// Runs `f` one nesting level deeper, failing instead of overflowing the
@@ -1103,6 +1190,72 @@ mod tests {
             ("def f(a, b, c, d, e, f, g, h, i):", Error::TooManyArguments),
             ("else", Error::UnexpectedToken),
             ("pass 1", Error::UnexpectedToken),
+        ] {
+            let mut parser = Parser::new(src).unwrap();
+            assert_eq!(
+                parser.parse_next_stmt(&mut code),
+                Err(err),
+                "source: {}",
+                src
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_imports_and_attributes() {
+        use Item::{CallAttr, GetAttr, Ident, Int};
+        let mut code = Code::new();
+        let mut parser = Parser::new(
+            "import display\nimport time as t, display as d\nfrom display import line, RED as R\n",
+        )
+        .unwrap();
+        let Some(Stmt::Import { names, count }) = parser.parse_next_stmt(&mut code).unwrap() else {
+            panic!("expected import");
+        };
+        assert_eq!(&names[..count], &[("display", "display")]);
+        let Some(Stmt::Import { names, count }) = parser.parse_next_stmt(&mut code).unwrap() else {
+            panic!("expected import");
+        };
+        assert_eq!(&names[..count], &[("time", "t"), ("display", "d")]);
+        let Some(Stmt::FromImport {
+            module,
+            names,
+            count,
+        }) = parser.parse_next_stmt(&mut code).unwrap()
+        else {
+            panic!("expected from-import");
+        };
+        assert_eq!(
+            (module, &names[..count]),
+            ("display", &[("line", "line"), ("RED", "R")][..])
+        );
+
+        assert_rpn("x = d.WIDTH", &[Ident("d"), GetAttr("WIDTH")]);
+        assert_rpn(
+            "x = d.line(1, 2)",
+            &[
+                Ident("d"),
+                Int(1),
+                Int(2),
+                CallAttr {
+                    attr: "line",
+                    argc: 2,
+                },
+            ],
+        );
+
+        for (src, err) in [
+            ("import", Error::InvalidSyntax),
+            ("import 1", Error::InvalidSyntax),
+            ("import a as", Error::InvalidSyntax),
+            ("import a b", Error::UnexpectedToken),
+            ("from a import", Error::InvalidSyntax),
+            ("from a b", Error::UnexpectedToken),
+            ("from a import *", Error::InvalidSyntax),
+            ("x = a.", Error::InvalidSyntax),
+            ("x = a.b.c", Error::UnexpectedToken),
+            ("a.b = 1", Error::UnexpectedToken),
+            ("import a, b, c, d, e, f, g, h, i", Error::TooManyArguments),
         ] {
             let mut parser = Parser::new(src).unwrap();
             assert_eq!(

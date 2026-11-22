@@ -44,6 +44,7 @@ Start with flat functions that follow MicroPython's names. Move to `machine.Pin(
 | 3.5 | `uart_write`/`uart_read` and SPI transfers | GPS modules, modems, displays | ⬜ |
 | 3.6 | Watchdog: `wdt_feed()`, plus automatic feeding inside `sleep_ms` | Production firmware has to recover from a hung script | ✅ |
 | 3.7 | TFT functions: `cls()`, `color(r, g, b)`, `text(x, y, s)`, `backlight(on)`, and scrolling | Makes the `tft` feature useful beyond showing logs | ✅ |
+| 3.8 | **Native modules with `import`**: `import display`, `from time import sleep_ms`; a `display` drawing module (pixels, lines, rectangles, circles, triangles, text) and a `time` module | Rust code grouped into MicroPython-style modules instead of one flat namespace | ✅ |
 
 Design note (✅ done): `HardwareBridge` now has a function table (`functions() -> &[HwFn]`) with argument counts,
 used for checks and `help()`, plus `constants()` and string arguments (`call_args`). Dispatch is still a `match` on the name,
@@ -69,6 +70,7 @@ Phase 3 status:
 Phase 4 follow-ups found while building it:
 
 * `str()`, string concatenation and formatting (`text()` can't show a number yet), which need a small string pool.
+* Importing `.py` files as modules (only native Rust modules can be imported), and a `machine` module with `Pin` objects.
 * A file system (`os`, `open`) so `mpremote cp`/`ls` work, instead of the single `main.py` slot.
 * Raw-paste mode for faster uploads (plain raw mode works).
 

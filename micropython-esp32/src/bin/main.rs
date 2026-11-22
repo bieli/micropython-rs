@@ -17,11 +17,11 @@
 use esp_backtrace as _;
 use esp_hal::main;
 use esp_println::println;
-use micropython_esp32::board::{Board, BoardPeripherals};
+use micropython_esp32::board::{Board, BoardPeripherals, TIME_MODULE};
 use micropython_esp32::repl::{self, BootScript};
 use micropython_esp32::script_store::ScriptStore;
 use micropython_esp32::serial_input;
-use micropython_rs::{Arg, Error, HardwareBridge, HwFn};
+use micropython_rs::{Arg, Error, HardwareBridge, HwFn, Module};
 
 esp_bootloader_esp_idf::esp_app_desc!();
 
@@ -97,6 +97,19 @@ impl HardwareBridge for GenericHardware<'_> {
     fn constants(&self) -> &[(&'static str, i64)] {
         GENERIC_CONSTS
     }
+
+    fn modules(&self) -> &[Module] {
+        &[TIME_MODULE]
+    }
+
+    fn call_module(
+        &mut self,
+        module: &str,
+        name: &str,
+        args: &[Arg<'_>],
+    ) -> Result<Option<i64>, Error> {
+        self.board.call_module(module, name, args)
+    }
 }
 
 #[cfg(not(feature = "tft"))]
@@ -123,6 +136,8 @@ fn main() -> ! {
 use core::cell::RefCell;
 #[cfg(feature = "tft")]
 use esp_hal::gpio::Level;
+#[cfg(feature = "tft")]
+use micropython_esp32::display_module::{self, DISPLAY_MODULE};
 #[cfg(feature = "tft")]
 use micropython_esp32::tft_console::{init_ttgo_spi, make_output_pin, SharedConsole, TftConsole};
 
@@ -197,6 +212,22 @@ impl HardwareBridge for TtgoHardware<'_, '_> {
 
     fn constants(&self) -> &[(&'static str, i64)] {
         TTGO_CONSTS
+    }
+
+    fn modules(&self) -> &[Module] {
+        &[TIME_MODULE, DISPLAY_MODULE]
+    }
+
+    fn call_module(
+        &mut self,
+        module: &str,
+        name: &str,
+        args: &[Arg<'_>],
+    ) -> Result<Option<i64>, Error> {
+        match module {
+            "display" => display_module::call(&mut self.console.borrow_mut(), name, args),
+            _ => self.board.call_module(module, name, args),
+        }
     }
 }
 
