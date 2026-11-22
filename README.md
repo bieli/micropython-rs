@@ -159,11 +159,12 @@ I (89) esp_image: segment 3: paddr=00013940 vaddr=00000000 size=0c6d8h ( 50904)
 I (112) esp_image: segment 4: paddr=00020020 vaddr=400d0020 size=04540h ( 17728) map
 I (120) boot: Loaded app from partition at offset 0x10000
 
-=== micropython-rs running on ESP32 ===
+=== micropython-rs starting on ESP32 ===
 Hello from ESP32
 a = 21 b = 21
+Blinking onboard LED on GPIO2...
+LED sequence complete!
 === Execution complete ===
-
 
 ```
 
@@ -176,6 +177,7 @@ a = 21 b = 21
 - [x] add assiggment in interpreted Python code "="
 - [x] running external hello.py file with Python code by interpreter (instead of hardcoded version!)
 - [x] running Python interpreted code on ESP32 real hardware by USB/UART monitor
+- [x] blinking LED on ESP32 hardware from MicroPython interpreter written in RUST
 - [ ] Variables and basic arithmetic (+, -, *, /)
 - [ ] Control flow (if / else, while loops with indentation tracking)
 - [ ] Compact Bytecode Compiler & Stack VM

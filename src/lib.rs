@@ -6,19 +6,29 @@ pub mod lexer;
 
 pub use interpreter::Interpreter;
 
-/// Hardware/Host abstraction for `print()`.
-/// Implement this trait for UART, RTT, VGA buffer, or std::io::Stdout.
-pub trait Output {
-    fn write_str(&mut self, s: &str);
-}
-
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {
     UnexpectedChar(char),
     UnexpectedToken,
     UnterminatedString,
-    UnknownIdentifier,
     InvalidSyntax,
-    TooManyArgs,
+    UnknownIdentifier,
     OutOfMemory,
+    TooManyArguments,
+}
+
+pub trait Output {
+    fn write_str(&mut self, s: &str);
+}
+
+pub trait HardwareBridge {
+    fn call(&mut self, name: &str, args: &[i64]) -> Result<Option<i64>, ()>;
+}
+
+pub struct NoHardware;
+
+impl HardwareBridge for NoHardware {
+    fn call(&mut self, _name: &str, _args: &[i64]) -> Result<Option<i64>, ()> {
+        Err(())
+    }
 }
