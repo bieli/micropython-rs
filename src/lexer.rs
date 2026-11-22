@@ -110,3 +110,136 @@ impl<'a> Lexer<'a> {
         Ok(Token::Ident(&self.src[start..self.pos]))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Helper that lexes all tokens until `Token::Eof` into a stack-allocated array.
+    fn collect_tokens<'a, const N: usize>(src: &'a str) -> ([Token<'a>; N], usize) {
+        let mut lexer = Lexer::new(src);
+        let mut tokens = [Token::Eof; N];
+        let mut count = 0;
+
+        loop {
+            let tok = lexer.next_token().expect("unexpected lexer error");
+            if tok == Token::Eof {
+                break;
+            }
+            assert!(count < N, "increase N in collect_tokens for this test");
+            tokens[count] = tok;
+            count += 1;
+        }
+
+        (tokens, count)
+    }
+
+    #[test]
+    fn test_empty_and_whitespace_only() {
+        let mut lexer = Lexer::new("   \t\r  ");
+        assert_eq!(lexer.next_token(), Ok(Token::Eof));
+        // Calling next_token repeatedly at EOF stays at EOF
+        assert_eq!(lexer.next_token(), Ok(Token::Eof));
+    }
+
+    #[test]
+    fn test_punctuation_and_newlines() {
+        let (tokens, count) = collect_tokens::<8>("( ) , =\n");
+        assert_eq!(
+            &tokens[..count],
+            &[
+                Token::LParen,
+                Token::RParen,
+                Token::Comma,
+                Token::Assign,
+                Token::Newline,
+            ]
+        );
+    }
+
+    #[test]
+    fn test_identifiers() {
+        let (tokens, count) = collect_tokens::<8>("print x _private var_123");
+        assert_eq!(
+            &tokens[..count],
+            &[
+                Token::Ident("print"),
+                Token::Ident("x"),
+                Token::Ident("_private"),
+                Token::Ident("var_123"),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_integers() {
+        let (tokens, count) = collect_tokens::<8>("0 7 42 100000");
+        assert_eq!(
+            &tokens[..count],
+            &[
+                Token::Int(0),
+                Token::Int(7),
+                Token::Int(42),
+                Token::Int(100_000),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_strings_single_and_double_quotes() {
+        let (tokens, count) = collect_tokens::<8>(r#"'hello' "world" "" 'it has "quotes"'"#);
+        assert_eq!(
+            &tokens[..count],
+            &[
+                Token::Str("hello"),
+                Token::Str("world"),
+                Token::Str(""),
+                Token::Str(r#"it has "quotes""#),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_utf8_inside_strings() {
+        let (tokens, count) = collect_tokens::<4>("'Cześć 🐍'");
+        assert_eq!(&tokens[..count], &[Token::Str("Cześć 🐍")]);
+    }
+
+    #[test]
+    fn test_comments_are_skipped_until_newline() {
+        let src = "# full line comment\nx = 10 # trailing comment\nprint(x)";
+        let (tokens, count) = collect_tokens::<16>(src);
+        assert_eq!(
+            &tokens[..count],
+            &[
+                Token::Newline,
+                Token::Ident("x"),
+                Token::Assign,
+                Token::Int(10),
+                Token::Newline,
+                Token::Ident("print"),
+                Token::LParen,
+                Token::Ident("x"),
+                Token::RParen,
+            ]
+        );
+    }
+
+    #[test]
+    fn test_comment_at_eof_without_newline() {
+        let (tokens, count) = collect_tokens::<4>("42 # comment at very end");
+        assert_eq!(&tokens[..count], &[Token::Int(42)]);
+    }
+
+    #[test]
+    fn test_unterminated_string_error() {
+        let mut lexer = Lexer::new("'hello world");
+        assert_eq!(lexer.next_token(), Err(Error::UnterminatedString));
+    }
+
+    #[test]
+    fn test_unexpected_char_error() {
+        let mut lexer = Lexer::new("@");
+        assert_eq!(lexer.next_token(), Err(Error::UnexpectedChar('@')));
+    }
+}
