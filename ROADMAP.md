@@ -1,7 +1,7 @@
 # micropython-rs Roadmap
 
 What comes next for micropython-rs, ordered by what embedded engineers need first.
-Status: ✅ done · 🚧 in progress · ⬜ planned
+Status: ✅ done · 🚧 in progress · ⬜ planned · ➡️ moved
 
 ## Phase 1: Code upgrades (foundation)
 
@@ -18,12 +18,18 @@ Status: ✅ done · 🚧 in progress · ⬜ planned
 
 | # | Feature | Why | Status |
 |---|---------|-----|--------|
-| 2.1 | **`if`/`elif`/`else`, `while`, `break`/`continue`**, with indentation | Without loops, no real firmware logic is possible. This is the biggest single unlock | ⬜ |
-| 2.2 | **Comparisons and booleans**: `== != < <= > >=`, `and or not`, `True`/`False` | Needed by 2.1 | ⬜ |
-| 2.3 | **Hex and binary literals and bitwise operators**: `0x40`, `0b1010`, `& \| ^ ~ << >>` | Daily work with registers, flags and masks | ⬜ |
-| 2.4 | **Augmented assignment**: `+= -= \|= &= <<=` | Common in counters and bit manipulation | ⬜ |
-| 2.5 | **`def` functions** (no closures) | Reusable code such as `blink(n)`. Needs a fixed-size call frame stack | ⬜ |
-| 2.6 | **`bytes`/`bytearray` from a static buffer pool** | Needed for I²C, SPI and UART payloads, while staying zero-heap | ⬜ |
+| 2.1 | **`if`/`elif`/`else`, `while`, `break`/`continue`**, with indentation | Without loops, no real firmware logic is possible. This is the biggest single unlock | ✅ |
+| 2.2 | **Comparisons and booleans**: `== != < <= > >=`, `and or not`, `True`/`False` | Needed by 2.1 | ✅ |
+| 2.3 | **Hex and binary literals and bitwise operators**: `0x40`, `0b1010`, `& \| ^ ~ << >>` | Daily work with registers, flags and masks | ✅ |
+| 2.4 | **Augmented assignment**: `+= -= \|= &= <<=` | Common in counters and bit manipulation | ✅ |
+| 2.5 | **`def` functions** (no closures) | Reusable code such as `blink(n)`. Needs a fixed-size call frame stack | ✅ |
+| 2.6 | **`bytes`/`bytearray` from a static buffer pool** | Needed for I²C, SPI and UART payloads, while staying zero-heap. Moved to Phase 3: it depends on the bus API design (`HardwareBridge` passes only integers today) | ➡️ 3.4 |
+
+Phase 2 follow-ups found while building it:
+
+* `for` loops with `range()`, the most common loop form in MicroPython code.
+* `global` statement, so functions can update global counters and state.
+* `hex()`/`bin()` output for register values (needs a small string pool, like 2.6).
 
 ## Phase 3: Hardware API (MicroPython-style names)
 

@@ -50,15 +50,39 @@ make all
 ## Supported Python subset
 
 ```python
-x = 10                      # integer / string variables
-msg = 'hello'
-y = (x + 2) * -3 // 4 % 5   # integer arithmetic with Python precedence
-print(msg, 'y =', y)        # print with multiple arguments
-delay_ms(x * 50)            # hardware functions take expressions as arguments
-level = adc_read(34) * 3    # ...and their return values can be used in expressions
+STATUS_READY = 0x01               # hex, octal (0o17), binary (0b1010) literals, 1_000 separators
+
+def wait_ready(max_tries):        # functions with parameters, return values, recursion
+    tries = 0
+    while tries < max_tries:      # while / break / continue
+        if read_reg(0x10) & STATUS_READY:   # hardware calls return values
+            return True
+        tries += 1
+        delay_ms(10)
+    return False
+
+if wait_ready(5) and not error_flag():   # and / or / not, True / False / None
+    print('sensor ready')
+elif 0 < retries <= 3:            # chained comparisons
+    print('retrying')
+else:
+    print('giving up')
+
+flags = 0
+flags |= 1 << 3                   # bitwise & | ^ ~ << >> and augmented assignment
 ```
 
-See [ROADMAP.md](ROADMAP.md) for planned features.
+| Area | Supported |
+|------|-----------|
+| Values | `int` (64-bit), `str` (literals only), `bool` (`True`/`False`), `None` |
+| Literals | `42`, `1_000`, `0x1F`, `0o17`, `0b1010`, `'single'`, `"double"` |
+| Operators | `+ - * / // % **`, `& \| ^ ~ << >>`, `== != < <= > >=` (chainable), `and or not` |
+| Assignment | `x = ...`, and `+= -= *= /= //= %= **= &= \|= ^= <<= >>=` |
+| Statements | `if`/`elif`/`else`, `while`, `break`, `continue`, `pass`, `def`, `return` |
+| Calls | `print(...)`, your own `def` functions, and hardware functions from `HardwareBridge` |
+
+Not supported yet: `for`, lists/dicts/tuples, floats, string operations, `global`, classes, imports.
+See [ROADMAP.md](ROADMAP.md) for what's planned.
 
 ### Arithmetic operators
 
@@ -66,9 +90,17 @@ All arithmetic is on 64-bit integers (`i64`). Precedence goes from lowest to hig
 
 | Precedence | Operators | Associativity | Example |
 |------------|-----------|---------------|---------|
-| lowest | `+` `-` | left | `10 - 4 - 3` → `3` |
+| lowest | `or` | left, short-circuit | `0 or 5` → `5` |
+| | `and` | left, short-circuit | `3 and 0` → `0` |
+| | `not` | | `not a == b` → `not (a == b)` |
+| | `==` `!=` `<` `<=` `>` `>=` | chained | `1 < x < 10` → `1 < x and x < 10` |
+| | `\|` | left | |
+| | `^` | left | |
+| | `&` | left | `0xFF & 1 << 4` → `16` |
+| | `<<` `>>` | left | `1 << 2 + 1` → `8` |
+| | `+` `-` | left | `10 - 4 - 3` → `3` |
 | | `*` `/` `//` `%` | left | `1 + 2 * 3` → `7` |
-| | unary `-` `+` | right | `-a * 3` → `(-a) * 3` |
+| | unary `-` `+` `~` | right | `-a * 3` → `(-a) * 3` |
 | highest | `**` | right | `2 ** 3 ** 2` → `512`, `-2 ** 2` → `-4` |
 | | `( ... )` | | `(1 + 2) * 3` → `9` |
 
@@ -78,8 +110,14 @@ Rules (they match CPython unless marked *differs*):
 * *Differs:* `/` is integer (floor) division (`7 / 2` → `3`), because floats aren't supported yet.
 * *Differs:* results that don't fit in `i64` raise `Error::Overflow`. CPython has unlimited-size integers.
 * `x / 0`, `x // 0` and `x % 0` raise `Error::ZeroDivision`.
-* Negative exponents (`2 ** -1`) and operators on strings (`'a' + 'b'`) raise `Error::TypeError`.
+* Negative exponents (`2 ** -1`) and arithmetic on strings (`'a' + 'b'`) raise `Error::TypeError`.
   String concatenation would need heap memory.
+* `bool` behaves as an integer (`True + 1` → `2`); `&`, `|`, `^` of two bools give a bool.
+* `and`/`or` return one of their operands and skip the right side when the result is known,
+  so `0 and f()` never calls `f`.
+* Strings compare with each other (`'a' < 'b'`). `==`/`!=` between different types is `False`/`True`;
+  ordering them (`1 < 'a'`) raises `Error::TypeError`.
+* *Differs:* `<<` that doesn't fit in `i64` raises `Error::Overflow`; a negative shift count raises `Error::ValueError`.
 
 How it works without a heap: the parser turns each expression into postfix (RPN) order in a fixed-size buffer.
 For example, `(a + 2) * -3` becomes `[a, 2, Add, 3, Neg, Mul]`.
@@ -90,16 +128,60 @@ The limits are in `src/ast_parser.rs`:
 |----------|-------|---------|
 | `MAX_EXPR_ITEMS` | 32 | Operands and operators per statement, all call arguments included |
 | `MAX_EXPR_DEPTH` | 16 | Nesting of parentheses and unary operators |
-| `MAX_CALL_ARGS` | 8 | Arguments per function call |
+| `MAX_CALL_ARGS` | 8 | Arguments per function call (and parameters per `def`) |
 
 Going over a limit raises `Error::OutOfMemory`.
+
+### Control flow and functions
+
+Blocks are defined by indentation, as in Python (a tab counts to the next multiple of 8 columns).
+A body can also be a single statement on the same line: `if x: led_on()`.
+
+```python
+def blink(times, ms):
+    n = 0
+    while n < times:
+        led_on()
+        delay_ms(ms)
+        led_off()
+        delay_ms(ms)
+        n += 1
+
+blink(3, 250)
+```
+
+* Function parameters and variables assigned inside a function are **local**. Globals can be read.
+  There's no `global` keyword yet, so `counter += 1` on a global inside a function raises `Error::UnknownIdentifier`.
+* Functions are defined at the top level (or inside `if`/`while` at the top level). A `def` inside a `def` raises `Error::InvalidSyntax`.
+* Calling with the wrong number of arguments raises `Error::TypeError`.
+* `break`/`continue` outside a loop and `return` outside a function raise `Error::InvalidSyntax`,
+  even in code that never runs, as Python does at compile time.
+* Bad indentation raises `Error::IndentationError`.
+
+How it works without a heap: the interpreter runs the source while parsing it and never builds a program in memory.
+A `while` loop keeps a copy of the parser (96 bytes) from its header and jumps back to it after each pass.
+A `def` stores a parser copy that points at its body. A block that doesn't run is still parsed, so syntax errors are always reported.
+The trade-off is speed: loop bodies are parsed again on every pass. The planned bytecode compiler will remove that cost.
+
+Limits (in `src/interpreter.rs`):
+
+| Constant | Value | Meaning | Error |
+|----------|-------|---------|-------|
+| `MAX_VARS` | 32 | Variables: globals plus the locals of all active calls | `OutOfMemory` |
+| `MAX_FUNCS` | 8 | `def` functions | `OutOfMemory` |
+| `MAX_CALL_DEPTH` | 8 | Nested function calls, recursion included | `RecursionLimit` |
+| `MAX_NESTING` | 24 | Nested blocks (`if`/`while`/function bodies) running at once | `OutOfMemory` |
+
+Native stack use grows with each nested call (an RPN buffer and value stack per call), which is why
+`MAX_CALL_DEPTH` is small. On a 64-bit host the `Interpreter` struct is about 3.4 KB; on 32-bit MCUs it's smaller.
 
 ### Function calls
 
 Calls are expressions, so they can be nested and combined with operators: `print(f(g(1), 2 + h()))`.
 
 * `print(...)` is built in. It prints its arguments separated by spaces and returns `None`.
-* Every other name is passed to your `HardwareBridge`. Arguments must be integers (otherwise `Error::TypeError`).
+* Your own `def` functions are looked up next.
+* Every other name is passed to your `HardwareBridge`. Arguments must be integers or bools (otherwise `Error::TypeError`).
   Return `Ok(Some(n))` to give the script a value, or `Ok(None)` for `None`.
 * All arguments are evaluated before the call runs. If one fails, nothing is printed or sent to hardware.
 
@@ -118,18 +200,19 @@ if let Err(err) = vm.eval(script) {
 
 Syntax errors point at the offending token, and runtime errors at the statement that failed.
 
-Two guards stop a script that runs too long (they matter most once loops are added):
+Two guards stop a script that runs too long, such as an accidental `while True:`:
 
 ```rust
 use core::sync::atomic::{AtomicBool, Ordering};
 
 static ABORT: AtomicBool = AtomicBool::new(false);   // set to true from a UART/button interrupt
 
-vm.set_step_limit(Some(10_000));  // eval() returns Error::StepLimit after 10 000 statements
+vm.set_step_limit(Some(10_000));  // eval() returns Error::StepLimit after 10 000 statements/loop passes
 vm.set_abort_flag(&ABORT);        // eval() returns Error::Interrupted once ABORT is true
 ```
 
-The step budget starts over for each `eval()` call. The abort flag is only read, so clear it yourself before the next run.
+The step budget starts over for each `eval()` call. The abort flag is checked before every statement and loop pass.
+It's only read, so clear it yourself before the next run. The ESP32 firmware sets a step limit of 1 000 000.
 
 ## Using micropython-rs on a Microcontroller
 
@@ -359,7 +442,10 @@ I (120) boot: Loaded app from partition at offset 0x10000
 Hello from ESP32
 a = 21 b = 21
 (a+b)*3-2**4//2 = 118
-Blinking onboard LED...
+square 1 = 1 odd
+square 2 = 4 even
+square 3 = 9 odd
+Blinking onboard LED 3 times...
 LED sequence complete!
 === Execution complete ===
 ```
@@ -367,11 +453,14 @@ LED sequence complete!
 TTGO T-Display build (`make flash FEATURES=tft`). The Python `print()` lines are also shown on the TFT screen (`=== Execution complete ===` goes to serial only):
 ```bash
 ...
-I (122) boot: Loaded app from partition at offset 0x10000
+I (125) boot: Loaded app from partition at offset 0x10000
 === micropython-rs ===
 Board: TTGO T-Display
 a = 21 b = 21
 (a+b)*3-2**4//2 = 118
+square 1 = 1 odd
+square 2 = 4 even
+square 3 = 9 odd
 TFT console active!
 === Execution complete ===
 ```
@@ -389,7 +478,9 @@ TFT console active!
 - [x] Python `print()` on LilyGO TTGO T-Display TFT screen (`--features tft`)
 - [x] board selection with Cargo features (generic ESP32 / TTGO T-Display)
 - [x] Variables and basic arithmetic (+, -, *, /, //, %, ** with Python precedence and parentheses)
-- [ ] Control flow (if / else, while loops with indentation tracking)
+- [x] Control flow (if / elif / else, while, break / continue, with indentation tracking)
+- [x] Comparisons, booleans, `and` / `or` / `not`, hex / binary literals, bitwise operators, augmented assignment
+- [x] `def` functions with parameters, local variables, `return` and recursion
 - [ ] Compact Bytecode Compiler & Stack VM
 
 

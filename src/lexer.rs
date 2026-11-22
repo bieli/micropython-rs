@@ -2,6 +2,7 @@
 // LEXER (Zero-copy tokenizer)
 // ============================================================================
 
+use crate::ast_parser::BinOp;
 use crate::Error;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -9,7 +10,26 @@ pub enum Token<'a> {
     Ident(&'a str),
     Str(&'a str),
     Int(i64),
+    // Keywords
+    If,
+    Elif,
+    Else,
+    While,
+    Break,
+    Continue,
+    Pass,
+    Def,
+    Return,
+    And,
+    Or,
+    Not,
+    True,
+    False,
+    None,
+    // Assignment: `=` and augmented `+=`, `-=`, `<<=`, ...
     Assign,
+    AugAssign(BinOp),
+    // Arithmetic
     Plus,
     Minus,
     Star,
@@ -17,14 +37,33 @@ pub enum Token<'a> {
     Slash,
     DoubleSlash,
     Percent,
+    // Bitwise
+    Amp,
+    Pipe,
+    Caret,
+    Tilde,
+    Shl,
+    Shr,
+    // Comparison
+    EqEq,
+    NotEq,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    // Punctuation
     LParen,
     RParen,
     Comma,
+    Colon,
     Newline,
     Eof,
 }
 
-#[derive(Clone)]
+/// Tab stops for indentation, as in Python.
+const TAB_SIZE: u32 = 8;
+
+#[derive(Debug, Clone, Copy)]
 pub struct Lexer<'a> {
     src: &'a str,
     pos: usize,
@@ -32,6 +71,12 @@ pub struct Lexer<'a> {
     line: u32,
     /// 1-based line where the most recently lexed token starts.
     token_line: u32,
+    /// True until the first non-blank character of the current line is read.
+    at_line_start: bool,
+    /// Indentation (in columns) of the current line.
+    line_indent: u32,
+    /// Indentation of the line the most recently lexed token is on.
+    token_indent: u32,
 }
 
 impl<'a> Lexer<'a> {
@@ -41,6 +86,9 @@ impl<'a> Lexer<'a> {
             pos: 0,
             line: 1,
             token_line: 1,
+            at_line_start: true,
+            line_indent: 0,
+            token_indent: 0,
         }
     }
 
@@ -48,6 +96,12 @@ impl<'a> Lexer<'a> {
     /// or where the failing token started if `next_token` returned an error.
     pub const fn token_line(&self) -> u32 {
         self.token_line
+    }
+
+    /// Indentation (in columns, tabs to multiples of 8) of the line that the
+    /// last token returned by `next_token` is on.
+    pub const fn token_indent(&self) -> u32 {
+        self.token_indent
     }
 
     fn peek(&self) -> Option<char> {
@@ -59,38 +113,74 @@ impl<'a> Lexer<'a> {
         self.pos += ch.len_utf8();
         if ch == '\n' {
             self.line += 1;
+            self.at_line_start = true;
+            self.line_indent = 0;
         }
         Some(ch)
     }
 
+    /// Consumes `expected` if it is the next character.
+    fn eat(&mut self, expected: char) -> bool {
+        if self.peek() == Some(expected) {
+            self.advance();
+            true
+        } else {
+            false
+        }
+    }
+
     pub fn next_token(&mut self) -> Result<Token<'a>, Error> {
         while let Some(ch) = self.peek() {
-            if ch == ' ' || ch == '\t' || ch == '\r' {
-                self.advance();
-            } else {
-                break;
+            match ch {
+                ' ' | '\t' | '\r' => {
+                    if self.at_line_start {
+                        self.line_indent = match ch {
+                            ' ' => self.line_indent + 1,
+                            '\t' => (self.line_indent / TAB_SIZE + 1) * TAB_SIZE,
+                            _ => self.line_indent,
+                        };
+                    }
+                    self.advance();
+                }
+                _ => break,
             }
         }
 
         self.token_line = self.line;
+        self.token_indent = self.line_indent;
         let Some(ch) = self.advance() else {
             return Ok(Token::Eof);
         };
+        if ch != '\n' {
+            self.at_line_start = false;
+        }
 
-        match ch {
-            '(' => Ok(Token::LParen),
-            ')' => Ok(Token::RParen),
-            ',' => Ok(Token::Comma),
-            '=' => Ok(Token::Assign),
-            '+' => Ok(Token::Plus),
-            '-' => Ok(Token::Minus),
-            '%' => Ok(Token::Percent),
-            '*' => Ok(self.lex_double('*', Token::Star, Token::DoubleStar)),
-            '/' => Ok(self.lex_double('/', Token::Slash, Token::DoubleSlash)),
-            '\n' => Ok(Token::Newline),
-            '\'' | '"' => self.lex_string(ch),
-            '0'..='9' => self.lex_int(ch),
-            c if c.is_ascii_alphabetic() || c == '_' => self.lex_ident(c),
+        let token = match ch {
+            '(' => Token::LParen,
+            ')' => Token::RParen,
+            ',' => Token::Comma,
+            ':' => Token::Colon,
+            '~' => Token::Tilde,
+            '\n' => Token::Newline,
+            '=' => self.op_or_eq(Token::Assign, Token::EqEq),
+            '!' if self.eat('=') => Token::NotEq,
+            '+' => self.op_or_aug(Token::Plus, BinOp::Add),
+            '-' => self.op_or_aug(Token::Minus, BinOp::Sub),
+            '%' => self.op_or_aug(Token::Percent, BinOp::Mod),
+            '&' => self.op_or_aug(Token::Amp, BinOp::BitAnd),
+            '|' => self.op_or_aug(Token::Pipe, BinOp::BitOr),
+            '^' => self.op_or_aug(Token::Caret, BinOp::BitXor),
+            '*' if self.eat('*') => self.op_or_aug(Token::DoubleStar, BinOp::Pow),
+            '*' => self.op_or_aug(Token::Star, BinOp::Mul),
+            '/' if self.eat('/') => self.op_or_aug(Token::DoubleSlash, BinOp::FloorDiv),
+            '/' => self.op_or_aug(Token::Slash, BinOp::Div),
+            '<' if self.eat('<') => self.op_or_aug(Token::Shl, BinOp::Shl),
+            '<' => self.op_or_eq(Token::Lt, Token::Le),
+            '>' if self.eat('>') => self.op_or_aug(Token::Shr, BinOp::Shr),
+            '>' => self.op_or_eq(Token::Gt, Token::Ge),
+            '\'' | '"' => return self.lex_string(ch),
+            '0'..='9' => return self.lex_int(ch),
+            c if c.is_ascii_alphabetic() || c == '_' => return Ok(self.lex_ident(c)),
             '#' => {
                 while let Some(c) = self.peek() {
                     if c == '\n' {
@@ -98,9 +188,28 @@ impl<'a> Lexer<'a> {
                     }
                     self.advance();
                 }
-                self.next_token()
+                return self.next_token();
             }
-            other => Err(Error::UnexpectedChar(other)),
+            other => return Err(Error::UnexpectedChar(other)),
+        };
+        Ok(token)
+    }
+
+    /// `op` or, if followed by `=`, the augmented assignment `op=`.
+    fn op_or_aug(&mut self, op: Token<'a>, bin: BinOp) -> Token<'a> {
+        if self.eat('=') {
+            Token::AugAssign(bin)
+        } else {
+            op
+        }
+    }
+
+    /// `single` or, if followed by `=`, `with_eq` (`=`/`==`, `<`/`<=`, `>`/`>=`).
+    fn op_or_eq(&mut self, single: Token<'a>, with_eq: Token<'a>) -> Token<'a> {
+        if self.eat('=') {
+            with_eq
+        } else {
+            single
         }
     }
 
@@ -117,33 +226,62 @@ impl<'a> Lexer<'a> {
         Err(Error::UnterminatedString)
     }
 
-    /// Lexes one- or two-character operators like `*` / `**` and `/` / `//`.
-    fn lex_double(&mut self, second: char, single: Token<'a>, double: Token<'a>) -> Token<'a> {
-        if self.peek() == Some(second) {
-            self.advance();
-            double
-        } else {
-            single
-        }
-    }
-
+    /// Integer literals: `42`, `1_000`, `0x1F`, `0o17`, `0b1010`.
     fn lex_int(&mut self, first: char) -> Result<Token<'a>, Error> {
-        let mut val = (first as u8 - b'0') as i64;
-        while let Some(ch) = self.peek() {
-            if ch.is_ascii_digit() {
-                self.advance();
-                val = val
-                    .checked_mul(10)
-                    .and_then(|v| v.checked_add((ch as u8 - b'0') as i64))
-                    .ok_or(Error::Overflow)?;
-            } else {
-                break;
+        let radix = if first == '0' {
+            match self.peek() {
+                Some('x' | 'X') => 16,
+                Some('o' | 'O') => 8,
+                Some('b' | 'B') => 2,
+                _ => 10,
             }
+        } else {
+            10
+        };
+
+        let mut val: i64 = 0;
+        let mut digits = 0;
+        if radix == 10 {
+            val = (first as u8 - b'0') as i64;
+            digits = 1;
+        } else {
+            self.advance(); // prefix letter
+        }
+
+        let mut last_was_underscore = false;
+        while let Some(ch) = self.peek() {
+            if ch == '_' {
+                // `_` only between digits (or right after a base prefix)
+                if last_was_underscore {
+                    return Err(Error::InvalidSyntax);
+                }
+                last_was_underscore = true;
+                self.advance();
+                continue;
+            }
+            let Some(digit) = ch.to_digit(radix) else {
+                // A letter/digit glued to the number, like `12abc` or `0b102`
+                if ch.is_ascii_alphanumeric() {
+                    return Err(Error::InvalidSyntax);
+                }
+                break;
+            };
+            self.advance();
+            last_was_underscore = false;
+            digits += 1;
+            val = val
+                .checked_mul(radix as i64)
+                .and_then(|v| v.checked_add(digit as i64))
+                .ok_or(Error::Overflow)?;
+        }
+
+        if digits == 0 || last_was_underscore {
+            return Err(Error::InvalidSyntax);
         }
         Ok(Token::Int(val))
     }
 
-    fn lex_ident(&mut self, first: char) -> Result<Token<'a>, Error> {
+    fn lex_ident(&mut self, first: char) -> Token<'a> {
         let start = self.pos - first.len_utf8();
         while let Some(ch) = self.peek() {
             if ch.is_ascii_alphanumeric() || ch == '_' {
@@ -152,7 +290,24 @@ impl<'a> Lexer<'a> {
                 break;
             }
         }
-        Ok(Token::Ident(&self.src[start..self.pos]))
+        match &self.src[start..self.pos] {
+            "if" => Token::If,
+            "elif" => Token::Elif,
+            "else" => Token::Else,
+            "while" => Token::While,
+            "break" => Token::Break,
+            "continue" => Token::Continue,
+            "pass" => Token::Pass,
+            "def" => Token::Def,
+            "return" => Token::Return,
+            "and" => Token::And,
+            "or" => Token::Or,
+            "not" => Token::Not,
+            "True" => Token::True,
+            "False" => Token::False,
+            "None" => Token::None,
+            ident => Token::Ident(ident),
+        }
     }
 }
 
@@ -307,6 +462,131 @@ mod tests {
     }
 
     #[test]
+    fn test_keywords() {
+        let (tokens, count) = collect_tokens::<20>(
+            "if elif else while break continue pass def return and or not True False None iff _if",
+        );
+        assert_eq!(
+            &tokens[..count],
+            &[
+                Token::If,
+                Token::Elif,
+                Token::Else,
+                Token::While,
+                Token::Break,
+                Token::Continue,
+                Token::Pass,
+                Token::Def,
+                Token::Return,
+                Token::And,
+                Token::Or,
+                Token::Not,
+                Token::True,
+                Token::False,
+                Token::None,
+                Token::Ident("iff"),
+                Token::Ident("_if"),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_comparison_bitwise_and_punctuation() {
+        let (tokens, count) = collect_tokens::<20>("== != < <= > >= & | ^ ~ << >> : = ** //");
+        assert_eq!(
+            &tokens[..count],
+            &[
+                Token::EqEq,
+                Token::NotEq,
+                Token::Lt,
+                Token::Le,
+                Token::Gt,
+                Token::Ge,
+                Token::Amp,
+                Token::Pipe,
+                Token::Caret,
+                Token::Tilde,
+                Token::Shl,
+                Token::Shr,
+                Token::Colon,
+                Token::Assign,
+                Token::DoubleStar,
+                Token::DoubleSlash,
+            ]
+        );
+        let mut lexer = Lexer::new("!");
+        assert_eq!(lexer.next_token(), Err(Error::UnexpectedChar('!')));
+    }
+
+    #[test]
+    fn test_augmented_assignment() {
+        use BinOp::*;
+        let (tokens, count) = collect_tokens::<16>("+= -= *= /= //= %= **= &= |= ^= <<= >>=");
+        let ops = [
+            Add, Sub, Mul, Div, FloorDiv, Mod, Pow, BitAnd, BitOr, BitXor, Shl, Shr,
+        ];
+        assert_eq!(count, ops.len());
+        for (tok, op) in tokens.iter().zip(ops) {
+            assert_eq!(*tok, Token::AugAssign(op));
+        }
+    }
+
+    #[test]
+    fn test_radix_and_underscore_literals() {
+        let (tokens, count) = collect_tokens::<8>("0x1F 0XfF 0o17 0b1010 1_000_000 0x_FF 0 007");
+        assert_eq!(
+            &tokens[..count],
+            &[
+                Token::Int(31),
+                Token::Int(255),
+                Token::Int(15),
+                Token::Int(10),
+                Token::Int(1_000_000),
+                Token::Int(255),
+                Token::Int(0),
+                Token::Int(7),
+            ]
+        );
+        assert_eq!(
+            Lexer::new("0x7FFFFFFFFFFFFFFF").next_token(),
+            Ok(Token::Int(i64::MAX))
+        );
+        for bad in ["0x", "0b", "0b102", "1__0", "1_", "12abc", "0xG"] {
+            assert_eq!(
+                Lexer::new(bad).next_token(),
+                Err(Error::InvalidSyntax),
+                "{}",
+                bad
+            );
+        }
+        assert_eq!(
+            Lexer::new("0x8000000000000000").next_token(),
+            Err(Error::Overflow)
+        );
+    }
+
+    #[test]
+    fn test_indentation() {
+        let src = "a\n    b\n\tc\n  \t d\n\n        # comment\ne";
+        let mut lexer = Lexer::new(src);
+        let mut indents = [0u32; 8];
+        let mut count = 0;
+        loop {
+            let tok = lexer.next_token().unwrap();
+            match tok {
+                Token::Eof => break,
+                Token::Ident(_) => {
+                    indents[count] = lexer.token_indent();
+                    count += 1;
+                }
+                _ => {}
+            }
+        }
+        // spaces count 1, a tab jumps to the next multiple of 8
+        assert_eq!(&indents[..count], &[0, 4, 8, 9, 0]);
+    }
+
+    #[test]
     fn test_token_lines() {
         let mut lexer = Lexer::new("a\n\n  # comment\nb 'multi\nline' c");
         let mut lines = [0u32; 8];
@@ -342,7 +622,7 @@ mod tests {
     fn test_unexpected_char_error() {
         let mut lexer = Lexer::new("@");
         assert_eq!(lexer.next_token(), Err(Error::UnexpectedChar('@')));
-        let mut lexer = Lexer::new("&");
-        assert_eq!(lexer.next_token(), Err(Error::UnexpectedChar('&')));
+        let mut lexer = Lexer::new("$");
+        assert_eq!(lexer.next_token(), Err(Error::UnexpectedChar('$')));
     }
 }

@@ -25,6 +25,12 @@ pub enum Error {
     StepLimit,
     /// The abort flag registered with `Interpreter::set_abort_flag` was set.
     Interrupted,
+    /// Unexpected indent, an inconsistent dedent, or a missing indented block.
+    IndentationError,
+    /// Too many nested function calls (see `interpreter::MAX_CALL_DEPTH`).
+    RecursionLimit,
+    /// Invalid value for an operation, e.g. a negative shift count.
+    ValueError,
 }
 
 pub trait Output {

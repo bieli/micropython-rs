@@ -26,6 +26,26 @@ print('(a+b)*3-2**4//2 =', result)
     };
 }
 
+/// Control-flow demo shared by every board: a function, a `while` loop,
+/// `if`/`else` and a bitwise test.
+macro_rules! loop_demo {
+    () => {
+        r#"
+def square(n):
+    return n * n
+
+i = 1
+while i <= 3:
+    if i & 1:
+        kind = 'odd'
+    else:
+        kind = 'even'
+    print('square', i, '=', square(i), kind)
+    i += 1
+"#
+    };
+}
+
 // ---------------------------------------------------------------------------
 // Generic ESP32 board (no display)
 // ---------------------------------------------------------------------------
@@ -74,16 +94,16 @@ print('Hello from', chip)
 print('a =', a, 'b =', b)
 "#,
     math_demo!(),
+    loop_demo!(),
     r#"
-
-print('Blinking onboard LED...')
-led_on()
-delay_ms(250)
-led_off()
-delay_ms(250)
-led_on()
-delay_ms(600)
-led_off()
+print('Blinking onboard LED 3 times...')
+count = 0
+while count < 3:
+    led_on()
+    delay_ms(250)
+    led_off()
+    delay_ms(250)
+    count += 1
 print('LED sequence complete!')
 "#
 );
@@ -143,6 +163,7 @@ print('Board:', board)
 print('a =', a, 'b =', b)
 "#,
     math_demo!(),
+    loop_demo!(),
     r#"
 delay_ms(500)
 print('TFT console active!')
@@ -173,7 +194,12 @@ fn main() -> ! {
 // Shared
 // ---------------------------------------------------------------------------
 
+/// Upper bound on executed statements, so a script stuck in `while True:`
+/// reports `StepLimit` instead of hanging the board.
+const STEP_LIMIT: u32 = 1_000_000;
+
 fn run<O: micropython_rs::Output, H: HardwareBridge>(mut vm: Interpreter<'_, O, H>) -> ! {
+    vm.set_step_limit(Some(STEP_LIMIT));
     match vm.eval(SCRIPT) {
         Ok(()) => println!("=== Execution complete ==="),
         Err(err) => match vm.error_line() {
