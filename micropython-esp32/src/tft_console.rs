@@ -34,8 +34,53 @@ const CHAR_W: i32 = 6;
 const CHAR_H: i32 = 12;
 const MARGIN_X: i32 = 4;
 const MARGIN_Y: i32 = 4;
-const MAX_COLS: i32 = (SCREEN_WIDTH as i32 - MARGIN_X * 2) / CHAR_W;   // 38 chars/line
+const MAX_COLS: i32 = (SCREEN_WIDTH as i32 - MARGIN_X * 2) / CHAR_W; // 38 chars/line
 const MAX_ROWS: i32 = (SCREEN_HEIGHT as i32 - MARGIN_Y * 2) / CHAR_H; // 10 lines
+const DEFAULT_COLOR: Rgb565 = Rgb565::CSS_LIGHT_GREEN;
+/// Lines to move up when the screen is full. Redrawing the text area costs
+/// ~25 ms, so scrolling half a screen at a time keeps long output fast.
+const SCROLL_LINES: i32 = MAX_ROWS / 2;
+
+/// One console line is rendered into this RAM strip (240 x 12 pixels,
+/// 5.6 KB) and sent to the display in a single SPI transfer, instead of one
+/// small transfer per character.
+const STRIP_W: usize = SCREEN_WIDTH as usize;
+const STRIP_H: usize = CHAR_H as usize;
+
+struct Strip {
+    px: [Rgb565; STRIP_W * STRIP_H],
+}
+
+impl DrawTarget for Strip {
+    type Color = Rgb565;
+    type Error = core::convert::Infallible;
+
+    fn draw_iter<I>(&mut self, pixels: I) -> Result<(), Self::Error>
+    where
+        I: IntoIterator<Item = Pixel<Self::Color>>,
+    {
+        for Pixel(p, color) in pixels {
+            if (0..STRIP_W as i32).contains(&p.x) && (0..STRIP_H as i32).contains(&p.y) {
+                self.px[p.y as usize * STRIP_W + p.x as usize] = color;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl OriginDimensions for Strip {
+    fn size(&self) -> Size {
+        Size::new(STRIP_W as u32, STRIP_H as u32)
+    }
+}
+
+fn text_style(color: Rgb565) -> embedded_graphics::mono_font::MonoTextStyle<'static, Rgb565> {
+    MonoTextStyleBuilder::new()
+        .font(&FONT_6X10)
+        .text_color(color)
+        .background_color(Rgb565::BLACK)
+        .build()
+}
 
 /// Concrete type alias for the SPI-backed ST7789 display
 pub type TtgoDisplay<'d> = Display<
@@ -49,6 +94,15 @@ pub struct TftConsole<'d> {
     backlight: GpioOutput<'d>,
     col: i32,
     row: i32,
+    /// Text of the visible console lines, for redrawing when scrolling.
+    lines: [[u8; MAX_COLS as usize]; MAX_ROWS as usize],
+    line_lens: [u8; MAX_ROWS as usize],
+    /// Color each line was printed in.
+    line_colors: [Rgb565; MAX_ROWS as usize],
+    color: Rgb565,
+    /// The current line changed since it was last drawn.
+    dirty: bool,
+    strip: Strip,
 }
 
 impl<'d> TftConsole<'d> {
@@ -82,6 +136,14 @@ impl<'d> TftConsole<'d> {
             backlight,
             col: 0,
             row: 0,
+            lines: [[b' '; MAX_COLS as usize]; MAX_ROWS as usize],
+            line_lens: [0; MAX_ROWS as usize],
+            line_colors: [DEFAULT_COLOR; MAX_ROWS as usize],
+            color: DEFAULT_COLOR,
+            dirty: false,
+            strip: Strip {
+                px: [Rgb565::BLACK; STRIP_W * STRIP_H],
+            },
         }
     }
 
@@ -93,22 +155,107 @@ impl<'d> TftConsole<'d> {
         }
     }
 
+    /// Clears the screen and moves the console cursor to the top.
     pub fn clear(&mut self) {
         let _ = self.display.clear(Rgb565::BLACK);
         self.col = 0;
         self.row = 0;
+        self.line_lens = [0; MAX_ROWS as usize];
+        self.dirty = false;
     }
 
-    fn newline(&mut self) {
-        self.col = 0;
-        self.row += 1;
-        if self.row >= MAX_ROWS {
-            // Wrap back to top and clear screen when full
-            self.clear();
+    /// Text color for `print()` and `text()`, from 8-bit RGB components.
+    pub fn set_color(&mut self, r: u8, g: u8, b: u8) {
+        self.color = Rgb565::new(r >> 3, g >> 2, b >> 3);
+    }
+
+    /// Draws `s` with its top-left corner at pixel (`x`, `y`), outside the
+    /// console's scrolling text. Characters that aren't printable ASCII are
+    /// shown as `?`.
+    pub fn draw_text(&mut self, x: i32, y: i32, s: &str) {
+        let style = text_style(self.color);
+        let mut buf = [0u8; MAX_COLS as usize];
+        let mut x = x;
+        // Draw in chunks so long strings don't need a big buffer
+        for chunk in s.as_bytes().chunks(buf.len()) {
+            for (dst, &b) in buf.iter_mut().zip(chunk) {
+                *dst = if (0x20..0x7F).contains(&b) { b } else { b'?' };
+            }
+            let text = core::str::from_utf8(&buf[..chunk.len()]).unwrap_or("");
+            let _ = Text::with_baseline(text, Point::new(x, y), style, Baseline::Top)
+                .draw(&mut self.display);
+            x += chunk.len() as i32 * CHAR_W;
         }
     }
 
-    /// Draws a single ASCII character at the current cursor cell and advances the cursor.
+    /// Fills a rectangle in the current color (`fill == false` clears it to black).
+    pub fn fill_rect(&mut self, x: i32, y: i32, w: u32, h: u32, fill: bool) {
+        let color = if fill { self.color } else { Rgb565::BLACK };
+        let _ = Rectangle::new(Point::new(x, y), Size::new(w, h))
+            .into_styled(PrimitiveStyle::with_fill(color))
+            .draw(&mut self.display);
+    }
+
+    fn newline(&mut self) {
+        self.flush_line();
+        self.col = 0;
+        self.row += 1;
+        if self.row >= MAX_ROWS {
+            self.scroll();
+        }
+        self.line_lens[self.row as usize] = 0;
+    }
+
+    /// Moves the console lines up by `SCROLL_LINES` and redraws them. Only
+    /// the text area is repainted, so graphics drawn below it (status bars) stay.
+    fn scroll(&mut self) {
+        let n = SCROLL_LINES as usize;
+        self.lines.copy_within(n.., 0);
+        self.line_lens.copy_within(n.., 0);
+        self.line_colors.copy_within(n.., 0);
+        self.row = MAX_ROWS - SCROLL_LINES;
+        for len in &mut self.line_lens[self.row as usize..] {
+            *len = 0;
+        }
+        for row in 0..MAX_ROWS {
+            self.draw_line(row);
+        }
+    }
+
+    /// Draws the current line if it changed.
+    fn flush_line(&mut self) {
+        if self.dirty {
+            self.draw_line(self.row);
+            self.dirty = false;
+        }
+    }
+
+    /// Renders one console line into the RAM strip and sends it to the
+    /// display in one transfer.
+    fn draw_line(&mut self, row: i32) {
+        let len = self.line_lens[row as usize] as usize;
+        self.strip.px.fill(Rgb565::BLACK);
+        // Lines only hold printable ASCII (see `put_char`)
+        let text = core::str::from_utf8(&self.lines[row as usize][..len]).unwrap_or("");
+        let _ = Text::with_baseline(
+            text,
+            Point::new(MARGIN_X, 0),
+            text_style(self.line_colors[row as usize]),
+            Baseline::Top,
+        )
+        .draw(&mut self.strip);
+
+        let area = Rectangle::new(
+            Point::new(0, MARGIN_Y + row * CHAR_H),
+            Size::new(STRIP_W as u32, STRIP_H as u32),
+        );
+        let _ = self
+            .display
+            .fill_contiguous(&area, self.strip.px.iter().copied());
+    }
+
+    /// Adds one character at the cursor. The line is drawn on the next
+    /// newline or at the end of `write_str`.
     pub fn put_char(&mut self, ch: char) {
         if ch == '\n' {
             self.newline();
@@ -123,27 +270,17 @@ impl<'d> TftConsole<'d> {
             self.newline();
         }
 
-        let x = MARGIN_X + self.col * CHAR_W;
-        let y = MARGIN_Y + self.row * CHAR_H;
-
-        // Clear the character cell background before drawing the glyph
-        let _ = Rectangle::new(Point::new(x, y), Size::new(CHAR_W as u32, CHAR_H as u32))
-            .into_styled(PrimitiveStyle::with_fill(Rgb565::BLACK))
-            .draw(&mut self.display);
-
-        let mut buf = [0u8; 4];
-        let glyph = ch.encode_utf8(&mut buf);
-
-        let style = MonoTextStyleBuilder::new()
-            .font(&FONT_6X10)
-            .text_color(Rgb565::CSS_LIGHT_GREEN)
-            .background_color(Rgb565::BLACK)
-            .build();
-
-        let _ = Text::with_baseline(glyph, Point::new(x, y), style, Baseline::Top)
-            .draw(&mut self.display);
-
+        let ch = if ch.is_ascii() && !ch.is_ascii_control() {
+            ch
+        } else {
+            '?'
+        };
+        let row = self.row as usize;
+        self.lines[row][self.col as usize] = ch as u8;
         self.col += 1;
+        self.line_lens[row] = self.line_lens[row].max(self.col as u8);
+        self.line_colors[row] = self.color;
+        self.dirty = true;
     }
 }
 
@@ -155,6 +292,17 @@ impl<'d> Output for TftConsole<'d> {
         for ch in s.chars() {
             self.put_char(ch);
         }
+        self.flush_line();
+    }
+}
+
+/// `print()` output that goes to a console shared with the hardware
+/// functions (`cls()`, `text()`, ...), which need it at other times.
+pub struct SharedConsole<'a, 'd>(pub &'a core::cell::RefCell<TftConsole<'d>>);
+
+impl Output for SharedConsole<'_, '_> {
+    fn write_str(&mut self, s: &str) {
+        self.0.borrow_mut().write_str(s);
     }
 }
 
@@ -167,7 +315,7 @@ pub fn init_ttgo_spi<'d>(
     Spi::new(
         spi2,
         SpiConfig::default()
-            .with_frequency(Rate::from_mhz(26))
+            .with_frequency(Rate::from_mhz(40))
             .with_mode(Mode::_0),
     )
     .unwrap()

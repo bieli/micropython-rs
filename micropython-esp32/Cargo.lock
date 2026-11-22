@@ -862,6 +862,7 @@ dependencies = [
  "esp-println",
  "micropython-rs",
  "mipidsi",
+ "nb 1.1.0",
 ]
 
 [[package]]

@@ -37,26 +37,33 @@ Start with flat functions that follow MicroPython's names. Move to `machine.Pin(
 
 | # | API | Notes | Status |
 |---|-----|-------|--------|
-| 3.1 | `sleep_ms(ms)`, `sleep_us(us)`, `ticks_ms()`, `ticks_diff(a, b)` | Same names as MicroPython's `time` module. Keep `delay_ms` as an alias | ⬜ |
-| 3.2 | `pin_mode(pin, OUT/IN/IN_PULLUP)`, `pin_write(pin, v)`, `pin_read(pin)` | Runtime pin numbers with an allowlist per board, so scripts can't touch the flash or PSRAM pins | ⬜ |
-| 3.3 | `adc_read(pin)`, `pwm(pin, freq, duty)` | Sensors, LED dimming and servos | ⬜ |
-| 3.4 | `i2c_write(addr, data)`, `i2c_read(addr, n)`, `i2c_scan()` | `i2c_scan()` is the first thing everyone runs with a new sensor. Needs 2.6 | ⬜ |
+| 3.1 | `sleep_ms(ms)`, `sleep_us(us)`, `ticks_ms()`, `ticks_diff(a, b)` | Same names as MicroPython's `time` module. Keep `delay_ms` as an alias | ✅ |
+| 3.2 | `pin_mode(pin, OUT/IN/IN_PULLUP)`, `pin_write(pin, v)`, `pin_read(pin)` | Runtime pin numbers with an allowlist per board, so scripts can't touch the flash or PSRAM pins | ✅ |
+| 3.3 | `adc_read(pin)`, `pwm(pin, freq, duty)` | Sensors, LED dimming and servos | ✅ |
+| 3.4 | `i2c_write(addr, data)`, `i2c_read(addr, n)`, `i2c_scan()` | `i2c_scan()` is the first thing everyone runs with a new sensor. Needs 2.6 | 🚧 |
 | 3.5 | `uart_write`/`uart_read` and SPI transfers | GPS modules, modems, displays | ⬜ |
-| 3.6 | Watchdog: `wdt_feed()`, plus automatic feeding inside `sleep_ms` | Production firmware has to recover from a hung script | ⬜ |
-| 3.7 | TFT functions: `cls()`, `color(r, g, b)`, `text(x, y, s)`, `backlight(on)`, and scrolling | Makes the `tft` feature useful beyond showing logs | ⬜ |
+| 3.6 | Watchdog: `wdt_feed()`, plus automatic feeding inside `sleep_ms` | Production firmware has to recover from a hung script | ✅ |
+| 3.7 | TFT functions: `cls()`, `color(r, g, b)`, `text(x, y, s)`, `backlight(on)`, and scrolling | Makes the `tft` feature useful beyond showing logs | ✅ |
 
-Design note: replace the `match` on string names in `HardwareBridge` with a **static function table**
-(`&[(&str, arity, fn)]`). Each board adds functions in one place, the core can report the wrong number of
-arguments clearly, and a `help()` listing can be generated from it.
+Design note (✅ done): `HardwareBridge` now has a function table (`functions() -> &[HwFn]`) with argument counts,
+used for checks and `help()`, plus `constants()` and string arguments (`call_args`). Dispatch is still a `match` on the name,
+which keeps the trait simple.
+
+Phase 3 status:
+
+* 3.4 I²C: `i2c_probe`, `i2c_scan`, and single-byte / 16-bit register reads and writes are done. Multi-byte transfers
+  still need `bytes`/`bytearray` (2.6).
+* 3.5 UART/SPI: not started. It needs the same byte buffers.
+* PWM output and the I²C transfers were checked for errors on a TTGO T-Display, but not measured with a scope or a real sensor.
 
 ## Phase 4: Developer experience on the device
 
 | # | Feature | Why | Status |
 |---|---------|-----|--------|
 | 4.1 | **REPL over USB/UART** with line editing and Ctrl-C | The defining MicroPython experience: try code without reflashing | ⬜ |
-| 4.2 | **Script from flash**: `include_str!` at build time (`make flash SCRIPT=blink.py`), then a data partition with `main.py` | Users change Python code without touching Rust | ⬜ |
+| 4.2 | **Script from flash**: `include_str!` at build time (`make flash SCRIPT=blink.py`), then a data partition with `main.py` | Users change Python code without touching Rust. Build-time embedding is done; a data partition (no rebuild) is still open | ✅ |
 | 4.3 | **Upload a script over serial** (simple protocol or raw-paste mode) | Fast edit, run, edit cycle | ⬜ |
-| 4.4 | **Example gallery** in `examples/`: blink, button, ADC, I²C scan, TFT clock | Each one also doubles as a hardware smoke test | ⬜ |
+| 4.4 | **Example gallery** in `micropython-esp32/scripts/`: blink, button, ADC, I²C scan, TFT clock | Each one also doubles as a hardware smoke test | 🚧 |
 | 4.5 | **More boards**: ESP32-C3 and C6 (RISC-V), and an SSD1306 OLED feature | Cheap boards that many people already own | ⬜ |
 
 **Later:** once loops and functions exist and profiling shows the evaluator is a bottleneck, add the
