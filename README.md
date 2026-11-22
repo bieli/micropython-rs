@@ -31,7 +31,7 @@ rustup target add thumbv7em-none-eabihf
 
 2. Run hello.py example
 ```bash
-make run hello.py
+make run FILE=hello.py
 ```
 
 3. Run all tests
