@@ -11,6 +11,11 @@ ESPFLASH     := $(HOME)/.cargo/bin/espflash
 PORT         ?=
 PORT_FLAG    := $(if $(PORT),--port $(PORT),)
 
+# Optional Cargo features (e.g., make flash FEATURES=tft for the LilyGO TTGO T-Display);
+# leave empty to build the generic ESP32 firmware (serial console + GPIO2 LED)
+FEATURES     ?=
+FEATURES_FLAG := $(if $(FEATURES),--features $(FEATURES),)
+
 # Mount the parent directory so Cargo inside Docker can resolve `micropython-rs = { path = ".." }`
 WORKSPACE_ROOT := $(abspath ..)
 
@@ -25,7 +30,7 @@ build:
 		-v "$(WORKSPACE_ROOT)":/workspace \
 		-w /workspace/$(BIN_NAME) \
 		$(DOCKER_IMAGE) \
-		bash -c "source /home/esp/export-esp.sh && cargo build --release"
+		bash -c "source /home/esp/export-esp.sh && cargo build --release $(FEATURES_FLAG)"
 
 # Build via Docker, then flash to the ESP32 and open the serial monitor
 flash: build
