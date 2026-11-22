@@ -47,6 +47,50 @@ make all
 ```
 
 
+## Supported Python subset
+
+```python
+x = 10                      # integer / string variables
+msg = 'hello'
+y = (x + 2) * -3 // 4 % 5   # integer arithmetic with Python precedence
+print(msg, 'y =', y)        # print with multiple arguments
+delay_ms(x * 50)            # hardware functions take expressions as arguments
+```
+
+### Arithmetic operators
+
+All arithmetic is on 64-bit integers (`i64`). Precedence goes from lowest to highest, as in Python:
+
+| Precedence | Operators | Associativity | Example |
+|------------|-----------|---------------|---------|
+| lowest | `+` `-` | left | `10 - 4 - 3` → `3` |
+| | `*` `/` `//` `%` | left | `1 + 2 * 3` → `7` |
+| | unary `-` `+` | right | `-a * 3` → `(-a) * 3` |
+| highest | `**` | right | `2 ** 3 ** 2` → `512`, `-2 ** 2` → `-4` |
+| | `( ... )` | | `(1 + 2) * 3` → `9` |
+
+Rules (they match CPython unless marked *differs*):
+
+* `//` rounds toward −∞ (`-7 // 2` → `-4`), and `%` takes the sign of the divisor (`-7 % 3` → `2`).
+* *Differs:* `/` is integer (floor) division (`7 / 2` → `3`), because floats aren't supported yet.
+* *Differs:* results that don't fit in `i64` raise `Error::Overflow`. CPython has unlimited-size integers.
+* `x / 0`, `x // 0` and `x % 0` raise `Error::ZeroDivision`.
+* Negative exponents (`2 ** -1`) and operators on strings (`'a' + 'b'`) raise `Error::TypeError`.
+  String concatenation would need heap memory.
+
+How it works without a heap: the parser turns each expression into postfix (RPN) order in a fixed-size buffer.
+For example, `(a + 2) * -3` becomes `[a, 2, Add, 3, Neg, Mul]`.
+The interpreter then evaluates it with a small fixed-size value stack.
+The limits are in `src/ast_parser.rs`:
+
+| Constant | Value | Meaning |
+|----------|-------|---------|
+| `MAX_EXPR_ITEMS` | 32 | Operands and operators per statement, all call arguments included |
+| `MAX_EXPR_DEPTH` | 16 | Nesting of parentheses and unary operators |
+| `MAX_CALL_ARGS` | 8 | Arguments per function call |
+
+Going over a limit raises `Error::OutOfMemory`.
+
 ## Using micropython-rs on a Microcontroller
 
 Because the core library is #![no_std], you can embed it into any firmware project 
@@ -274,6 +318,7 @@ I (120) boot: Loaded app from partition at offset 0x10000
 === micropython-rs ===
 Hello from ESP32
 a = 21 b = 21
+(a+b)*3-2**4//2 = 118
 Blinking onboard LED...
 LED sequence complete!
 === Execution complete ===
@@ -286,6 +331,7 @@ I (122) boot: Loaded app from partition at offset 0x10000
 === micropython-rs ===
 Board: TTGO T-Display
 a = 21 b = 21
+(a+b)*3-2**4//2 = 118
 TFT console active!
 === Execution complete ===
 ```
@@ -302,7 +348,7 @@ TFT console active!
 - [x] blinking LED on ESP32 hardware from MicroPython interpreter written in RUST
 - [x] Python `print()` on LilyGO TTGO T-Display TFT screen (`--features tft`)
 - [x] board selection with Cargo features (generic ESP32 / TTGO T-Display)
-- [ ] Variables and basic arithmetic (+, -, *, /)
+- [x] Variables and basic arithmetic (+, -, *, /, //, %, ** with Python precedence and parentheses)
 - [ ] Control flow (if / else, while loops with indentation tracking)
 - [ ] Compact Bytecode Compiler & Stack VM
 

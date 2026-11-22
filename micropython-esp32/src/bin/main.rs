@@ -14,6 +14,18 @@ use micropython_rs::{Error, HardwareBridge, Interpreter};
 
 esp_bootloader_esp_idf::esp_app_desc!();
 
+/// Arithmetic demo shared by every board, so the same formula and result
+/// show up on the serial monitor and on the TFT screen.
+/// Expects `a` and `b` to be set earlier in the script.
+macro_rules! math_demo {
+    () => {
+        r#"
+result = (a + b) * 3 - 2 ** 4 // 2
+print('(a+b)*3-2**4//2 =', result)
+"#
+    };
+}
+
 // ---------------------------------------------------------------------------
 // Generic ESP32 board (no display)
 // ---------------------------------------------------------------------------
@@ -52,13 +64,17 @@ impl<'d> HardwareBridge for Esp32Board<'d> {
 }
 
 #[cfg(not(feature = "tft"))]
-const SCRIPT: &str = r#"
+const SCRIPT: &str = concat!(
+    r#"
 print('=== micropython-rs ===')
 chip = 'ESP32'
 a = 21
 b = 21
 print('Hello from', chip)
 print('a =', a, 'b =', b)
+"#,
+    math_demo!(),
+    r#"
 
 print('Blinking onboard LED...')
 led_on()
@@ -69,7 +85,8 @@ led_on()
 delay_ms(600)
 led_off()
 print('LED sequence complete!')
-"#;
+"#
+);
 
 #[cfg(not(feature = "tft"))]
 #[main]
@@ -116,16 +133,21 @@ impl HardwareBridge for TtgoHardware {
 }
 
 #[cfg(feature = "tft")]
-const SCRIPT: &str = r#"
+const SCRIPT: &str = concat!(
+    r#"
 print('=== micropython-rs ===')
 board = 'TTGO T-Display'
 a = 21
 b = 21
 print('Board:', board)
 print('a =', a, 'b =', b)
+"#,
+    math_demo!(),
+    r#"
 delay_ms(500)
 print('TFT console active!')
-"#;
+"#
+);
 
 #[cfg(feature = "tft")]
 #[main]

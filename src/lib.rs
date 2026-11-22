@@ -15,6 +15,12 @@ pub enum Error {
     UnknownIdentifier,
     OutOfMemory,
     TooManyArguments,
+    /// Operator applied to unsupported operand types (e.g. `'a' + 1`).
+    TypeError,
+    /// `x / 0`, `x // 0` or `x % 0`.
+    ZeroDivision,
+    /// Integer result does not fit into `i64`.
+    Overflow,
 }
 
 pub trait Output {
