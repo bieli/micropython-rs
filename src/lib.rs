@@ -1,6 +1,7 @@
 #![no_std]
 
 pub mod ast_parser;
+pub mod flatfs;
 pub mod interpreter;
 pub mod lexer;
 
