@@ -2,7 +2,7 @@
 name = "micropython-rs"
 version = "0.1.0"
 edition = "2021"
-author = "Marcin Bielak <marcin.bieli+github+micropython-rs@gmail.com>"
+authors = ["Marcin Bielak <marcin.bieli+github+micropython-rs@gmail.com>"]
 license = "Apache-2.0"
 description = "A minimal, no_std Python interpreter written in Rust"
 
