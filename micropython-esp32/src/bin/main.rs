@@ -18,6 +18,7 @@ use esp_backtrace as _;
 use esp_hal::main;
 use esp_println::println;
 use micropython_esp32::board::{Board, BoardPeripherals, TIME_MODULE};
+use micropython_esp32::buttons::{Buttons, BUTTONS_MODULE};
 use micropython_esp32::repl::{self, BootScript};
 use micropython_esp32::script_store::ScriptStore;
 use micropython_esp32::serial_input;
@@ -74,6 +75,7 @@ const GENERIC_CONSTS: &[(&str, i64)] =
 #[cfg(not(feature = "tft"))]
 struct GenericHardware<'d> {
     board: Board<'d>,
+    buttons: Buttons,
 }
 
 #[cfg(not(feature = "tft"))]
@@ -99,7 +101,7 @@ impl HardwareBridge for GenericHardware<'_> {
     }
 
     fn modules(&self) -> &[Module] {
-        &[TIME_MODULE]
+        &[TIME_MODULE, BUTTONS_MODULE]
     }
 
     fn call_module(
@@ -108,7 +110,10 @@ impl HardwareBridge for GenericHardware<'_> {
         name: &str,
         args: &[Arg<'_>],
     ) -> Result<Option<i64>, Error> {
-        self.board.call_module(module, name, args)
+        match module {
+            "buttons" => self.buttons.call(&mut self.board, name, args),
+            _ => self.board.call_module(module, name, args),
+        }
     }
 }
 
@@ -121,9 +126,11 @@ fn main() -> ! {
     print_reset_reason();
     let mut store = ScriptStore::new(peripherals.FLASH);
 
-    let board = Board::new(board_peripherals!(peripherals), GENERIC_PINS);
+    let mut board = Board::new(board_peripherals!(peripherals), GENERIC_PINS);
+    // Most DevKits only have the BOOT button (GPIO0) as a user button: LEFT
+    let buttons = Buttons::new(&mut board, Some((0, true)), None);
     let mut out = micropython_esp32::serial_console::EspSerialOut;
-    let mut hw = GenericHardware { board };
+    let mut hw = GenericHardware { board, buttons };
 
     repl::run(&mut out, &mut hw, &BOOT_SCRIPT, &mut store)
 }
@@ -174,6 +181,7 @@ const TTGO_CONSTS: &[(&str, i64)] = micropython_esp32::board_constants!(
 #[cfg(feature = "tft")]
 struct TtgoHardware<'a, 'd> {
     board: Board<'d>,
+    buttons: Buttons,
     console: &'a RefCell<TftConsole<'d>>,
 }
 
@@ -215,7 +223,7 @@ impl HardwareBridge for TtgoHardware<'_, '_> {
     }
 
     fn modules(&self) -> &[Module] {
-        &[TIME_MODULE, DISPLAY_MODULE]
+        &[TIME_MODULE, DISPLAY_MODULE, BUTTONS_MODULE]
     }
 
     fn call_module(
@@ -226,6 +234,7 @@ impl HardwareBridge for TtgoHardware<'_, '_> {
     ) -> Result<Option<i64>, Error> {
         match module {
             "display" => display_module::call(&mut self.console.borrow_mut(), name, args),
+            "buttons" => self.buttons.call(&mut self.board, name, args),
             _ => self.board.call_module(module, name, args),
         }
     }
@@ -246,13 +255,16 @@ fn main() -> ! {
     let rst = make_output_pin(peripherals.GPIO23, Level::High);
     let bl = make_output_pin(peripherals.GPIO4, Level::Low);
 
-    let board = Board::new(board_peripherals!(peripherals), TTGO_PINS);
+    let mut board = Board::new(board_peripherals!(peripherals), TTGO_PINS);
+    // TTGO buttons: GPIO0 (left, internal pull-up) and GPIO35 (right, external pull-up)
+    let buttons = Buttons::new(&mut board, Some((0, true)), Some((35, false)));
 
     let mut spi_buf = [0u8; 4096];
     let console = RefCell::new(TftConsole::new(spi, cs, dc, rst, bl, &mut spi_buf));
     let mut out = SharedConsole(&console);
     let mut hw = TtgoHardware {
         board,
+        buttons,
         console: &console,
     };
 

@@ -69,6 +69,25 @@ pub const DISPLAY_MODULE: Module = Module {
             "Text (6x10 font), top-left at x, y",
         ),
         HwFn::new("rgb", "r, g, b", "RGB565 color from 0-255 components"),
+        HwFn::with_args(
+            "number",
+            3,
+            5,
+            "x, y, n, [color], [bg]",
+            "Draw an integer; returns its width",
+        ),
+        HwFn::new("font", "size", "Text font: 1 = 6x10, 2 = 8x13, 3 = 10x20"),
+        HwFn::new(
+            "number_width",
+            "n",
+            "Width in pixels of n in the current font",
+        ),
+        HwFn::new(
+            "text_width",
+            "s",
+            "Width in pixels of s in the current font",
+        ),
+        HwFn::new("font_height", "", "Height in pixels of the current font"),
     ],
     constants: &[
         ("WIDTH", SCREEN_WIDTH as i64),
@@ -89,6 +108,14 @@ pub const DISPLAY_MODULE: Module = Module {
 /// Coordinates and sizes beyond this are rejected, so a typo like
 /// `circle(0, 0, 10**9)` can't keep the board busy for hours.
 const MAX_EXTENT: i64 = 4096;
+
+/// Optional background color at `i`, black if missing.
+fn background(args: &[Arg<'_>], i: usize) -> Result<embedded_graphics::pixelcolor::Rgb565, Error> {
+    let v = args.get(i).map_or(Ok(0), |a| a.int())?;
+    u16::try_from(v)
+        .map(color_from_rgb565)
+        .map_err(|_| Error::ValueError)
+}
 
 /// Runs `display.<name>(args)`. The interpreter has already checked the
 /// argument count against `DISPLAY_MODULE`.
@@ -149,13 +176,25 @@ pub fn call(
             console.draw_triangle(corners, color(6)?, name == "fill_triangle");
         }
         "text" => {
-            let bg = if args.len() > 4 {
-                color(4)?
-            } else {
-                color_from_rgb565(0)
-            };
+            let bg = background(args, 4)?;
             console.draw_text_colored(coord(0)?, coord(1)?, args[2].str()?, color(3)?, bg);
         }
+        "number" => {
+            let bg = background(args, 4)?;
+            let width = console.draw_number(coord(0)?, coord(1)?, args[2].int()?, color(3)?, bg);
+            return Ok(Some(width as i64));
+        }
+        "font" => {
+            if !console.set_font(args[0].int()?) {
+                return Err(Error::ValueError);
+            }
+        }
+        "number_width" => return Ok(Some(console.number_width(args[0].int()?) as i64)),
+        "text_width" => {
+            let chars = args[0].str()?.chars().count() as i64;
+            return Ok(Some(chars * console.char_width() as i64));
+        }
+        "font_height" => return Ok(Some(console.font_height() as i64)),
         "rgb" => {
             let value = rgb565(component(0)?, component(1)?, component(2)?);
             return Ok(Some(value as i64));

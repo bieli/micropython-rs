@@ -25,11 +25,13 @@ use crate::ast_parser::{
 use crate::{Arg, Error, HardwareBridge, Module, NoHardware, Output};
 
 /// Variable slots, shared by globals and the locals of active function calls.
-pub const MAX_VARS: usize = 32;
+pub const MAX_VARS: usize = 64;
 /// Number of `def` functions that can exist at the same time.
-pub const MAX_FUNCS: usize = 8;
+pub const MAX_FUNCS: usize = 16;
 /// Maximum depth of nested user function calls (recursion included).
 pub const MAX_CALL_DEPTH: usize = 8;
+/// `global` names declared by all active function calls together.
+pub const MAX_GLOBAL_DECLS: usize = 16;
 /// Maximum nesting of blocks (`if`/`while`/function bodies) being run at once.
 pub const MAX_NESTING: usize = 24;
 /// RPN evaluation stack depth. With calls, every item of an expression can be
@@ -107,11 +109,18 @@ pub struct Interpreter<'a, O: Output, H: HardwareBridge = NoHardware> {
     vars: [(&'a str, Value<'a>); MAX_VARS],
     nvars: usize,
     /// First variable slot of the innermost function call.
-    frame_base: usize,
+    /// First local of the innermost call, counted from `globals_len`, so new
+    /// globals can be inserted below running calls (`global x; x = 1`).
+    frame_off: usize,
     /// Number of globals while a function call is active.
     globals_len: usize,
     call_depth: usize,
     nesting: usize,
+    /// Names declared `global` by the active calls; the innermost call's
+    /// declarations start at `frame_globals`.
+    global_decls: [&'a str; MAX_GLOBAL_DECLS],
+    global_count: usize,
+    frame_globals: usize,
     funcs: [Option<FuncDef<'a>>; MAX_FUNCS],
     /// Line of the last error returned by `eval`, if any.
     error_line: Option<u32>,
@@ -141,7 +150,10 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
             hw,
             vars: [("", Value::None); MAX_VARS],
             nvars: 0,
-            frame_base: 0,
+            frame_off: 0,
+            global_decls: [""; MAX_GLOBAL_DECLS],
+            global_count: 0,
+            frame_globals: 0,
             globals_len: 0,
             call_depth: 0,
             nesting: 0,
@@ -441,6 +453,11 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
             Stmt::While(cond) => {
                 return self.exec_while(cond, start, parser, indent, run, ctx, code)
             }
+            Stmt::Global { names, count } => {
+                if run {
+                    self.declare_globals(&names[..count])?;
+                }
+            }
             Stmt::Import { names, count } => {
                 if run {
                     for &(module, bound) in &names[..count] {
@@ -588,8 +605,50 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
         if self.call_depth == 0 {
             0
         } else {
-            self.frame_base
+            self.globals_len + self.frame_off
         }
+    }
+
+    /// True if the innermost function call declared `name` with `global`.
+    fn is_declared_global(&self, name: &str) -> bool {
+        self.call_depth > 0
+            && self.global_decls[self.frame_globals..self.global_count].contains(&name)
+    }
+
+    /// `global a, b` inside a function (at the top level it does nothing).
+    fn declare_globals(&mut self, names: &[&'a str]) -> Result<(), Error> {
+        if self.call_depth == 0 {
+            return Ok(());
+        }
+        for &name in names {
+            if self.is_declared_global(name) {
+                continue;
+            }
+            if self.global_count >= MAX_GLOBAL_DECLS {
+                return Err(Error::OutOfMemory);
+            }
+            self.global_decls[self.global_count] = name;
+            self.global_count += 1;
+        }
+        Ok(())
+    }
+
+    /// Assigns a global from inside a function, creating it if needed by
+    /// moving the locals of the running calls up one slot.
+    fn set_global(&mut self, name: &'a str, val: Value<'a>) -> Result<(), Error> {
+        if let Some(i) = self.find_in(0..self.globals_len, name) {
+            self.vars[i].1 = val;
+            return Ok(());
+        }
+        if self.nvars >= MAX_VARS {
+            return Err(Error::OutOfMemory);
+        }
+        self.vars
+            .copy_within(self.globals_len..self.nvars, self.globals_len + 1);
+        self.vars[self.globals_len] = (name, val);
+        self.globals_len += 1;
+        self.nvars += 1;
+        Ok(())
     }
 
     fn find_in(&self, range: core::ops::Range<usize>, name: &str) -> Option<usize> {
@@ -597,6 +656,9 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
     }
 
     fn set_var(&mut self, name: &'a str, val: Value<'a>) -> Result<(), Error> {
+        if self.is_declared_global(name) {
+            return self.set_global(name, val);
+        }
         match self.find_in(self.scope_start()..self.nvars, name) {
             Some(i) => self.vars[i].1 = val,
             None => self.push_var(name, val)?,
@@ -613,9 +675,15 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
         Ok(())
     }
 
-    /// Looks a name up in the current scope only.
+    /// Looks a name up in the current scope only (the globals, for a name
+    /// declared `global`).
     fn get_scope_var(&self, name: &str) -> Result<Value<'a>, Error> {
-        self.find_in(self.scope_start()..self.nvars, name)
+        let range = if self.is_declared_global(name) {
+            0..self.globals_len
+        } else {
+            self.scope_start()..self.nvars
+        };
+        self.find_in(range, name)
             .map(|i| self.vars[i].1)
             .ok_or(Error::UnknownIdentifier)
     }
@@ -680,18 +748,21 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
             return Err(Error::RecursionLimit);
         }
 
-        let saved_base = self.frame_base;
+        let saved_off = self.frame_off;
+        let saved_globals = (self.frame_globals, self.global_count);
         if self.call_depth == 0 {
             self.globals_len = self.nvars;
         }
-        let base = self.nvars;
+        // Offsets from `globals_len` stay valid when a global is inserted
+        let base_off = self.nvars - self.globals_len;
         for (&param, &val) in func.params[..func.count].iter().zip(args) {
             if let Err(err) = self.push_var(param, val) {
-                self.nvars = base;
+                self.nvars = self.globals_len + base_off;
                 return Err(err);
             }
         }
-        self.frame_base = base;
+        self.frame_off = base_off;
+        self.frame_globals = self.global_count;
         self.call_depth += 1;
 
         let mut parser = func.body;
@@ -702,10 +773,11 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
         };
         let result = self.exec_body(&mut parser, func.indent, true, body_ctx, &mut code);
 
-        // Drop the locals and return to the caller's scope
+        // Drop the locals and `global` declarations, back to the caller's scope
         self.call_depth -= 1;
-        self.frame_base = saved_base;
-        self.nvars = base;
+        self.frame_off = saved_off;
+        (self.frame_globals, self.global_count) = saved_globals;
+        self.nvars = self.globals_len + base_off;
 
         Ok(match result? {
             Flow::Return(val) => val,
@@ -833,6 +905,27 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
             }
             self.out.write_str("\n");
             return Ok(Value::None);
+        }
+
+        match (name, args) {
+            ("abs", [val]) => {
+                let n = val.as_int().ok_or(Error::TypeError)?;
+                return n.checked_abs().map(Value::Int).ok_or(Error::Overflow);
+            }
+            ("abs", _) => return Err(Error::TypeError),
+            ("min" | "max", [first, rest @ ..]) if !rest.is_empty() => {
+                let want = if name == "min" { CmpOp::Lt } else { CmpOp::Gt };
+                let mut best = *first;
+                for &val in rest {
+                    if compare(want, val, best)? {
+                        best = val;
+                    }
+                }
+                return Ok(best);
+            }
+            // min()/max() of one value would need an iterable
+            ("min" | "max", _) => return Err(Error::TypeError),
+            _ => {}
         }
 
         if name == "help" {
@@ -974,7 +1067,9 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
     /// `help()`: lists built-ins, the script's functions, and the hardware
     /// functions and constants of the bridge.
     fn print_help(&mut self) {
-        self.out.write_str("Built-in:\n  print(...)\n  help()\n");
+        self.out.write_str(
+            "Built-in:\n  print(...)\n  help()\n  abs(x), min(a, b, ...), max(a, b, ...)\n",
+        );
 
         let mut funcs = self.funcs.iter().flatten().peekable();
         if funcs.peek().is_some() {
@@ -1931,7 +2026,7 @@ print(fact(7), fib(7))
         let interp = core::mem::size_of::<Interpreter<'_, MockOut, MockHardware>>();
         let code = core::mem::size_of::<Code<'_>>();
         let parser = core::mem::size_of::<Parser<'_>>();
-        assert!(interp <= 4096, "Interpreter is {} bytes", interp);
+        assert!(interp <= 8192, "Interpreter is {} bytes", interp);
         assert!(code <= 1024, "Code is {} bytes", code);
         assert!(parser <= 128, "Parser is {} bytes", parser);
     }
@@ -2101,7 +2196,7 @@ print(fact(7), fib(7))
         assert_eq!(vm.eval("help(1)"), Err(Error::TypeError));
         assert_eq!(
             out.as_str(),
-            "Built-in:\n  print(...)\n  help()\n\
+            "Built-in:\n  print(...)\n  help()\n  abs(x), min(a, b, ...), max(a, b, ...)\n\
              Script functions:\n  blink(times, ms)\n\
              Hardware:\n  pin_write(pin, value) - Set an output pin\n  pin_read(pin) - Read a pin\n  \
              text(s, [x, y]) - Show text\n  ticks_ms()\n\
@@ -2111,7 +2206,10 @@ print(fact(7), fib(7))
         // Without hardware, only built-ins are listed
         let mut out = MockOut::new();
         Interpreter::new(&mut out).eval("help()").unwrap();
-        assert_eq!(out.as_str(), "Built-in:\n  print(...)\n  help()\n");
+        assert_eq!(
+            out.as_str(),
+            "Built-in:\n  print(...)\n  help()\n  abs(x), min(a, b, ...), max(a, b, ...)\n"
+        );
     }
 
     #[test]
@@ -2354,6 +2452,80 @@ print(gfx == g, gfx == clock, f == gfx.pixel)
         assert!(out
             .as_str()
             .ends_with("Modules (import them, then help(module)):\n  gfx clock\n"));
+    }
+
+    #[test]
+    fn test_global_statement() {
+        let src = r#"
+count = 0
+total = 0
+
+def press(n):
+    global count, total
+    count += 1
+    total = total + n
+    local = n * 2
+    return local
+
+def reset():
+    global count
+    count = 0
+
+def create():
+    global made
+    made = 'new global'
+
+press(5)
+press(7)
+print(count, total)
+reset()
+print(count, total)
+create()
+print(made)
+
+def outer():
+    x = 1
+    inner()
+    return x
+
+def inner():
+    global count
+    count = 99
+    y = 2
+
+print(outer(), count)
+"#;
+        assert_output(src, "2 12\n0 12\nnew global\n1 99\n");
+        // At the top level `global` does nothing
+        assert_output("global q\nq = 3\nprint(q)", "3\n");
+
+        // A `global` declaration only applies to the function that made it
+        let (err, line) =
+            run_err("n = 0\ndef a():\n    global n\n    n = 1\ndef b():\n    n += 1\na()\nb()");
+        assert_eq!((err, line), (Error::UnknownIdentifier, Some(6)));
+        // Creating a global while other calls are running keeps their locals intact
+        assert_output(
+            "def mk(v):\n    global g\n    g = v\ndef run(a):\n    b = a + 1\n    mk(a * 10)\n    return a + b\nprint(run(2), g)",
+            "5 20\n",
+        );
+    }
+
+    #[test]
+    fn test_abs_min_max() {
+        assert_eval("abs(-5)", "5");
+        assert_eval("abs(7)", "7");
+        assert_eval("abs(True)", "1");
+        assert_eval("min(3, 1, 2)", "1");
+        assert_eval("max(3, 1, 2)", "3");
+        assert_eval("max(-1, -5)", "-1");
+        assert_eval("min('b', 'a')", "a");
+        assert_eval("max(2, 2)", "2");
+        assert_eval_err("abs('x')", Error::TypeError);
+        assert_eval_err("abs(1, 2)", Error::TypeError);
+        assert_eval_err("min(1)", Error::TypeError);
+        assert_eval_err("max()", Error::TypeError);
+        assert_eval_err("max(1, 'a')", Error::TypeError);
+        assert_eval_err("abs(-9223372036854775807 - 1)", Error::Overflow);
     }
 
     #[test]
