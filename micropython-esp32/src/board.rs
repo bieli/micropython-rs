@@ -81,6 +81,8 @@ macro_rules! board_functions {
             micropython_rs::HwFn::new("pin_read", "pin", "Read a pin: 0 or 1"),
             micropython_rs::HwFn::new("pin_toggle", "pin", "Invert an output pin"),
             micropython_rs::HwFn::new("adc_read", "pin", "Raw 12-bit ADC value (pins 34, 36, 39)"),
+            micropython_rs::HwFn::with_args("adc_mv", 1, 2, "pin, [samples]", "Calibrated millivolts, averaged (default 16 samples)"),
+            micropython_rs::HwFn::new("adc_vref", "", "ADC reference voltage from eFuse, mV"),
             micropython_rs::HwFn::new("pwm", "pin, freq, duty", "PWM output, duty in percent (0-100)"),
             micropython_rs::HwFn::new("pwm_stop", "pin", "Stop PWM on a pin"),
             micropython_rs::HwFn::new("i2c_probe", "addr", "True if a device answers at addr"),
@@ -215,6 +217,14 @@ impl<'d> Board<'d> {
             }
             "pin_read" => Ok(Some(self.input(pin_number(int(0)?)?)?.is_high() as i64)),
             "adc_read" => self.adc_read(int(0)?).map(Some),
+            "adc_mv" => {
+                let samples = match args.get(1) {
+                    Some(arg) => arg.int()?,
+                    None => DEFAULT_ADC_SAMPLES,
+                };
+                self.adc_mv(int(0)?, samples).map(Some)
+            }
+            "adc_vref" => Ok(Some(adc_vref_mv() as i64)),
             "pwm" => self
                 .pwm(pin_number(int(0)?)?, int(1)?, int(2)?)
                 .map(|()| None),
@@ -375,6 +385,21 @@ impl<'d> Board<'d> {
         value.map(i64::from).map_err(|_| Error::IoError)
     }
 
+    /// Average of `samples` readings, converted to millivolts with the chip's
+    /// eFuse reference voltage (see `raw_to_mv`).
+    pub fn adc_mv(&mut self, pin: i64, samples: i64) -> Result<i64, Error> {
+        if !(1..=MAX_ADC_SAMPLES).contains(&samples) {
+            return Err(Error::ValueError);
+        }
+        let mut total = 0;
+        for _ in 0..samples {
+            total += self.adc_read(pin)?;
+        }
+        // Round to the nearest raw value before converting
+        let raw = (total + samples / 2) / samples;
+        Ok(raw_to_mv(raw as u32, adc_vref_mv()) as i64)
+    }
+
     fn pwm(&mut self, pin: u8, freq: i64, duty: i64) -> Result<(), Error> {
         self.check_allowed(pin)?;
         if pin >= 34 || !(1..=40_000_000).contains(&freq) || !(0..=100).contains(&duty) {
@@ -477,6 +502,35 @@ const DUTY_RESOLUTIONS: [timer::config::Duty; 10] = {
         Duty4Bit, Duty2Bit,
     ]
 };
+
+const DEFAULT_ADC_SAMPLES: i64 = 16;
+const MAX_ADC_SAMPLES: i64 = 1024;
+
+/// The ADC reference voltage of this chip in mV, from eFuse. The factory
+/// stores the deviation from 1100 mV in 7 mV steps (sign-magnitude, 5 bits);
+/// chips without it read as 0 deviation, i.e. 1100 mV.
+pub fn adc_vref_mv() -> u32 {
+    let bits: u8 = esp_hal::efuse::Efuse::read_field_le(esp_hal::efuse::ADC_VREF);
+    let magnitude = (bits & 0x0F) as i32;
+    let deviation = if bits & 0x10 != 0 {
+        -magnitude
+    } else {
+        magnitude
+    };
+    (1100 + deviation * 7) as u32
+}
+
+/// Raw 12-bit reading at 11 dB attenuation to millivolts, with ESP-IDF's
+/// linear characterization for ADC1 (`esp_adc_cal`, "Vref" mode):
+/// `mv = (vref * 196602 / 4096 * raw + 32768) / 65536 + 142`.
+/// ESP-IDF adds a lookup table for the top of the 11 dB range, which this
+/// leaves out, so readings above ~2.6 V are a few percent less accurate.
+pub fn raw_to_mv(raw: u32, vref_mv: u32) -> u32 {
+    const SCALE_11DB: u64 = 196_602;
+    const OFFSET_11DB: u64 = 142;
+    let coeff_a = vref_mv as u64 * SCALE_11DB / 4096;
+    ((coeff_a * raw as u64 + 32_768) / 65_536 + OFFSET_11DB) as u32
+}
 
 /// Why the chip started, as one of the `*_RESET` constants.
 pub fn reset_cause() -> i64 {

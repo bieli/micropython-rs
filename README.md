@@ -475,6 +475,7 @@ boot, or run `tools/mpy.py erase`.
 | [`scripts/tft_clock.py`](micropython-esp32/scripts/tft_clock.py) | An uptime clock drawn with `text()` (TTGO only) |
 | [`scripts/display_demo.py`](micropython-esp32/scripts/display_demo.py) | `import display`: lines, rectangles, circles, triangles, pixels and text, with timings (TTGO only) |
 | [`scripts/calculator.py`](micropython-esp32/scripts/calculator.py) | A two-button calculator app: a keypad on the screen, `buttons` events, `global` state (TTGO only) |
+| [`scripts/voltmeter.py`](micropython-esp32/scripts/voltmeter.py) | A voltmeter: calibrated mV readout, min/max/average, sweeping graph, battery gauge (TTGO only) |
 
 ### Calculator app (TTGO T-Display)
 
@@ -505,6 +506,51 @@ tools/mpy.py run scripts/calculator.py     # try it (Ctrl-C in the terminal to s
 tools/mpy.py save scripts/calculator.py    # make it the app that starts at every boot
 tools/mpy.py erase                         # back to the built-in demo
 ```
+
+### Voltmeter app (TTGO T-Display)
+
+[`scripts/voltmeter.py`](micropython-esp32/scripts/voltmeter.py) turns the board into a small measuring instrument:
+
+```text
+┌──────────────────────────────────────┐
+│ AIN GPIO36   HOLD        [####] 87%  │  input, HOLD flag, battery level
+│ 1234 mV                    3.95 V    │  input in mV (big), battery voltage
+│ min 1201  max 1340  avg 1288         │  statistics since the last reset
+│3300┬─────────────────────────────────│
+│    │      ╱╲      ╱╲                 │  sweeping graph, 20 points per second,
+│1650┤ ────╱──╲────╱──╲──── │          │  grey cursor = where the next point goes
+│    │          ╲╱      ╲╱             │
+│   0┴─────────────────────────────────│
+└──────────────────────────────────────┘
+```
+
+| Button | Short press | Hold (600 ms) |
+|--------|-------------|---------------|
+| LEFT (GPIO0) | Switch input: GPIO36 ↔ GPIO39 | Reset min / max / average |
+| RIGHT (GPIO35) | HOLD: freeze the readings | Graph range: 3300 → 1650 → 825 mV full scale |
+
+* Each point is the average of 16 readings (`adc_mv(pin, 16)`); the average shown is a moving average.
+* Below about 150 mV the ESP32 ADC reads 0, shown as `< 150 mV`; at the top of its range it saturates, shown as `> 3.1 V`.
+* The battery level is linear from 3.3 V (0 %) to 4.2 V (100 %) for a Li-ion cell. With USB power and no battery the
+  battery pin floats (about 2.7 V on the test board), so the gauge only means something with a battery connected.
+* To match a multimeter, measure one known voltage and set `CAL_NUM` / `CAL_DEN` (gain) and `CAL_OFFSET` (mV) at the
+  top of the script.
+
+> [!WARNING]
+> ADC pins take 0–3.3 V only. Measure higher voltages through a resistor divider, and never connect more than 3.3 V
+> (or a negative voltage) directly to GPIO36/39.
+
+```bash
+tools/mpy.py run scripts/voltmeter.py      # try it
+tools/mpy.py save scripts/voltmeter.py     # start it at every boot
+```
+
+#### ADC accuracy
+
+`adc_mv()` uses ESP-IDF's linear "Vref" characterization for ADC1 at 11 dB attenuation
+(`mV = (vref * 196602 / 4096 * raw + 32768) / 65536 + 142`), with the reference voltage the factory stored in eFuse.
+ESP-IDF adds a lookup table for the top of the 11 dB range, which isn't included here, so readings above about
+2.6 V are a few percent less accurate. Useful range: about 0.15–3.1 V. Averaging (`samples`) reduces the noise.
 | [`scripts/watchdog.py`](micropython-esp32/scripts/watchdog.py) | The watchdog resetting a hung script, and `reset_cause()` after the reboot |
 | [`scripts/errors.py`](micropython-esp32/scripts/errors.py) | A forbidden pin reported as `ValueError` with its line number |
 
@@ -517,11 +563,12 @@ Pins are plain GPIO numbers.
 |------|-----------|-------|
 | Time | `sleep_ms(ms)`, `sleep_us(us)`, `ticks_ms()`, `ticks_us()`, `ticks_diff(new, old)` | `delay_ms(ms)` is an alias of `sleep_ms`. Ticks count from boot as 64-bit values and don't wrap |
 | GPIO | `pin_mode(pin, mode)`, `pin_write(pin, value)`, `pin_read(pin)`, `pin_toggle(pin)` | Modes: `OUT`, `IN`, `IN_PULLUP`, `IN_PULLDOWN`. `pin_write` on an unconfigured pin makes it an output; `pin_read` on one makes it an input. Outputs read back their own level |
-| ADC | `adc_read(pin)` | Raw 12-bit value (0–4095, 11 dB attenuation, about 0–3.3 V) on GPIO34, 36 and 39 |
+| ADC | `adc_read(pin)`, `adc_mv(pin, [samples])`, `adc_vref()` | `adc_read`: raw 12-bit value (0–4095, 11 dB attenuation) on GPIO34, 36 and 39. `adc_mv`: millivolts, averaged over `samples` readings (default 16), calibrated with the chip's eFuse reference voltage (`adc_vref()`, e.g. 1135 mV). See [ADC accuracy](#adc-accuracy) |
 | PWM | `pwm(pin, freq, duty)`, `pwm_stop(pin)` | `duty` in percent (0–100). Up to 4 pins at once, each with its own frequency (LEDC timers 0–3). The duty resolution adapts to the frequency (14 bits at 50 Hz for servos). `pwm_stop` leaves the pin as a low output |
 | I²C | `i2c_probe(addr)`, `i2c_scan()`, `i2c_read_reg(addr, reg)`, `i2c_read_reg16(addr, reg)`, `i2c_write_reg(addr, reg, value)` | 100 kHz on SDA = GPIO21, SCL = GPIO22. `i2c_scan()` returns the number of devices; loop over `i2c_probe` to list addresses. 16-bit reads are big-endian. A device that doesn't answer raises `IoError` |
 | Watchdog | `wdt_enable(timeout_ms)`, `wdt_feed()`, `wdt_disable()` | The RTC watchdog resets the whole board when it isn't fed in time. `sleep_ms` feeds it automatically every 100 ms |
 | System | `reset()`, `reset_cause()` | `reset_cause()` returns `PWRON_RESET`, `HARD_RESET`, `WDT_RESET`, `DEEPSLEEP_RESET` or `SOFT_RESET` (MicroPython's values). The firmware also prints the reset reason at boot |
+| Battery (`tft` only) | `battery_mv([samples])` | Battery voltage in mV: switches on the TTGO's divider (`ADC_EN`, GPIO14), reads GPIO34, doubles it, switches the divider off |
 | TFT (`tft` only) | `cls()`, `color(r, g, b)`, `text(x, y, s)`, `rect(x, y, w, h)`, `backlight(on)` | `color` sets the text and fill color (0–255 per channel). `text` and `rect` draw at pixel positions. `WIDTH` and `HEIGHT` are 240 and 135 |
 
 #### Modules
@@ -851,6 +898,7 @@ help() lists functions. Ctrl-C stops a script, Ctrl-D soft resets, Ctrl-E pastes
 - [x] `main.py` saved in flash and uploaded over USB (`tools/mpy.py save`)
 - [x] `import` of native modules written in Rust: `time` and a `display` drawing module (pixels, lines, shapes, text)
 - [x] `global` statement, `abs`/`min`/`max`; `buttons` module and a two-button calculator app on the TTGO
+- [x] Calibrated ADC readings (`adc_mv`, eFuse Vref), `battery_mv()`, and a voltmeter app with a live graph
 - [ ] Compact Bytecode Compiler & Stack VM
 
 

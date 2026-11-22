@@ -46,6 +46,7 @@ Start with flat functions that follow MicroPython's names. Move to `machine.Pin(
 | 3.7 | TFT functions: `cls()`, `color(r, g, b)`, `text(x, y, s)`, `backlight(on)`, and scrolling | Makes the `tft` feature useful beyond showing logs | ✅ |
 | 3.8 | **Native modules with `import`**: `import display`, `from time import sleep_ms`; a `display` drawing module (pixels, lines, rectangles, circles, triangles, text) and a `time` module | Rust code grouped into MicroPython-style modules instead of one flat namespace | ✅ |
 | 3.9 | **`buttons` module and apps**: debounced short/long presses, `display.number()` and fonts, and a two-button calculator (`scripts/calculator.py`) | Real interactive apps on the board without a PC | ✅ |
+| 3.10 | **Calibrated ADC** (`adc_mv`, eFuse Vref), `battery_mv()`, and a voltmeter app (`scripts/voltmeter.py`) | Readings in millivolts instead of raw counts. ESP-IDF's 11 dB lookup table is still missing | ✅ |
 
 Design note (✅ done): `HardwareBridge` now has a function table (`functions() -> &[HwFn]`) with argument counts,
 used for checks and `help()`, plus `constants()` and string arguments (`call_args`). Dispatch is still a `match` on the name,
