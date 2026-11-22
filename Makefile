@@ -1,12 +1,13 @@
 # Target configuration
 EMBEDDED_TARGET := thumbv7em-none-eabihf
+MIN_COVERAGE := 30
 
 FILE ?= hello.py
 
-.PHONY: all check test run build-embedded clean
+.PHONY: all check test coverage run build-embedded clean
 
-# Default target: run host tests and verify bare-metal compilation
-all: test build-embedded
+# Default target: run host tests, enforce coverage, and verify bare-metal compilation
+all: test coverage build-embedded
 
 # Fast syntax and type check for both host and embedded targets
 check:
@@ -16,6 +17,10 @@ check:
 # Run unit tests on the host
 test:
 	cargo test
+
+# Enforce minimum line coverage threshold (exits non-zero if below MIN_COVERAGE)
+coverage:
+	cargo llvm-cov --lib --fail-under-lines $(MIN_COVERAGE)
 
 # Run the host CLI runner (src/main.rs) with a Python script
 run:
