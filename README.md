@@ -29,9 +29,9 @@ Install Rust using rustup, then add the ARM Cortex-M target so you can test bare
 rustup target add thumbv7em-none-eabihf
 ```
 
-2. Run Example from main.rs
+2. Run hello.py example
 ```bash
-make run
+make run hello.py
 ```
 
 3. Run all tests
@@ -71,6 +71,7 @@ fn run_script() {
 - [x] Zero-copy Lexer (print, strings, integers, comments)
 - [x] Stack-allocated AST Parser & Evaluator
 - [x] #![no_std] ARM Cortex-M build verification
+- [x] add assiggment in interpreted Python code "="
 - [ ] running external hello.py file with Python code by interpreter (instead of hardcoded version!)
 - [ ] Variables and basic arithmetic (+, -, *, /)
 - [ ] Control flow (if / else, while loops with indentation tracking)
