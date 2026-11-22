@@ -30,7 +30,10 @@ fn main() {
     let mut vm = Interpreter::new(&mut out);
 
     if let Err(err) = vm.eval(&script) {
-        eprintln!("Runtime Error: {:?}", err);
+        match vm.error_line() {
+            Some(line) => eprintln!("{}:{}: Error: {:?}", path, line, err),
+            None => eprintln!("{}: Error: {:?}", path, err),
+        }
         process::exit(1);
     }
 }

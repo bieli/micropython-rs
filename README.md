@@ -55,7 +55,10 @@ msg = 'hello'
 y = (x + 2) * -3 // 4 % 5   # integer arithmetic with Python precedence
 print(msg, 'y =', y)        # print with multiple arguments
 delay_ms(x * 50)            # hardware functions take expressions as arguments
+level = adc_read(34) * 3    # ...and their return values can be used in expressions
 ```
+
+See [ROADMAP.md](ROADMAP.md) for planned features.
 
 ### Arithmetic operators
 
@@ -90,6 +93,43 @@ The limits are in `src/ast_parser.rs`:
 | `MAX_CALL_ARGS` | 8 | Arguments per function call |
 
 Going over a limit raises `Error::OutOfMemory`.
+
+### Function calls
+
+Calls are expressions, so they can be nested and combined with operators: `print(f(g(1), 2 + h()))`.
+
+* `print(...)` is built in. It prints its arguments separated by spaces and returns `None`.
+* Every other name is passed to your `HardwareBridge`. Arguments must be integers (otherwise `Error::TypeError`).
+  Return `Ok(Some(n))` to give the script a value, or `Ok(None)` for `None`.
+* All arguments are evaluated before the call runs. If one fails, nothing is printed or sent to hardware.
+
+### Errors, line numbers and running safely on a device
+
+`eval()` returns an `Error`, and `error_line()` tells you where it happened:
+
+```rust
+if let Err(err) = vm.eval(script) {
+    match vm.error_line() {
+        Some(line) => println!("Python Error at line {}: {:?}", line, err),
+        None => println!("Python Error: {:?}", err),
+    }
+}
+```
+
+Syntax errors point at the offending token, and runtime errors at the statement that failed.
+
+Two guards stop a script that runs too long (they matter most once loops are added):
+
+```rust
+use core::sync::atomic::{AtomicBool, Ordering};
+
+static ABORT: AtomicBool = AtomicBool::new(false);   // set to true from a UART/button interrupt
+
+vm.set_step_limit(Some(10_000));  // eval() returns Error::StepLimit after 10 000 statements
+vm.set_abort_flag(&ABORT);        // eval() returns Error::Interrupted once ABORT is true
+```
+
+The step budget starts over for each `eval()` call. The abort flag is only read, so clear it yourself before the next run.
 
 ## Using micropython-rs on a Microcontroller
 

@@ -176,7 +176,10 @@ fn main() -> ! {
 fn run<O: micropython_rs::Output, H: HardwareBridge>(mut vm: Interpreter<'_, O, H>) -> ! {
     match vm.eval(SCRIPT) {
         Ok(()) => println!("=== Execution complete ==="),
-        Err(err) => println!("Python Error: {:?}", err),
+        Err(err) => match vm.error_line() {
+            Some(line) => println!("Python Error at line {}: {:?}", line, err),
+            None => println!("Python Error: {:?}", err),
+        },
     }
     loop {}
 }

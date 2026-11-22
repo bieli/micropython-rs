@@ -2,13 +2,15 @@
 // INTERPRETER / EVALUATOR
 // ============================================================================
 
+use core::sync::atomic::{AtomicBool, Ordering};
+
 use crate::ast_parser::{BinOp, Code, Expr, Item, Parser, Stmt, MAX_CALL_ARGS, MAX_EXPR_ITEMS};
 use crate::{Error, HardwareBridge, NoHardware, Output};
 
 const MAX_VARS: usize = 32;
-/// RPN evaluation stack depth: an expression with N items never holds more
-/// than N/2 + 1 intermediate values at once.
-const MAX_EVAL_STACK: usize = MAX_EXPR_ITEMS / 2 + 1;
+/// RPN evaluation stack depth. With calls, every item of an expression can be
+/// an operand waiting on the stack (`f(1, 2, 3, ...)`), so it matches the item limit.
+const MAX_EVAL_STACK: usize = MAX_EXPR_ITEMS;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Value<'a> {
@@ -21,34 +23,90 @@ pub struct Interpreter<'a, O: Output, H: HardwareBridge = NoHardware> {
     out: &'a mut O,
     hw: Option<&'a mut H>,
     vars: [Option<(&'a str, Value<'a>)>; MAX_VARS],
+    /// Line of the last error returned by `eval`, if any.
+    error_line: Option<u32>,
+    /// Maximum statements one `eval` call may execute (`None` = unlimited).
+    step_limit: Option<u32>,
+    /// Set from outside (e.g. a UART Ctrl-C handler) to stop a running script.
+    abort: Option<&'a AtomicBool>,
 }
 
 impl<'a, O: Output> Interpreter<'a, O, NoHardware> {
     pub fn new(out: &'a mut O) -> Self {
-        Self {
-            out,
-            hw: None,
-            vars: [None; MAX_VARS],
-        }
+        Self::from_parts(out, None)
     }
 }
 
 impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
     pub fn with_hardware(out: &'a mut O, hw: &'a mut H) -> Self {
+        Self::from_parts(out, Some(hw))
+    }
+
+    fn from_parts(out: &'a mut O, hw: Option<&'a mut H>) -> Self {
         Self {
             out,
-            hw: Some(hw),
+            hw,
             vars: [None; MAX_VARS],
+            error_line: None,
+            step_limit: None,
+            abort: None,
         }
     }
 
+    /// Limits how many statements a single `eval` call may execute.
+    /// When the limit is hit, `eval` returns `Error::StepLimit`.
+    /// Protects the device from scripts that never finish.
+    pub fn set_step_limit(&mut self, limit: Option<u32>) {
+        self.step_limit = limit;
+    }
+
+    /// Registers a flag that stops the running script when set to `true`
+    /// (checked before every statement), making `eval` return `Error::Interrupted`.
+    /// The flag is only read, so the owner clears it before the next run.
+    pub fn set_abort_flag(&mut self, flag: &'a AtomicBool) {
+        self.abort = Some(flag);
+    }
+
+    /// 1-based line where the error returned by the last `eval` call happened,
+    /// or `None` if it succeeded.
+    pub const fn error_line(&self) -> Option<u32> {
+        self.error_line
+    }
+
     pub fn eval(&mut self, source: &'a str) -> Result<(), Error> {
+        let mut line = 1;
+        let result = self.run(source, &mut line);
+        self.error_line = result.err().map(|_| line);
+        result
+    }
+
+    /// Runs `source`, keeping `line` pointed at the code currently being handled.
+    fn run(&mut self, source: &'a str, line: &mut u32) -> Result<(), Error> {
         let mut parser = Parser::new(source)?;
         let mut code = Code::new();
-        while let Some(stmt) = parser.parse_next_stmt(&mut code)? {
+        let mut steps: u32 = 0;
+
+        loop {
+            let parsed = parser.parse_next_stmt(&mut code);
+            // Parse errors point at the offending token, runtime errors at the statement
+            *line = match parsed {
+                Ok(_) => parser.stmt_line(),
+                Err(_) => parser.line(),
+            };
+            let Some(stmt) = parsed? else {
+                return Ok(());
+            };
+
+            if self.abort.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+                return Err(Error::Interrupted);
+            }
+            steps += 1;
+            if self.step_limit.is_some_and(|limit| steps > limit) {
+                return Err(Error::StepLimit);
+            }
+
             self.exec_stmt(stmt, &code)?;
         }
-        Ok(())
     }
 
     fn set_var(&mut self, name: &'a str, val: Value<'a>) -> Result<(), Error> {
@@ -77,7 +135,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
     }
 
     /// Evaluates one RPN expression with a fixed-size value stack.
-    fn eval_expr(&self, code: &Code<'a>, expr: Expr) -> Result<Value<'a>, Error> {
+    fn eval_expr(&mut self, code: &Code<'a>, expr: Expr) -> Result<Value<'a>, Error> {
         let mut stack = [Value::None; MAX_EVAL_STACK];
         let mut sp = 0;
 
@@ -100,6 +158,10 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
                         _ => return Err(Error::TypeError),
                     }
                 }
+                Item::Call { name, argc } => {
+                    sp -= argc as usize;
+                    self.call_function(name, &stack[sp..sp + argc as usize])?
+                }
             };
             if sp >= MAX_EVAL_STACK {
                 return Err(Error::OutOfMemory);
@@ -121,41 +183,38 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
                 let val = self.eval_expr(code, expr)?;
                 self.set_var(name, val)
             }
-            Stmt::Call { name, args, count } => match name {
-                "print" => {
-                    // Evaluate all arguments first, so an error prints nothing (like Python)
-                    let mut vals = [Value::None; MAX_CALL_ARGS];
-                    for (val, expr) in vals.iter_mut().zip(&args[..count]) {
-                        *val = self.eval_expr(code, *expr)?;
-                    }
-                    for (i, val) in vals[..count].iter().enumerate() {
-                        if i > 0 {
-                            self.out.write_str(" ");
-                        }
-                        self.print_value(*val);
-                    }
-                    self.out.write_str("\n");
-                    Ok(())
-                }
-                _ => {
-                    let mut eval_args = [0i64; MAX_CALL_ARGS];
-                    for (i, expr) in args[..count].iter().enumerate() {
-                        match self.eval_expr(code, *expr)? {
-                            Value::Int(n) => eval_args[i] = n,
-                            _ => return Err(Error::InvalidSyntax),
-                        }
-                    }
-
-                    match self.hw.as_mut() {
-                        Some(hw) => {
-                            hw.call(name, &eval_args[..count])?;
-                            Ok(())
-                        }
-                        None => Err(Error::UnknownIdentifier),
-                    }
-                }
-            },
+            Stmt::Expr(expr) => self.eval_expr(code, expr).map(|_| ()),
         }
+    }
+
+    /// Calls a built-in (`print`) or a hardware function. Arguments are
+    /// already evaluated, so a failing argument means nothing is printed or
+    /// sent to hardware (like Python).
+    fn call_function(&mut self, name: &str, args: &[Value<'_>]) -> Result<Value<'a>, Error> {
+        if name == "print" {
+            for (i, val) in args.iter().enumerate() {
+                if i > 0 {
+                    self.out.write_str(" ");
+                }
+                self.print_value(*val);
+            }
+            self.out.write_str("\n");
+            return Ok(Value::None);
+        }
+
+        let hw = self.hw.as_mut().ok_or(Error::UnknownIdentifier)?;
+        let mut int_args = [0i64; MAX_CALL_ARGS];
+        for (slot, val) in int_args.iter_mut().zip(args) {
+            match val {
+                Value::Int(n) => *slot = *n,
+                _ => return Err(Error::TypeError),
+            }
+        }
+
+        Ok(match hw.call(name, &int_args[..args.len()])? {
+            Some(n) => Value::Int(n),
+            None => Value::None,
+        })
     }
 
     fn print_value(&mut self, val: Value<'_>) {
@@ -284,6 +343,9 @@ mod tests {
                     self.total_delay_ms += *ms;
                     Ok(None)
                 }
+                // Fake sensor: returns pin number * 10
+                ("adc_read", [pin]) => Ok(Some(*pin * 10)),
+                ("millis", []) => Ok(Some(self.total_delay_ms)),
                 _ => Err(Error::UnknownIdentifier),
             }
         }
@@ -331,7 +393,7 @@ print('LED ok')
         // Test error paths while `vm` still holds the mutable borrows
         assert_eq!(vm.eval("unknown_hw()"), Err(Error::UnknownIdentifier));
         assert_eq!(vm.eval("led_on(1)"), Err(Error::UnknownIdentifier));
-        assert_eq!(vm.eval("delay_ms('bad')"), Err(Error::InvalidSyntax));
+        assert_eq!(vm.eval("delay_ms('bad')"), Err(Error::TypeError));
 
         // Now `vm` is no longer used, so we can inspect `hw` and `out`
         assert!(hw.led_state);
@@ -457,6 +519,123 @@ delay_ms(half - base)
 
         assert_eq!(hw.total_delay_ms, 200 + 75);
         assert_eq!(out.as_str(), "total = 350 half = 175 count = 2\n350\n");
+    }
+
+    fn mock_hw() -> MockHardware {
+        MockHardware {
+            led_state: false,
+            total_delay_ms: 0,
+        }
+    }
+
+    #[test]
+    fn test_hardware_return_values_in_expressions() {
+        let mut out = MockOut::new();
+        let mut hw = mock_hw();
+        let mut vm = Interpreter::with_hardware(&mut out, &mut hw);
+
+        let code = r#"
+level = adc_read(34) * 3 + 1
+delay_ms(adc_read(5) - 20)
+print('level =', level, 'now =', millis())
+print(adc_read(adc_read(1)))
+nothing = led_on()
+print(nothing)
+"#;
+        vm.eval(code).unwrap();
+
+        // A function returning None can't be used in arithmetic
+        assert_eq!(vm.eval("x = led_on() + 1"), Err(Error::TypeError));
+        // print() itself returns None
+        assert_eq!(vm.eval("x = print('side effect')"), Ok(()));
+        assert_eq!(vm.eval("print(x)"), Ok(()));
+
+        assert_eq!(hw.total_delay_ms, 30);
+        assert_eq!(
+            out.as_str(),
+            "level = 1021 now = 30\n100\nNone\nside effect\nNone\n"
+        );
+    }
+
+    #[test]
+    fn test_failed_argument_skips_call() {
+        let mut out = MockOut::new();
+        let mut hw = mock_hw();
+        let mut vm = Interpreter::with_hardware(&mut out, &mut hw);
+
+        // The second argument fails, so neither print nor delay_ms run
+        assert_eq!(vm.eval("print('a', 1 // 0)"), Err(Error::ZeroDivision));
+        assert_eq!(vm.eval("delay_ms(missing)"), Err(Error::UnknownIdentifier));
+        assert_eq!(hw.total_delay_ms, 0);
+        assert_eq!(out.as_str(), "");
+    }
+
+    #[test]
+    fn test_error_line_numbers() {
+        let mut out = MockOut::new();
+        let mut vm = Interpreter::new(&mut out);
+
+        let code = "x = 1\n\n# comment\ny = x * 2\nz = y // 0\nprint(z)\n";
+        assert_eq!(vm.eval(code), Err(Error::ZeroDivision));
+        assert_eq!(vm.error_line(), Some(5));
+
+        // Parse and lexer errors report the line of the offending token
+        assert_eq!(vm.eval("a = 1\nb = (a +\n"), Err(Error::UnexpectedToken));
+        assert_eq!(vm.error_line(), Some(2));
+        assert_eq!(
+            vm.eval("a = 1\nb = 2\nc = 'open"),
+            Err(Error::UnterminatedString)
+        );
+        assert_eq!(vm.error_line(), Some(3));
+        assert_eq!(
+            vm.eval("print(1)\nprint(@)"),
+            Err(Error::UnexpectedChar('@'))
+        );
+        assert_eq!(vm.error_line(), Some(2));
+        assert_eq!(vm.eval("'first token"), Err(Error::UnterminatedString));
+        assert_eq!(vm.error_line(), Some(1));
+
+        // A successful run clears it
+        assert_eq!(vm.eval("print(1)"), Ok(()));
+        assert_eq!(vm.error_line(), None);
+    }
+
+    #[test]
+    fn test_step_limit() {
+        let mut out = MockOut::new();
+        let mut vm = Interpreter::new(&mut out);
+        vm.set_step_limit(Some(3));
+
+        // Exactly at the limit is fine, and the budget resets for every eval()
+        assert_eq!(vm.eval("a = 1\nb = 2\nc = 3"), Ok(()));
+        assert_eq!(
+            vm.eval("print(1)\nprint(2)\nprint(3)\nprint(4)"),
+            Err(Error::StepLimit)
+        );
+        assert_eq!(vm.error_line(), Some(4));
+
+        vm.set_step_limit(None);
+        assert_eq!(vm.eval("a = 1\nb = 2\nc = 3\nd = 4"), Ok(()));
+
+        // Statements before the limit ran
+        assert_eq!(out.as_str(), "1\n2\n3\n");
+    }
+
+    #[test]
+    fn test_abort_flag() {
+        let abort = AtomicBool::new(false);
+        let mut out = MockOut::new();
+        let mut vm = Interpreter::new(&mut out);
+        vm.set_abort_flag(&abort);
+
+        assert_eq!(vm.eval("print(1)"), Ok(()));
+        abort.store(true, Ordering::Relaxed);
+        assert_eq!(vm.eval("print(2)"), Err(Error::Interrupted));
+        assert_eq!(vm.error_line(), Some(1));
+        abort.store(false, Ordering::Relaxed);
+        assert_eq!(vm.eval("print(3)"), Ok(()));
+
+        assert_eq!(out.as_str(), "1\n3\n");
     }
 
     #[test]

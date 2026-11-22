@@ -21,6 +21,10 @@ pub enum Error {
     ZeroDivision,
     /// Integer result does not fit into `i64`.
     Overflow,
+    /// The script executed more statements than `Interpreter::set_step_limit` allows.
+    StepLimit,
+    /// The abort flag registered with `Interpreter::set_abort_flag` was set.
+    Interrupted,
 }
 
 pub trait Output {
