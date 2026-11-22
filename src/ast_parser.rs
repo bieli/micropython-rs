@@ -7,7 +7,7 @@ use crate::Error;
 
 pub const MAX_CALL_ARGS: usize = 8;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Expr<'a> {
     None,
     Str(&'a str),
@@ -15,7 +15,7 @@ pub enum Expr<'a> {
     Ident(&'a str),
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum Stmt<'a> {
     Assign {
         name: &'a str,
@@ -118,5 +118,120 @@ impl<'a> Parser<'a> {
             }
             _ => Err(Error::UnexpectedToken),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_empty_and_blank_lines() {
+        let mut parser = Parser::new("\n   \n\t\n").unwrap();
+        assert_eq!(parser.parse_next_stmt(), Ok(None));
+        // Calling again at EOF continues returning Ok(None)
+        assert_eq!(parser.parse_next_stmt(), Ok(None));
+    }
+
+    #[test]
+    fn test_variable_assignments() {
+        let src = r#"
+x = 42
+greeting = 'hello'
+alias = x
+"#;
+        let mut parser = Parser::new(src).unwrap();
+
+        assert_eq!(
+            parser.parse_next_stmt(),
+            Ok(Some(Stmt::Assign {
+                name: "x",
+                value: Expr::Int(42),
+            }))
+        );
+        assert_eq!(
+            parser.parse_next_stmt(),
+            Ok(Some(Stmt::Assign {
+                name: "greeting",
+                value: Expr::Str("hello"),
+            }))
+        );
+        assert_eq!(
+            parser.parse_next_stmt(),
+            Ok(Some(Stmt::Assign {
+                name: "alias",
+                value: Expr::Ident("x"),
+            }))
+        );
+        assert_eq!(parser.parse_next_stmt(), Ok(None));
+    }
+
+    #[test]
+    fn test_function_call_zero_args() {
+        let mut parser = Parser::new("print()").unwrap();
+
+        assert_eq!(
+            parser.parse_next_stmt(),
+            Ok(Some(Stmt::Call {
+                func: "print",
+                args: [Expr::None; MAX_CALL_ARGS],
+                arg_count: 0,
+            }))
+        );
+        assert_eq!(parser.parse_next_stmt(), Ok(None));
+    }
+
+    #[test]
+    fn test_function_call_multiple_args() {
+        let mut parser = Parser::new("print('count:', 10, x)").unwrap();
+
+        let mut expected_args = [Expr::None; MAX_CALL_ARGS];
+        expected_args[0] = Expr::Str("count:");
+        expected_args[1] = Expr::Int(10);
+        expected_args[2] = Expr::Ident("x");
+
+        assert_eq!(
+            parser.parse_next_stmt(),
+            Ok(Some(Stmt::Call {
+                func: "print",
+                args: expected_args,
+                arg_count: 3,
+            }))
+        );
+        assert_eq!(parser.parse_next_stmt(), Ok(None));
+    }
+
+    #[test]
+    fn test_syntax_errors() {
+        // Statement starting with a literal instead of an identifier
+        let mut p1 = Parser::new("123 = 456").unwrap();
+        assert_eq!(p1.parse_next_stmt(), Err(Error::InvalidSyntax));
+
+        // Identifier followed by neither `=` nor `(`
+        let mut p2 = Parser::new("x 42").unwrap();
+        assert_eq!(p2.parse_next_stmt(), Err(Error::UnexpectedToken));
+
+        // Missing value on right-hand side of assignment
+        let mut p3 = Parser::new("x = \n").unwrap();
+        assert_eq!(p3.parse_next_stmt(), Err(Error::UnexpectedToken));
+
+        // Missing comma between function arguments
+        let mut p4 = Parser::new("print(1 2)").unwrap();
+        assert_eq!(p4.parse_next_stmt(), Err(Error::UnexpectedToken));
+
+        // Unclosed parenthesis
+        let mut p5 = Parser::new("print('hi'\n").unwrap();
+        assert_eq!(p5.parse_next_stmt(), Err(Error::UnexpectedToken));
+
+        // Trailing tokens on the same line after a valid statement
+        let mut p6 = Parser::new("x = 1 y = 2").unwrap();
+        assert_eq!(p6.parse_next_stmt(), Err(Error::UnexpectedToken));
+    }
+
+    #[test]
+    fn test_too_many_args_error() {
+        // 9 arguments exceeds MAX_CALL_ARGS (8)
+        let mut parser = Parser::new("print(1, 2, 3, 4, 5, 6, 7, 8, 9)").unwrap();
+        assert_eq!(parser.parse_next_stmt(), Err(Error::TooManyArgs));
     }
 }
