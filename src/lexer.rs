@@ -24,14 +24,30 @@ pub enum Token<'a> {
     Eof,
 }
 
+#[derive(Clone)]
 pub struct Lexer<'a> {
     src: &'a str,
     pos: usize,
+    /// 1-based line of the next character.
+    line: u32,
+    /// 1-based line where the most recently lexed token starts.
+    token_line: u32,
 }
 
 impl<'a> Lexer<'a> {
     pub const fn new(src: &'a str) -> Self {
-        Self { src, pos: 0 }
+        Self {
+            src,
+            pos: 0,
+            line: 1,
+            token_line: 1,
+        }
+    }
+
+    /// Line (1-based) where the last token returned by `next_token` starts,
+    /// or where the failing token started if `next_token` returned an error.
+    pub const fn token_line(&self) -> u32 {
+        self.token_line
     }
 
     fn peek(&self) -> Option<char> {
@@ -41,6 +57,9 @@ impl<'a> Lexer<'a> {
     fn advance(&mut self) -> Option<char> {
         let ch = self.peek()?;
         self.pos += ch.len_utf8();
+        if ch == '\n' {
+            self.line += 1;
+        }
         Some(ch)
     }
 
@@ -53,6 +72,7 @@ impl<'a> Lexer<'a> {
             }
         }
 
+        self.token_line = self.line;
         let Some(ch) = self.advance() else {
             return Ok(Token::Eof);
         };
@@ -284,6 +304,32 @@ mod tests {
     fn test_comment_at_eof_without_newline() {
         let (tokens, count) = collect_tokens::<4>("42 # comment at very end");
         assert_eq!(&tokens[..count], &[Token::Int(42)]);
+    }
+
+    #[test]
+    fn test_token_lines() {
+        let mut lexer = Lexer::new("a\n\n  # comment\nb 'multi\nline' c");
+        let mut lines = [0u32; 8];
+        let mut count = 0;
+        loop {
+            let tok = lexer.next_token().unwrap();
+            if tok == Token::Eof {
+                break;
+            }
+            if let Token::Ident(_) | Token::Str(_) = tok {
+                lines[count] = lexer.token_line();
+                count += 1;
+            }
+        }
+        // `a` on line 1, `b` on line 4, string starts on line 4, `c` on line 5
+        assert_eq!(&lines[..count], &[1, 4, 4, 5]);
+    }
+
+    #[test]
+    fn test_error_line_points_at_failing_token() {
+        let mut lexer = Lexer::new("x\ny\n'open");
+        while lexer.next_token().is_ok() {}
+        assert_eq!(lexer.token_line(), 3);
     }
 
     #[test]

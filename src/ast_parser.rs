@@ -17,7 +17,10 @@
 //     unary -  +
 //     **                (right-assoc, binds tighter than unary on its left:
 //                        -2**2 == -4, 2**-1 is parsed as 2**(-1))
-//     atoms: int, 'str', name, ( expr )
+//     atoms: int, 'str', name, name(args...), ( expr )
+//
+// Calls are expressions too: `f(a, b + 1)` compiles to
+// [Ident(a), Ident(b), Int(1), Bin(Add), Call { name: "f", argc: 2 }].
 
 use crate::lexer::{Lexer, Token};
 use crate::Error;
@@ -53,6 +56,11 @@ pub enum Item<'a> {
     Neg,
     /// Binary operator: pops rhs then lhs, pushes `lhs op rhs`.
     Bin(BinOp),
+    /// Function call: pops `argc` arguments, pushes the return value.
+    Call {
+        name: &'a str,
+        argc: u8,
+    },
 }
 
 /// A range of RPN items inside a statement's `Code` buffer.
@@ -105,37 +113,59 @@ impl Default for Code<'_> {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Stmt<'a> {
-    Assign {
-        name: &'a str,
-        expr: Expr,
-    },
-    Call {
-        name: &'a str,
-        args: [Expr; MAX_CALL_ARGS],
-        count: usize,
-    },
+    /// `name = <expr>`
+    Assign { name: &'a str, expr: Expr },
+    /// Expression statement, evaluated for its side effects: `print(x)`, `led_on()`
+    Expr(Expr),
 }
 
 pub struct Parser<'a> {
     lexer: Lexer<'a>,
     current: Token<'a>,
+    /// Line where `current` starts.
+    current_line: u32,
+    /// Line where the most recently parsed statement starts.
+    stmt_line: u32,
     depth: usize,
 }
 
 impl<'a> Parser<'a> {
     pub fn new(source: &'a str) -> Result<Self, Error> {
         let mut lexer = Lexer::new(source);
+        // Line numbers of errors in the very first token are reported as line 1
         let current = lexer.next_token()?;
+        let current_line = lexer.token_line();
         Ok(Self {
             lexer,
             current,
+            current_line,
+            stmt_line: current_line,
             depth: 0,
         })
     }
 
+    /// Line (1-based) of the token the parser is looking at. After a parse
+    /// or lexer error, this is the line where the problem was found.
+    pub const fn line(&self) -> u32 {
+        self.current_line
+    }
+
+    /// Line (1-based) where the most recently parsed statement starts.
+    /// Used to report runtime errors.
+    pub const fn stmt_line(&self) -> u32 {
+        self.stmt_line
+    }
+
     fn advance(&mut self) -> Result<(), Error> {
-        self.current = self.lexer.next_token()?;
+        let result = self.lexer.next_token();
+        self.current_line = self.lexer.token_line();
+        self.current = result?;
         Ok(())
+    }
+
+    /// Looks at the token after `current` without consuming anything.
+    fn peek(&self) -> Result<Token<'a>, Error> {
+        self.lexer.clone().next_token()
     }
 
     fn skip_newlines(&mut self) -> Result<(), Error> {
@@ -157,70 +187,28 @@ impl<'a> Parser<'a> {
     pub fn parse_next_stmt(&mut self, code: &mut Code<'a>) -> Result<Option<Stmt<'a>>, Error> {
         code.clear();
         self.skip_newlines()?;
+        self.stmt_line = self.current_line;
 
         if self.current == Token::Eof {
             return Ok(None);
         }
 
-        let name = match self.current {
-            Token::Ident(ident) => ident,
-            _ => return Err(Error::InvalidSyntax),
-        };
-        self.advance()?;
-
-        match self.current {
+        let stmt = match self.current {
             // Variable assignment: `x = <expr>`
-            Token::Assign => {
-                self.advance()?;
+            Token::Ident(name) if self.peek()? == Token::Assign => {
+                self.advance()?; // name
+                self.advance()?; // '='
                 let expr = self.parse_expr(code)?;
-                self.expect_stmt_end()?;
-                Ok(Some(Stmt::Assign { name, expr }))
+                Stmt::Assign { name, expr }
             }
-            // Function or hardware call: `print(...)`, `led_on()`, `delay_ms(500)`
-            Token::LParen => self.parse_call_stmt(name, code),
-            _ => Err(Error::UnexpectedToken),
-        }
-    }
+            // `123 = 456`, `'a' = 1`: assignment to something that is not a name
+            _ if self.peek()? == Token::Assign => return Err(Error::InvalidSyntax),
+            // Expression statement: `print(x)`, `led_on()`, `delay_ms(t * 2)`
+            _ => Stmt::Expr(self.parse_expr(code)?),
+        };
 
-    fn parse_call_stmt(
-        &mut self,
-        name: &'a str,
-        code: &mut Code<'a>,
-    ) -> Result<Option<Stmt<'a>>, Error> {
-        // Consume '('
-        self.advance()?;
-
-        let mut args = [Expr::default(); MAX_CALL_ARGS];
-        let mut count = 0;
-
-        if self.current != Token::RParen {
-            loop {
-                if count >= MAX_CALL_ARGS {
-                    return Err(Error::TooManyArguments);
-                }
-
-                args[count] = self.parse_expr(code)?;
-                count += 1;
-
-                match self.current {
-                    Token::Comma => {
-                        self.advance()?;
-                        // Allow trailing comma before ')'
-                        if self.current == Token::RParen {
-                            break;
-                        }
-                    }
-                    Token::RParen => break,
-                    _ => return Err(Error::UnexpectedToken),
-                }
-            }
-        }
-
-        // Consume ')'
-        self.advance()?;
         self.expect_stmt_end()?;
-
-        Ok(Some(Stmt::Call { name, args, count }))
+        Ok(Some(stmt))
     }
 
     /// Parses one full expression and returns its range in `code`.
@@ -292,12 +280,18 @@ impl<'a> Parser<'a> {
         Ok(())
     }
 
-    /// atom := INT | STR | IDENT | '(' expr ')'
+    /// atom := INT | STR | IDENT | call | '(' expr ')'
     fn parse_atom(&mut self, code: &mut Code<'a>) -> Result<(), Error> {
         let item = match self.current {
             Token::Int(n) => Item::Int(n),
             Token::Str(s) => Item::Str(s),
-            Token::Ident(ident) => Item::Ident(ident),
+            Token::Ident(name) => {
+                self.advance()?;
+                if self.current == Token::LParen {
+                    return self.nested(|p| p.parse_call(name, code));
+                }
+                return code.push(Item::Ident(name));
+            }
             Token::LParen => {
                 self.advance()?;
                 self.nested(|p| p.parse_additive(code))?;
@@ -311,6 +305,37 @@ impl<'a> Parser<'a> {
         };
         self.advance()?;
         code.push(item)
+    }
+
+    /// call := IDENT '(' [expr (',' expr)* [',']] ')'
+    ///
+    /// Arguments are emitted first, then `Call { name, argc }`.
+    fn parse_call(&mut self, name: &'a str, code: &mut Code<'a>) -> Result<(), Error> {
+        // Consume '('
+        self.advance()?;
+
+        let mut argc = 0;
+        while self.current != Token::RParen {
+            if argc >= MAX_CALL_ARGS {
+                return Err(Error::TooManyArguments);
+            }
+            self.parse_additive(code)?;
+            argc += 1;
+
+            match self.current {
+                // A trailing comma before ')' is allowed
+                Token::Comma => self.advance()?,
+                Token::RParen => break,
+                _ => return Err(Error::UnexpectedToken),
+            }
+        }
+
+        // Consume ')'
+        self.advance()?;
+        code.push(Item::Call {
+            name,
+            argc: argc as u8,
+        })
     }
 
     /// Runs `f` one nesting level deeper, failing instead of overflowing the
@@ -377,60 +402,166 @@ mod tests {
         assert_eq!(parser.parse_next_stmt(&mut code).unwrap(), None);
     }
 
+    /// Parses one expression statement and returns its RPN items.
+    fn expr_stmt<'a>(parser: &mut Parser<'a>, code: &mut Code<'a>) -> [Item<'a>; MAX_EXPR_ITEMS] {
+        let Some(Stmt::Expr(expr)) = parser.parse_next_stmt(code).unwrap() else {
+            panic!("expected expression statement");
+        };
+        let mut out = [Item::Int(-1); MAX_EXPR_ITEMS];
+        out[..expr_len(code, expr)].copy_from_slice(code.items(expr));
+        out
+    }
+
+    fn expr_len(code: &Code<'_>, expr: Expr) -> usize {
+        code.items(expr).len()
+    }
+
     #[test]
     fn test_parse_empty_and_hardware_calls() {
+        use Item::{Call, Int};
         let mut code = Code::new();
         let mut parser = Parser::new("led_on()\ndelay_ms(500)\n").unwrap();
 
+        let items = expr_stmt(&mut parser, &mut code);
+        assert_eq!(code.len, 1);
         assert_eq!(
-            parser.parse_next_stmt(&mut code).unwrap(),
-            Some(Stmt::Call {
+            items[0],
+            Call {
                 name: "led_on",
-                args: [Expr::default(); MAX_CALL_ARGS],
-                count: 0,
-            })
+                argc: 0
+            }
         );
 
-        let Some(Stmt::Call { name, args, count }) = parser.parse_next_stmt(&mut code).unwrap()
-        else {
-            panic!("expected call");
-        };
-        assert_eq!((name, count), ("delay_ms", 1));
-        assert_eq!(code.items(args[0]), &[Item::Int(500)]);
+        let items = expr_stmt(&mut parser, &mut code);
+        assert_eq!(
+            &items[..code.len],
+            &[
+                Int(500),
+                Call {
+                    name: "delay_ms",
+                    argc: 1
+                }
+            ]
+        );
 
         assert_eq!(parser.parse_next_stmt(&mut code).unwrap(), None);
     }
 
     #[test]
     fn test_parse_multi_arg_call_and_trailing_comma() {
+        use Item::{Call, Ident, Int, Str};
         let mut code = Code::new();
         let mut parser = Parser::new("print('x =', x, 10,)\n").unwrap();
 
-        let Some(Stmt::Call { name, args, count }) = parser.parse_next_stmt(&mut code).unwrap()
-        else {
-            panic!("expected call");
-        };
-        assert_eq!((name, count), ("print", 3));
-        assert_eq!(code.items(args[0]), &[Item::Str("x =")]);
-        assert_eq!(code.items(args[1]), &[Item::Ident("x")]);
-        assert_eq!(code.items(args[2]), &[Item::Int(10)]);
+        let items = expr_stmt(&mut parser, &mut code);
+        assert_eq!(
+            &items[..code.len],
+            &[
+                Str("x ="),
+                Ident("x"),
+                Int(10),
+                Call {
+                    name: "print",
+                    argc: 3
+                }
+            ]
+        );
     }
 
     #[test]
     fn test_parse_call_args_with_expressions() {
+        use Item::{Bin, Call, Ident, Int, Neg};
         let mut code = Code::new();
         let mut parser = Parser::new("delay_ms(t * 2, -1)").unwrap();
 
-        let Some(Stmt::Call { args, count, .. }) = parser.parse_next_stmt(&mut code).unwrap()
-        else {
-            panic!("expected call");
-        };
-        assert_eq!(count, 2);
+        let items = expr_stmt(&mut parser, &mut code);
         assert_eq!(
-            code.items(args[0]),
-            &[Item::Ident("t"), Item::Int(2), Item::Bin(BinOp::Mul)]
+            &items[..code.len],
+            &[
+                Ident("t"),
+                Int(2),
+                Bin(BinOp::Mul),
+                Int(1),
+                Neg,
+                Call {
+                    name: "delay_ms",
+                    argc: 2
+                },
+            ]
         );
-        assert_eq!(code.items(args[1]), &[Item::Int(1), Item::Neg]);
+    }
+
+    #[test]
+    fn test_parse_calls_inside_expressions() {
+        use BinOp::{Add, Mul};
+        use Item::{Bin, Call, Ident, Int};
+
+        // A call is an operand like any other, and calls can nest
+        assert_rpn(
+            "x = adc_read(34) * 3 + 1",
+            &[
+                Int(34),
+                Call {
+                    name: "adc_read",
+                    argc: 1,
+                },
+                Int(3),
+                Bin(Mul),
+                Int(1),
+                Bin(Add),
+            ],
+        );
+        assert_rpn(
+            "x = f(g(a), 2 + h())",
+            &[
+                Ident("a"),
+                Call { name: "g", argc: 1 },
+                Int(2),
+                Call { name: "h", argc: 0 },
+                Bin(Add),
+                Call { name: "f", argc: 2 },
+            ],
+        );
+        // A bare name stays a variable read
+        assert_rpn("x = millis", &[Ident("millis")]);
+    }
+
+    #[test]
+    fn test_parse_expression_statements() {
+        use Item::{Bin, Int};
+        let mut code = Code::new();
+        // Any expression is a valid statement, as in Python
+        let mut parser = Parser::new("1 + 2\n").unwrap();
+        let items = expr_stmt(&mut parser, &mut code);
+        assert_eq!(&items[..code.len], &[Int(1), Int(2), Bin(BinOp::Add)]);
+    }
+
+    #[test]
+    fn test_parse_line_numbers() {
+        let mut code = Code::new();
+        let mut parser = Parser::new("\n# comment\nx = 1\n\n  print(x)\n").unwrap();
+
+        parser.parse_next_stmt(&mut code).unwrap();
+        assert_eq!(parser.stmt_line(), 3);
+        parser.parse_next_stmt(&mut code).unwrap();
+        assert_eq!(parser.stmt_line(), 5);
+
+        // Errors point at the offending token
+        let mut parser = Parser::new("x = 1\ny = (2 +\n").unwrap();
+        parser.parse_next_stmt(&mut code).unwrap();
+        assert_eq!(
+            parser.parse_next_stmt(&mut code),
+            Err(Error::UnexpectedToken)
+        );
+        assert_eq!(parser.line(), 2);
+
+        let mut parser = Parser::new("x = 1\n\nprint('open").unwrap();
+        parser.parse_next_stmt(&mut code).unwrap();
+        assert_eq!(
+            parser.parse_next_stmt(&mut code),
+            Err(Error::UnterminatedString)
+        );
+        assert_eq!(parser.line(), 3);
     }
 
     #[test]
@@ -489,6 +620,19 @@ mod tests {
 
         let mut p3 = Parser::new("led_on(1 2)").unwrap();
         assert_eq!(p3.parse_next_stmt(&mut code), Err(Error::UnexpectedToken));
+
+        let mut p5 = Parser::new("'a' = 1").unwrap();
+        assert_eq!(p5.parse_next_stmt(&mut code), Err(Error::InvalidSyntax));
+
+        for src in ["f(,)", "f(1,,)", "f(1", "x = 1 y", "f()()"] {
+            let mut parser = Parser::new(src).unwrap();
+            assert_eq!(
+                parser.parse_next_stmt(&mut code),
+                Err(Error::UnexpectedToken),
+                "source: {}",
+                src
+            );
+        }
 
         let mut p4 = Parser::new("f(1, 2, 3, 4, 5, 6, 7, 8, 9)").unwrap();
         assert_eq!(p4.parse_next_stmt(&mut code), Err(Error::TooManyArguments));
