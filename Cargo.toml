@@ -1,0 +1,20 @@
+[package]
+name = "micropython-rs"
+version = "0.1.0"
+edition = "2021"
+author = "Marcin Bielak <marcin.bieli+github+micropython-rs@gmail.com>"
+license = "Apache-2.0"
+description = "A minimal, no_std Python interpreter written in Rust"
+
+[toolchain]
+channel = "stable"
+targets = ["thumbv7em-none-eabihf"]
+
+[lib]
+name = "micropython_rs"
+path = "src/lib.rs"
+
+[[bin]]
+name = "mpy-cli"
+path = "src/main.rs"
+
