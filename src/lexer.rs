@@ -10,6 +10,13 @@ pub enum Token<'a> {
     Str(&'a str),
     Int(i64),
     Assign,
+    Plus,
+    Minus,
+    Star,
+    DoubleStar,
+    Slash,
+    DoubleSlash,
+    Percent,
     LParen,
     RParen,
     Comma,
@@ -55,6 +62,11 @@ impl<'a> Lexer<'a> {
             ')' => Ok(Token::RParen),
             ',' => Ok(Token::Comma),
             '=' => Ok(Token::Assign),
+            '+' => Ok(Token::Plus),
+            '-' => Ok(Token::Minus),
+            '%' => Ok(Token::Percent),
+            '*' => Ok(self.lex_double('*', Token::Star, Token::DoubleStar)),
+            '/' => Ok(self.lex_double('/', Token::Slash, Token::DoubleSlash)),
             '\n' => Ok(Token::Newline),
             '\'' | '"' => self.lex_string(ch),
             '0'..='9' => self.lex_int(ch),
@@ -85,12 +97,25 @@ impl<'a> Lexer<'a> {
         Err(Error::UnterminatedString)
     }
 
+    /// Lexes one- or two-character operators like `*` / `**` and `/` / `//`.
+    fn lex_double(&mut self, second: char, single: Token<'a>, double: Token<'a>) -> Token<'a> {
+        if self.peek() == Some(second) {
+            self.advance();
+            double
+        } else {
+            single
+        }
+    }
+
     fn lex_int(&mut self, first: char) -> Result<Token<'a>, Error> {
         let mut val = (first as u8 - b'0') as i64;
         while let Some(ch) = self.peek() {
             if ch.is_ascii_digit() {
                 self.advance();
-                val = val * 10 + (ch as u8 - b'0') as i64;
+                val = val
+                    .checked_mul(10)
+                    .and_then(|v| v.checked_add((ch as u8 - b'0') as i64))
+                    .ok_or(Error::Overflow)?;
             } else {
                 break;
             }
@@ -155,6 +180,36 @@ mod tests {
                 Token::Newline,
             ]
         );
+    }
+
+    #[test]
+    fn test_arithmetic_operators() {
+        let (tokens, count) = collect_tokens::<16>("+ - * ** / // % 2**3//4");
+        assert_eq!(
+            &tokens[..count],
+            &[
+                Token::Plus,
+                Token::Minus,
+                Token::Star,
+                Token::DoubleStar,
+                Token::Slash,
+                Token::DoubleSlash,
+                Token::Percent,
+                Token::Int(2),
+                Token::DoubleStar,
+                Token::Int(3),
+                Token::DoubleSlash,
+                Token::Int(4),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_integer_literal_overflow() {
+        let mut lexer = Lexer::new("9223372036854775807");
+        assert_eq!(lexer.next_token(), Ok(Token::Int(i64::MAX)));
+        let mut lexer = Lexer::new("9223372036854775808");
+        assert_eq!(lexer.next_token(), Err(Error::Overflow));
     }
 
     #[test]
@@ -241,5 +296,7 @@ mod tests {
     fn test_unexpected_char_error() {
         let mut lexer = Lexer::new("@");
         assert_eq!(lexer.next_token(), Err(Error::UnexpectedChar('@')));
+        let mut lexer = Lexer::new("&");
+        assert_eq!(lexer.next_token(), Err(Error::UnexpectedChar('&')));
     }
 }
