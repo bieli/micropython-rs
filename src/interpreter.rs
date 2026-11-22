@@ -111,10 +111,10 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
                     }
 
                     match self.hw.as_mut() {
-                        Some(hw) => hw
-                            .call(name, &eval_args[..count])
-                            .map(|_| ())
-                            .map_err(|_| Error::UnknownIdentifier),
+                        Some(hw) => {
+                            hw.call(name, &eval_args[..count])?;
+                            Ok(())
+                        }
                         None => Err(Error::UnknownIdentifier),
                     }
                 }
@@ -191,7 +191,7 @@ mod tests {
     }
 
     impl HardwareBridge for MockHardware {
-        fn call(&mut self, name: &str, args: &[i64]) -> Result<Option<i64>, ()> {
+        fn call(&mut self, name: &str, args: &[i64]) -> Result<Option<i64>, Error> {
             match (name, args) {
                 ("led_on", []) => {
                     self.led_state = true;
@@ -205,7 +205,7 @@ mod tests {
                     self.total_delay_ms += *ms;
                     Ok(None)
                 }
-                _ => Err(()),
+                _ => Err(Error::UnknownIdentifier),
             }
         }
     }
