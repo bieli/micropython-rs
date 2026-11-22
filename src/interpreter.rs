@@ -178,4 +178,82 @@ print('Answer:', y)
         vm.eval(code).unwrap();
         assert_eq!(out.as_str(), "Hello, Rust!\nAnswer: 42\n");
     }
+
+    #[test]
+    fn test_unknown_variable_error() {
+        let mut out = MockOut::new();
+        let mut vm = Interpreter::new(&mut out);
+
+        assert_eq!(
+            vm.eval("print(undefined_var)"),
+            Err(Error::UnknownIdentifier)
+        );
+        assert_eq!(vm.eval("x = missing"), Err(Error::UnknownIdentifier));
+    }
+
+    #[test]
+    fn test_unknown_function_error() {
+        let mut out = MockOut::new();
+        let mut vm = Interpreter::new(&mut out);
+
+        assert_eq!(vm.eval("unknown_func(123)"), Err(Error::UnknownIdentifier));
+    }
+
+    #[test]
+    fn test_out_of_memory_when_exceeding_max_vars() {
+        let mut out = MockOut::new();
+        let mut vm = Interpreter::new(&mut out);
+
+        // Fill all 32 variable slots (MAX_VARS = 32)
+        let mut buf = [0u8; 512];
+        let mut len = 0;
+        for i in 0..MAX_VARS {
+            // Write "v0 = 0\n", "v1 = 1\n", ... into a stack buffer
+            let prefix = b"v";
+            buf[len..len + prefix.len()].copy_from_slice(prefix);
+            len += prefix.len();
+
+            if i >= 10 {
+                buf[len] = b'0' + (i / 10) as u8;
+                len += 1;
+            }
+            buf[len] = b'0' + (i % 10) as u8;
+            len += 1;
+
+            let suffix = b" = 1\n";
+            buf[len..len + suffix.len()].copy_from_slice(suffix);
+            len += suffix.len();
+        }
+
+        let fill_script = core::str::from_utf8(&buf[..len]).unwrap();
+        assert_eq!(vm.eval(fill_script), Ok(()));
+
+        // Overwriting an existing variable still succeeds when full
+        assert_eq!(vm.eval("v0 = 99"), Ok(()));
+
+        // Adding a 33rd distinct variable fails with OutOfMemory
+        assert_eq!(vm.eval("overflow = 1"), Err(Error::OutOfMemory));
+    }
+
+    #[test]
+    fn test_print_zero_and_empty_call() {
+        let mut out = MockOut::new();
+        let mut vm = Interpreter::new(&mut out);
+
+        vm.eval("print(0)\nprint()").unwrap();
+        assert_eq!(out.as_str(), "0\n\n");
+    }
+
+    #[test]
+    fn test_propagates_lexer_and_parser_errors() {
+        let mut out = MockOut::new();
+        let mut vm = Interpreter::new(&mut out);
+
+        assert_eq!(
+            vm.eval("print('unterminated"),
+            Err(Error::UnterminatedString)
+        );
+        assert_eq!(vm.eval("123 = 456"), Err(Error::InvalidSyntax));
+        assert_eq!(vm.eval("x = "), Err(Error::UnexpectedToken));
+    }
 }
