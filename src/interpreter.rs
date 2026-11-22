@@ -83,7 +83,7 @@ impl<'a, 'o, O: Output> Interpreter<'a, 'o, O> {
                 arg_count,
             } => match func {
                 "print" => {
-                    for i in 0..arg_count {
+                    for (i, _item) in args.iter().enumerate().take(arg_count) {
                         if i > 0 {
                             self.out.write_str(" ");
                         }
