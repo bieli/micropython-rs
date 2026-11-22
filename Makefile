@@ -1,7 +1,7 @@
 # Target configuration
 MIN_COVERAGE := 30
 EMBEDDED_ARM := thumbv7em-none-eabihf
-EMBEDDED_ESP32 := riscv32imc-unknown-none-elf	
+EMBEDDED_ESP32 := riscv32imc-unknown-none-elf
 
 FILE ?= hello.py
 
@@ -13,7 +13,8 @@ all: test coverage build-embedded
 # Fast syntax and type check for both host and embedded targets
 check:
 	cargo check
-	cargo check --lib --target $(EMBEDDED_TARGET)
+	cargo check --lib --target $(EMBEDDED_ARM)
+	cargo check --lib --target $(EMBEDDED_ESP32)
 
 # Run unit tests on the host
 test:

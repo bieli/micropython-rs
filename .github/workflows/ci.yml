@@ -18,10 +18,10 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install Rust toolchain, LLVM tools, and ARM target
+      - name: Install Rust toolchain, LLVM tools, and embedded targets (ARM + RISC-V)
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: thumbv7em-none-eabihf
+          targets: thumbv7em-none-eabihf, riscv32imc-unknown-none-elf
           components: rustfmt, clippy, llvm-tools-preview
 
       - name: Install cargo-llvm-cov

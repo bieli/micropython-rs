@@ -6,10 +6,6 @@ authors = ["Marcin Bielak <marcin.bieli+github+micropython-rs@gmail.com>"]
 license = "Apache-2.0"
 description = "A minimal, no_std Python interpreter written in Rust"
 
-[toolchain]
-channel = "stable"
-targets = ["thumbv7em-none-eabihf"]
-
 [lib]
 name = "micropython_rs"
 path = "src/lib.rs"
