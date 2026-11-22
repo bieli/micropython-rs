@@ -60,11 +60,17 @@ Phase 3 status:
 
 | # | Feature | Why | Status |
 |---|---------|-----|--------|
-| 4.1 | **REPL over USB/UART** with line editing and Ctrl-C | The defining MicroPython experience: try code without reflashing | ⬜ |
-| 4.2 | **Script from flash**: `include_str!` at build time (`make flash SCRIPT=blink.py`), then a data partition with `main.py` | Users change Python code without touching Rust. Build-time embedding is done; a data partition (no rebuild) is still open | ✅ |
-| 4.3 | **Upload a script over serial** (simple protocol or raw-paste mode) | Fast edit, run, edit cycle | ⬜ |
-| 4.4 | **Example gallery** in `micropython-esp32/scripts/`: blink, button, ADC, I²C scan, TFT clock | Each one also doubles as a hardware smoke test | 🚧 |
-| 4.5 | **More boards**: ESP32-C3 and C6 (RISC-V), and an SSD1306 OLED feature | Cheap boards that many people already own | ⬜ |
+| 4.1 | **REPL over USB/UART** with line editing and Ctrl-C | The defining MicroPython experience: try code without reflashing | ✅ |
+| 4.2 | **Script from flash**: `include_str!` at build time (`make flash SCRIPT=blink.py`), then a data partition with `main.py` | Users change Python code without touching Rust. Done: build-time embedding, and `main.py` saved in the `nvs` partition over USB (`tools/mpy.py save`) | ✅ |
+| 4.3 | **Upload a script over serial** (MicroPython's raw REPL: works with `mpremote run/exec` and `tools/mpy.py`) | Fast edit, run, edit cycle | ✅ |
+| 4.4 | **Example gallery** in `micropython-esp32/scripts/`: blink, button, ADC, I²C scan, TFT clock | Each one also doubles as a hardware smoke test | ✅ |
+| 4.5 | **More boards**: ESP32-C3 and C6 (RISC-V), and an SSD1306 OLED feature | Cheap boards that many people already own | ⬜ Not started: needs the hardware to test on |
+
+Phase 4 follow-ups found while building it:
+
+* `str()`, string concatenation and formatting (`text()` can't show a number yet), which need a small string pool.
+* A file system (`os`, `open`) so `mpremote cp`/`ls` work, instead of the single `main.py` slot.
+* Raw-paste mode for faster uploads (plain raw mode works).
 
 **Later:** once loops and functions exist and profiling shows the evaluator is a bottleneck, add the
 bytecode compiler and VM, plus a `const` folding pass.

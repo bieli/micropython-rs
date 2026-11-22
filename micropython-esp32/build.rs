@@ -162,4 +162,5 @@ fn select_script() {
     }
     println!("cargo:rerun-if-changed={}", path.display());
     println!("cargo:rustc-env=MPY_SCRIPT_PATH={}", path.display());
+    println!("cargo:rustc-env=MPY_SCRIPT_NAME={}", chosen);
 }

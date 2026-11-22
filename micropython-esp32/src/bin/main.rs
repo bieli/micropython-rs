@@ -10,12 +10,18 @@
 //!
 //! Both builds get the shared hardware functions from `board.rs`
 //! (time, GPIO, ADC, PWM, I2C, watchdog). Run `help()` in a script to list them.
+//!
+//! At boot the board runs `main.py` from flash (or the embedded script),
+//! then starts the REPL on the USB serial port (`repl.rs`).
 
 use esp_backtrace as _;
 use esp_hal::main;
 use esp_println::println;
 use micropython_esp32::board::{Board, BoardPeripherals};
-use micropython_rs::{Arg, Error, HardwareBridge, HwFn, Interpreter};
+use micropython_esp32::repl::{self, BootScript};
+use micropython_esp32::script_store::ScriptStore;
+use micropython_esp32::serial_input;
+use micropython_rs::{Arg, Error, HardwareBridge, HwFn};
 
 esp_bootloader_esp_idf::esp_app_desc!();
 
@@ -97,13 +103,16 @@ impl HardwareBridge for GenericHardware<'_> {
 #[main]
 fn main() -> ! {
     let peripherals = esp_hal::init(esp_hal::Config::default());
+    // Set up serial input first: it resets UART0, which drops unsent output
+    serial_input::init(peripherals.UART0, peripherals.GPIO3);
     print_reset_reason();
+    let mut store = ScriptStore::new(peripherals.FLASH);
 
     let board = Board::new(board_peripherals!(peripherals), GENERIC_PINS);
     let mut out = micropython_esp32::serial_console::EspSerialOut;
     let mut hw = GenericHardware { board };
 
-    run(Interpreter::with_hardware(&mut out, &mut hw))
+    repl::run(&mut out, &mut hw, &BOOT_SCRIPT, &mut store)
 }
 
 // ---------------------------------------------------------------------------
@@ -195,7 +204,10 @@ impl HardwareBridge for TtgoHardware<'_, '_> {
 #[main]
 fn main() -> ! {
     let peripherals = esp_hal::init(esp_hal::Config::default());
+    // Set up serial input first: it resets UART0, which drops unsent output
+    serial_input::init(peripherals.UART0, peripherals.GPIO3);
     print_reset_reason();
+    let mut store = ScriptStore::new(peripherals.FLASH);
 
     let spi = init_ttgo_spi(peripherals.SPI2, peripherals.GPIO18, peripherals.GPIO19);
     let cs = make_output_pin(peripherals.GPIO5, Level::High);
@@ -213,30 +225,20 @@ fn main() -> ! {
         console: &console,
     };
 
-    run(Interpreter::with_hardware(&mut out, &mut hw))
+    repl::run(&mut out, &mut hw, &BOOT_SCRIPT, &mut store)
 }
 
 // ---------------------------------------------------------------------------
 // Shared
 // ---------------------------------------------------------------------------
 
-/// Upper bound on executed statements, so a script stuck in `while True:`
-/// reports `StepLimit` instead of hanging the board.
-const STEP_LIMIT: u32 = 1_000_000;
-
 /// Shows why the chip started (power on, watchdog, software reset, ...).
 fn print_reset_reason() {
     println!("Reset reason: {:?}", esp_hal::system::reset_reason());
 }
 
-fn run<O: micropython_rs::Output, H: HardwareBridge>(mut vm: Interpreter<'_, O, H>) -> ! {
-    vm.set_step_limit(Some(STEP_LIMIT));
-    match vm.eval(SCRIPT) {
-        Ok(()) => println!("=== Execution complete ==="),
-        Err(err) => match vm.error_line() {
-            Some(line) => println!("Python Error at line {}: {:?}", line, err),
-            None => println!("Python Error: {:?}", err),
-        },
-    }
-    loop {}
-}
+/// The embedded boot script, used when no `main.py` is saved in flash.
+const BOOT_SCRIPT: BootScript = BootScript {
+    source: SCRIPT,
+    name: env!("MPY_SCRIPT_NAME"),
+};

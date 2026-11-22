@@ -78,7 +78,7 @@ flags |= 1 << 3                   # bitwise & | ^ ~ << >> and augmented assignme
 | Literals | `42`, `1_000`, `0x1F`, `0o17`, `0b1010`, `'single'`, `"double"` |
 | Operators | `+ - * / // % **`, `& \| ^ ~ << >>`, `== != < <= > >=` (chainable), `and or not` |
 | Assignment | `x = ...`, and `+= -= *= /= //= %= **= &= \|= ^= <<= >>=` |
-| Statements | `if`/`elif`/`else`, `while`, `break`, `continue`, `pass`, `def`, `return` |
+| Statements | `if`/`elif`/`else`, `while`, `break`, `continue`, `pass`, `def`, `return`; `;` between statements (`x = 1; y = 2`) |
 | Calls | `print(...)`, your own `def` functions, and hardware functions from `HardwareBridge` |
 
 Not supported yet: `for`, lists/dicts/tuples, floats, string operations, `global`, classes, imports.
@@ -214,7 +214,7 @@ vm.set_abort_flag(&ABORT);        // eval() returns Error::Interrupted once ABOR
 ```
 
 The step budget starts over for each `eval()` call. The abort flag is checked before every statement and loop pass.
-It's only read, so clear it yourself before the next run. The ESP32 firmware sets a step limit of 1 000 000.
+It's only read, so clear it yourself before the next run. The ESP32 firmware connects the abort flag to Ctrl-C on the serial port.
 
 ## Using micropython-rs on a Microcontroller
 
@@ -281,6 +281,14 @@ impl HardwareBridge for MyBoard {
 Return `Error::ValueError` for bad values (a pin that doesn't exist) and `Error::IoError` when the hardware fails
 (an I2C device that doesn't answer).
 
+### Building a REPL
+
+`vm.set_interactive(true)` makes top-level expression statements print their value, like Python's prompt
+(`1 + 2` prints `3`, strings print in quotes, `None` prints nothing). `vm.output()` gives access to the `Output`,
+so the prompt and echo can go to the same place as `print()`. `eval()` can be called again and again; variables and
+functions stay defined. The source passed to `eval()` must stay alive as long as the interpreter, because variables
+and functions point into it; the ESP32 REPL keeps every line in a fixed 32 KB arena for that reason.
+
 ## Running on real ESP32 hardware
 
 The [`micropython-esp32/`](micropython-esp32) folder holds the firmware. It runs Python scripts on ESP32 (Xtensa) boards,
@@ -322,9 +330,11 @@ make clean                                   # remove build artifacts
 |---------------|---------|---------|
 | `FEATURES` | *(empty)* | Cargo features passed as `--features ...` (e.g. `tft`) |
 | `SCRIPT` | *(empty: the board's demo)* | Python file to embed, relative to `micropython-esp32/`. It must be inside the repository, because the Docker build only sees the repository |
+| `KEEP_MAIN` | *(empty)* | `KEEP_MAIN=1` keeps a `main.py` saved in flash. By default `make flash` erases it, so the new build runs its embedded script |
 | `PORT` | *(empty, espflash picks the saved port)* | Serial port for `flash` / `monitor` |
 
-The script is compiled into the firmware (`include_str!`), so changing it means flashing again.
+The `SCRIPT` file is compiled into the firmware (`include_str!`). To change scripts without reflashing, use the REPL
+or upload them over USB (next section).
 Docker builds keep the Cargo registry in `target/cargo-registry`, so crates are downloaded only once.
 
 Without Docker/Make (the `esp` toolchain installed locally with `espup`):
@@ -335,6 +345,61 @@ MPY_SCRIPT=scripts/blink.py cargo build --release           # with your own scri
 cargo build --release --features tft                        # TTGO T-Display
 espflash flash --monitor target/xtensa-esp32-none-elf/release/micropython-esp32
 ```
+
+### REPL and uploading scripts over USB
+
+At boot the board runs `main.py` from flash if one is saved, otherwise the built-in script, and then starts a
+**REPL** on the USB serial port (115200 baud), like MicroPython. On the TTGO, the prompt and output also appear on the screen.
+
+```text
+$ make monitor                      # or: mpremote connect /dev/ttyACM0 repl, picocom, screen, ...
+>>> x = 21
+>>> x * 2
+42
+>>> def blink(n):
+...     while n: pin_toggle(LED); sleep_ms(200); n -= 1
+...
+>>> blink(6)
+>>> while True: pass
+KeyboardInterrupt                   # after pressing Ctrl-C
+>>>
+```
+
+| Key | What it does |
+|-----|--------------|
+| Enter | Runs the line. A line ending in `:` starts a block; an empty line runs the block |
+| Backspace, Up arrow | Edit the line; recall the previous line |
+| Ctrl-C | Stops the running script, even inside `while True:` or `sleep_ms()`, or clears the line |
+| Ctrl-D | Soft reset (on an empty line): clears variables and functions, runs `main.py` again |
+| Ctrl-E | Paste mode: paste code with its indentation, Ctrl-D runs it, Ctrl-C cancels |
+| Ctrl-A / Ctrl-B | Enter / leave the raw REPL (for tools) |
+
+Every line that runs stays in memory until the next soft reset, because variables and functions point into their
+source text. The REPL has 32 KB for that; when it runs out, press Ctrl-D.
+
+**Tools.** The firmware speaks MicroPython's raw REPL protocol, so `mpremote` can run code on it, and
+[`tools/mpy.py`](micropython-esp32/tools/mpy.py) adds saving `main.py` to flash:
+
+```bash
+tools/mpy.py run scripts/blink.py        # run a file and print its output (no reflashing)
+tools/mpy.py exec "print(6 * 7)"
+tools/mpy.py save scripts/blink.py       # store as main.py in flash: it runs at every boot
+tools/mpy.py cat                         # print the saved main.py
+tools/mpy.py erase                       # remove it (the built-in script runs again)
+tools/mpy.py reset                       # soft reset
+
+mpremote connect /dev/ttyACM0 run scripts/blink.py
+mpremote connect /dev/ttyACM0 exec "print(ticks_ms())"
+mpremote connect /dev/ttyACM0 repl
+```
+
+`tools/mpy.py` needs `pyserial` and takes `--port` (default `/dev/ttyACM0`, or `$MPY_PORT`). It exits with status 1
+when the script raises an error. `mpremote`'s file commands (`cp`, `ls`, `fs`) don't work, because the firmware has no
+file system or `os` module; use `tools/mpy.py save` instead. Like with MicroPython, `mpremote` soft-resets the board
+before each command unless you add `resume`.
+
+`main.py` is stored in the `nvs` flash partition (24 KB max) with a checksum. If it hangs the board, press Ctrl-C at
+boot, or run `tools/mpy.py erase`.
 
 ### Example scripts
 
@@ -347,6 +412,8 @@ espflash flash --monitor target/xtensa-esp32-none-elf/release/micropython-esp32
 | [`scripts/button.py`](micropython-esp32/scripts/button.py) | Counting button presses with a pull-up and debouncing, timed with `ticks_ms` |
 | [`scripts/pwm_fade.py`](micropython-esp32/scripts/pwm_fade.py) | Fading an LED, and a 50 Hz servo pulse |
 | [`scripts/i2c_scan.py`](micropython-esp32/scripts/i2c_scan.py) | Scanning the I²C bus and reading a register |
+| [`scripts/adc.py`](micropython-esp32/scripts/adc.py) | Averaging ADC samples and converting them to millivolts |
+| [`scripts/tft_clock.py`](micropython-esp32/scripts/tft_clock.py) | An uptime clock drawn with `text()` (TTGO only) |
 | [`scripts/watchdog.py`](micropython-esp32/scripts/watchdog.py) | The watchdog resetting a hung script, and `reset_cause()` after the reboot |
 | [`scripts/errors.py`](micropython-esp32/scripts/errors.py) | A forbidden pin reported as `ValueError` with its line number |
 
@@ -399,10 +466,14 @@ print('stopped after', ticks_ms(), 'ms')
 | `micropython-esp32/src/board.rs` | `Board`: time, GPIO, ADC, PWM, I²C, watchdog and reset functions for every build, plus the `board_functions!` and `board_constants!` table macros |
 | `micropython-esp32/src/serial_console.rs` | `EspSerialOut`, an `Output` that writes `print()` text to USB/UART with `esp_println` |
 | `micropython-esp32/src/tft_console.rs` | `TftConsole`: the scrolling text console and drawing functions on the ST7789 (only compiled with `tft`) |
+| `micropython-esp32/src/repl.rs` | The REPL: boot script, line editing, blocks, paste mode, soft reset, and the raw REPL protocol |
+| `micropython-esp32/src/serial_input.rs` | UART0 receive interrupt: fills a 2 KB ring buffer and sets the global `ABORT` flag on Ctrl-C |
+| `micropython-esp32/src/script_store.rs` | `main.py` in the `nvs` flash partition (`esp-storage`), with a header and checksum |
+| `micropython-esp32/tools/mpy.py` | Host tool: run, save, show and erase scripts over USB serial |
 | `micropython-esp32/scripts/` | The demo and example scripts |
 | `micropython-esp32/build.rs` | Picks the script (`MPY_SCRIPT`, or the board's demo) and hands its path to `include_str!` |
 | `micropython-esp32/Cargo.toml` | Declares the `tft` feature. `mipidsi`, `embedded-graphics` and `embedded-hal-bus` are optional dependencies, so boards without a display don't pull them in |
-| `micropython-esp32/Makefile` | Docker build and host flash/monitor, with the `FEATURES`, `SCRIPT` and `PORT` variables |
+| `micropython-esp32/Makefile` | Docker build and host flash/monitor, with the `FEATURES`, `SCRIPT`, `KEEP_MAIN` and `PORT` variables |
 
 #### How the hardware layer works
 
@@ -417,6 +488,12 @@ print('stopped after', ticks_ms(), 'ms')
   chunks and feeds the watchdog in between, so only a script that stops sleeping (a busy loop, a hang) gets reset.
 * **TTGO console.** `print()` and the drawing functions share one `TftConsole` through a `RefCell`: `print()` goes
   through `SharedConsole` (the `Output`), drawing through the bridge.
+* **Ctrl-C.** A UART0 receive interrupt moves incoming bytes into a ring buffer and sets the global `ABORT` flag when it
+  sees Ctrl-C. The interpreter checks that flag before every statement (`set_abort_flag`), and `sleep_ms` checks it
+  every 100 ms, so any script can be stopped. Output still goes through `esp_println`, with `\n` sent as `\r\n`.
+* **Raw REPL.** Ctrl-A switches to MicroPython's machine protocol: input isn't echoed, Ctrl-D runs it, and the reply is
+  `OK`, the output, `\x04`, the error, `\x04`, `>`. Raw-paste mode is declined (`R\x00`), so tools fall back to plain
+  raw mode. `tools/mpy.py` sends `#@save`, `#@cat` and `#@erase` through the same channel.
 
 #### Generic ESP32 build (default)
 
@@ -543,6 +620,7 @@ I (112) esp_image: segment 4: paddr=00020020 vaddr=400d0020 size=04540h ( 17728)
 I (120) boot: Loaded app from partition at offset 0x10000
 
 Reset reason: Some(ChipPowerOn)
+scripts/demo.py (built-in)
 === micropython-rs ===
 Hello from ESP32
 a = 21 b = 21
@@ -555,14 +633,18 @@ ADC34 raw: 1468
 I2C devices: 0
 Blinking onboard LED 3 times...
 LED dimmed to 10% with PWM
-=== Execution complete ===
+
+micropython-rs REPL on ESP32
+help() lists functions. Ctrl-C stops a script, Ctrl-D soft resets, Ctrl-E pastes.
+>>>
 ```
 
-TTGO T-Display build (`make flash FEATURES=tft`). The Python `print()` lines are also shown on the TFT screen (`=== Execution complete ===` goes to serial only):
+TTGO T-Display build (`make flash FEATURES=tft`). The same text, the REPL included, is shown on the TFT screen:
 ```bash
 ...
 I (131) boot: Loaded app from partition at offset 0x10000
 Reset reason: Some(ChipPowerOn)
+scripts/ttgo_demo.py (built-in)
 === micropython-rs ===
 Board: TTGO T-Display
 a = 21 b = 21
@@ -576,7 +658,10 @@ I2C devices: 0
 buttons (1 = up): 1 1
 battery ADC raw: 1565
 TFT console active!
-=== Execution complete ===
+
+micropython-rs REPL on ESP32
+help() lists functions. Ctrl-C stops a script, Ctrl-D soft resets, Ctrl-E pastes.
+>>>
 ```
 
 
@@ -597,6 +682,8 @@ TFT console active!
 - [x] `def` functions with parameters, local variables, `return` and recursion
 - [x] Hardware API on ESP32: time, GPIO, ADC, PWM, I²C, watchdog, reset cause, TFT drawing; `help()`
 - [x] Scripts loaded from `.py` files at build time (`make flash SCRIPT=...`)
+- [x] REPL over USB serial with Ctrl-C, paste mode and soft reset; MicroPython raw REPL (`mpremote run/exec`)
+- [x] `main.py` saved in flash and uploaded over USB (`tools/mpy.py save`)
 - [ ] Compact Bytecode Compiler & Stack VM
 
 

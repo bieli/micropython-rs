@@ -112,6 +112,8 @@ pub struct Interpreter<'a, O: Output, H: HardwareBridge = NoHardware> {
     steps: u32,
     /// Set from outside (e.g. a UART Ctrl-C handler) to stop a running script.
     abort: Option<&'a AtomicBool>,
+    /// REPL mode: top-level expression statements print their value.
+    interactive: bool,
 }
 
 impl<'a, O: Output> Interpreter<'a, O, NoHardware> {
@@ -140,6 +142,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
             step_limit: None,
             steps: 0,
             abort: None,
+            interactive: false,
         }
     }
 
@@ -156,6 +159,20 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
     /// clears it before the next run.
     pub fn set_abort_flag(&mut self, flag: &'a AtomicBool) {
         self.abort = Some(flag);
+    }
+
+    /// The `Output` the interpreter prints to, e.g. for a REPL to write its
+    /// prompt and echo to the same place as `print()`.
+    pub fn output(&mut self) -> &mut O {
+        self.out
+    }
+
+    /// REPL mode, like Python's interactive prompt: an expression statement at
+    /// the top level prints its value (`1 + 2` prints `3`, `'a'` prints `'a'`),
+    /// unless it is `None`. Calls such as `print(x)` return `None`, so they
+    /// don't print twice.
+    pub fn set_interactive(&mut self, on: bool) {
+        self.interactive = on;
     }
 
     /// 1-based line where the error returned by the last `eval` call happened,
@@ -287,11 +304,34 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
                 Err(e) => Err(e),
             }
         } else {
-            self.exec_stmt(parser, header_indent, run, ctx, code, true)
+            self.exec_inline_body(parser, header_indent, run, ctx, code)
         };
 
         self.nesting -= 1;
         result
+    }
+
+    /// A body on the header's line: one or more simple statements joined by
+    /// `;` (`if x: a = 1; b = 2`).
+    fn exec_inline_body(
+        &mut self,
+        parser: &mut Parser<'a>,
+        header_indent: u32,
+        run: bool,
+        ctx: Ctx,
+        code: &mut Code<'a>,
+    ) -> Result<Flow<'a>, Error> {
+        let mut flow = Flow::Normal;
+        loop {
+            let active = run && flow == Flow::Normal;
+            let result = self.exec_stmt(parser, header_indent, active, ctx, code, true)?;
+            if active {
+                flow = result;
+            }
+            if !parser.after_semicolon() || parser.at_line_end() {
+                return Ok(flow);
+            }
+        }
     }
 
     /// Parses one statement and runs it if `run` is true. `inline` is set for
@@ -355,7 +395,11 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
             }
             Stmt::Expr(expr) => {
                 if run {
-                    self.eval_expr(code, expr)?;
+                    let val = self.eval_expr(code, expr)?;
+                    if self.interactive && self.call_depth == 0 && val != Value::None {
+                        self.print_repr(val);
+                        self.out.write_str("\n");
+                    }
                 }
             }
             Stmt::Pass => {}
@@ -832,6 +876,24 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
             Value::Bool(false) => self.out.write_str("False"),
             Value::Str(s) => self.out.write_str(s),
             Value::Int(n) => self.write_i64(n),
+        }
+    }
+
+    /// Prints a value the way the Python REPL shows it: strings in quotes.
+    fn print_repr(&mut self, val: Value<'_>) {
+        match val {
+            Value::Str(s) => {
+                // Like Python: single quotes, unless the text contains them
+                let quote = if s.contains('\'') && !s.contains('"') {
+                    "\""
+                } else {
+                    "'"
+                };
+                self.out.write_str(quote);
+                self.out.write_str(s);
+                self.out.write_str(quote);
+            }
+            other => self.print_value(other),
         }
     }
 
@@ -1875,6 +1937,62 @@ print(fact(7), fib(7))
             Err(Error::UnknownIdentifier)
         );
         assert_eq!(Arg::Int(1).str(), Err(Error::TypeError));
+    }
+
+    #[test]
+    fn test_interactive_echo() {
+        let mut out = MockOut::new();
+        let mut vm = Interpreter::new(&mut out);
+        vm.set_interactive(true);
+        for line in [
+            "1 + 2",
+            "x = 5",
+            "x * 2",
+            "'hi'",
+            "\"it's\"",
+            "x > 3",
+            "None",
+            "print('once')",
+            "def f():\n    7\n    return 8",
+            "f()",
+        ] {
+            vm.eval(line).unwrap();
+        }
+        // Expressions inside functions and blocks don't echo, top-level ones do
+        vm.eval("if 1:\n    9").unwrap();
+        vm.set_interactive(false);
+        vm.eval("10").unwrap();
+        vm.output().write_str(">>> ");
+        assert_eq!(
+            out.as_str(),
+            "3\n10\n'hi'\n\"it's\"\nTrue\nonce\n8\n9\n>>> "
+        );
+    }
+
+    #[test]
+    fn test_semicolons() {
+        assert_output("x = 1; y = 2; print(x + y)", "3\n");
+        assert_output("x = 5;\nprint(x)", "5\n");
+        // Inline bodies: every `;`-joined statement belongs to the body
+        assert_output("if 0: print('a'); print('b')\nprint('c')", "c\n");
+        assert_output(
+            "if 1: print('a'); print('b')\nelse: print('x'); print('y')",
+            "a\nb\n",
+        );
+        assert_output("i = 0\nwhile i < 3: i += 1; print(i)", "1\n2\n3\n");
+        assert_output("def f(a): b = a * 2; return b + 1\nprint(f(4))", "9\n");
+        assert_output(
+            "i = 0\nwhile 1: i += 1; print(i); break\nprint('done')",
+            "1\ndone\n",
+        );
+        // In a block, `;` just separates statements of that block
+        assert_output("if 1:\n    a = 1; b = 2\n    print(a, b)", "1 2\n");
+        assert_eq!(run_err("x = 1;; y = 2").0, Error::UnexpectedToken);
+        assert_eq!(run_err("; x = 1").0, Error::UnexpectedToken);
+        assert_eq!(
+            run_err("if 1: x = 1; while 1: pass").0,
+            Error::InvalidSyntax
+        );
     }
 
     #[test]

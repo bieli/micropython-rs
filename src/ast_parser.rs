@@ -243,6 +243,8 @@ pub struct Parser<'a> {
     current_indent: u32,
     /// Line where the most recently parsed statement starts.
     stmt_line: u32,
+    /// The last statement ended with `;`, so another may follow on its line.
+    after_semicolon: bool,
     depth: usize,
 }
 
@@ -258,6 +260,7 @@ impl<'a> Parser<'a> {
             current_line,
             current_indent: lexer.token_indent(),
             stmt_line: current_line,
+            after_semicolon: false,
             depth: 0,
         })
     }
@@ -288,6 +291,12 @@ impl<'a> Parser<'a> {
     /// means the body is an indented block, not an inline statement).
     pub fn at_line_end(&self) -> bool {
         matches!(self.current, Token::Newline | Token::Eof)
+    }
+
+    /// True if the last statement ended with `;` (`a = 1; b = 2`), so the
+    /// next statement, if any on this line, belongs to the same body.
+    pub fn after_semicolon(&self) -> bool {
+        self.after_semicolon
     }
 
     /// True if the next statement starts with `elif` / `else`.
@@ -326,9 +335,15 @@ impl<'a> Parser<'a> {
         Ok(())
     }
 
+    /// A simple statement ends at a newline, the end of input, or `;`
+    /// (which is consumed, so the parser is at the next statement).
     fn expect_stmt_end(&mut self) -> Result<(), Error> {
         match self.current {
             Token::Newline | Token::Eof => Ok(()),
+            Token::Semicolon => {
+                self.after_semicolon = true;
+                self.advance()
+            }
             _ => Err(Error::UnexpectedToken),
         }
     }
@@ -340,6 +355,7 @@ impl<'a> Parser<'a> {
     /// consumed; the parser is then at the start of the body.
     pub fn parse_next_stmt(&mut self, code: &mut Code<'a>) -> Result<Option<Stmt<'a>>, Error> {
         code.clear();
+        self.after_semicolon = false;
         self.skip_newlines()?;
         self.stmt_line = self.current_line;
 

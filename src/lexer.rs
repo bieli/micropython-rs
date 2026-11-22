@@ -56,6 +56,8 @@ pub enum Token<'a> {
     RParen,
     Comma,
     Colon,
+    /// `;` between statements on one line
+    Semicolon,
     Newline,
     Eof,
 }
@@ -160,6 +162,7 @@ impl<'a> Lexer<'a> {
             ')' => Token::RParen,
             ',' => Token::Comma,
             ':' => Token::Colon,
+            ';' => Token::Semicolon,
             '~' => Token::Tilde,
             '\n' => Token::Newline,
             '=' => self.op_or_eq(Token::Assign, Token::EqEq),
@@ -492,7 +495,7 @@ mod tests {
 
     #[test]
     fn test_comparison_bitwise_and_punctuation() {
-        let (tokens, count) = collect_tokens::<20>("== != < <= > >= & | ^ ~ << >> : = ** //");
+        let (tokens, count) = collect_tokens::<20>("== != < <= > >= & | ^ ~ << >> : = ** // ;");
         assert_eq!(
             &tokens[..count],
             &[
@@ -512,6 +515,7 @@ mod tests {
                 Token::Assign,
                 Token::DoubleStar,
                 Token::DoubleSlash,
+                Token::Semicolon,
             ]
         );
         let mut lexer = Lexer::new("!");
