@@ -1,6 +1,7 @@
 # Voltmeter for the LilyGO TTGO T-Display (FEATURES=tft): an analog input
 # in millivolts with min/max/average and a sweeping graph, plus the battery
-# voltage and charge level.
+# voltage and charge level, and the uptime (HH:MM:SS since power-on) to
+# see how long the battery lasts.
 #
 #   LEFT  button: switch input GPIO36 <-> GPIO39   (hold: reset min/max/avg)
 #   RIGHT button: HOLD the display                 (hold: change graph range)
@@ -34,6 +35,10 @@ GRID = rgb(40, 40, 40)
 TRACE = display.GREEN
 CURSOR = rgb(90, 90, 90)
 LABEL = display.GRAY
+
+# Top line: input label and HOLD | battery icon and level | uptime clock
+BAT_X = 96
+CLOCK_X = 176
 
 pin = 36
 hold = False
@@ -114,12 +119,38 @@ def reset_stats():
 
 
 def draw_header():
-    display.fill_rect(0, 0, 150, 12, display.BLACK)
+    display.fill_rect(0, 0, BAT_X - 2, 12, display.BLACK)
     display.font(1)
     display.text(2, 2, 'AIN GPIO', LABEL)
     display.number(2 + display.text_width('AIN GPIO'), 2, pin, LABEL)
     if hold:
-        display.text(80, 2, 'HOLD', display.BLACK, display.YELLOW)
+        display.text(66, 2, 'HOLD', display.BLACK, display.YELLOW)
+
+
+def two_digits(x, y, n):
+    # Draws n with a leading zero (7 -> "07"); returns the width
+    w = 0
+    if n < 10:
+        w = display.number(x, y, 0, display.WHITE)
+    return w + display.number(x + w, y, n, display.WHITE)
+
+
+def draw_clock(secs):
+    # Uptime as HH:MM:SS, right-aligned in the top-right corner
+    hours = secs // 3600
+    display.font(1)
+    width = display.text_width('00:00:00')
+    if hours > 99:
+        width += display.number_width(hours) - display.text_width('00')
+    x = WIDTH - 2 - width
+    display.fill_rect(CLOCK_X, 0, WIDTH - CLOCK_X, 12, display.BLACK)
+    x += two_digits(x, 2, hours)
+    display.text(x, 2, ':', LABEL)
+    x += display.text_width(':')
+    x += two_digits(x, 2, secs // 60 % 60)
+    display.text(x, 2, ':', LABEL)
+    x += display.text_width(':')
+    two_digits(x, 2, secs % 60)
 
 
 def draw_value(raw):
@@ -154,8 +185,8 @@ def draw_stats():
 
 def draw_battery():
     bat = battery_mv(8)
-    x = WIDTH - 66
-    display.fill_rect(x, 1, 66, 11, display.BLACK)
+    x = BAT_X
+    display.fill_rect(x, 0, CLOCK_X - x, 12, display.BLACK)
     display.fill_rect(150, 16, WIDTH - 150, 18, display.BLACK)
     display.font(1)
     if bat < BAT_NONE:
@@ -262,9 +293,13 @@ print('voltmeter: LEFT = channel (hold: reset stats), RIGHT = hold (hold: range)
 # --- main loop (tests replace everything below this line) ---
 next_sample = time.ticks_ms()
 next_battery = next_sample + BATTERY_MS
+shown_secs = -1
 while True:
     handle(buttons.get())
     now = time.ticks_ms()
+    if now // 1000 != shown_secs:
+        shown_secs = now // 1000
+        draw_clock(shown_secs)
     if not hold and now >= next_sample:
         sample()
         next_sample = now + SAMPLE_MS

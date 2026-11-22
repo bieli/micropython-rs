@@ -440,6 +440,8 @@ source text. The REPL has 32 KB for that; when it runs out, press Ctrl-D.
 [`tools/mpy.py`](micropython-esp32/tools/mpy.py) adds saving `main.py` to flash:
 
 ```bash
+tools/mpy.py watch scripts/blink.py      # rerun the file on the board every time you save it
+tools/mpy.py watch scripts/blink.py --save   # ... and keep each version as main.py
 tools/mpy.py run scripts/blink.py        # run a file and print its output (no reflashing)
 tools/mpy.py exec "print(6 * 7)"
 tools/mpy.py save scripts/blink.py       # store as main.py in flash: it runs at every boot
@@ -451,6 +453,35 @@ mpremote connect /dev/ttyACM0 run scripts/blink.py
 mpremote connect /dev/ttyACM0 exec "print(ticks_ms())"
 mpremote connect /dev/ttyACM0 repl
 ```
+
+**Edit-and-run workflow (`watch`).** Open the file in any editor (VS Code, Thonny as an editor, nano, ...) and run
+`tools/mpy.py watch myapp.py` in a terminal. Every time the file is saved:
+
+1. CPython checks the syntax first (the board runs a subset of Python, so anything CPython rejects would fail there
+   too); a syntax error is shown with its line number and the previous version keeps running.
+2. The running program is stopped (Ctrl-C, works for endless loops too), the board is soft-reset, and the new
+   version starts. Its output appears live; runtime errors show the board's line number.
+3. With `--save`, each version is also stored as `main.py`; when you stop watching (Ctrl-C), the board soft-resets
+   and keeps running it on its own.
+
+```text
+$ tools/mpy.py watch myapp.py
+watching myapp.py - save it to rerun it on the board, Ctrl-C to stop
+
+--- 21:33:46 running myapp.py ---
+version 1, tick 0
+version 1, tick 1
+--- stopped ---
+
+--- 21:33:49 running myapp.py ---
+version 2, tick 100
+myapp.py:2: syntax error: unexpected EOF while parsing - not uploaded
+--- 21:33:55 running myapp.py ---
+--- Error at line 2: ZeroDivision ---
+```
+
+Thonny's own MicroPython mode (file browser, "Save to device") doesn't work yet: Thonny runs helper code on the board
+that needs classes, `try`/`except`, lists, dicts and the `os` module, which the interpreter doesn't support yet.
 
 `tools/mpy.py` needs `pyserial` and takes `--port` (default `/dev/ttyACM0`, or `$MPY_PORT`). It exits with status 1
 when the script raises an error. `mpremote`'s file commands (`cp`, `ls`, `fs`) don't work, because the firmware has no
@@ -513,7 +544,7 @@ tools/mpy.py erase                         # back to the built-in demo
 
 ```text
 ┌──────────────────────────────────────┐
-│ AIN GPIO36   HOLD        [####] 87%  │  input, HOLD flag, battery level
+│ AIN GPIO36 HOLD [####] 87%  01:23:45 │  input, HOLD flag, battery level, uptime
 │ 1234 mV                    3.95 V    │  input in mV (big), battery voltage
 │ min 1201  max 1340  avg 1288         │  statistics since the last reset
 │3300┬─────────────────────────────────│
@@ -530,6 +561,9 @@ tools/mpy.py erase                         # back to the built-in demo
 | RIGHT (GPIO35) | HOLD: freeze the readings | Graph range: 3300 → 1650 → 825 mV full scale |
 
 * Each point is the average of 16 readings (`adc_mv(pin, 16)`); the average shown is a moving average.
+* The uptime (top right, `HH:MM:SS`, hours go past 99) counts from power-on, not from when the script started, so
+  starting from a full battery it shows how long the battery has lasted. It restarts on power-on, a reset button press
+  or a watchdog reset; a soft reset (Ctrl-D, `tools/mpy.py`) keeps it running.
 * Below about 150 mV the ESP32 ADC reads 0, shown as `< 150 mV`; at the top of its range it saturates, shown as `> 3.1 V`.
 * The battery level is linear from 3.3 V (0 %) to 4.2 V (100 %) for a Li-ion cell. Above 4.25 V it shows `CHG`
   (on USB, a charging cell reads about 4.4–4.5 V). Below 3.0 V no usable cell is connected, so the gauge shows a grey
