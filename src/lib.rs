@@ -22,13 +22,13 @@ pub trait Output {
 }
 
 pub trait HardwareBridge {
-    fn call(&mut self, name: &str, args: &[i64]) -> Result<Option<i64>, ()>;
+    fn call(&mut self, name: &str, args: &[i64]) -> Result<Option<i64>, Error>;
 }
 
 pub struct NoHardware;
 
 impl HardwareBridge for NoHardware {
-    fn call(&mut self, _name: &str, _args: &[i64]) -> Result<Option<i64>, ()> {
-        Err(())
+    fn call(&mut self, _name: &str, _args: &[i64]) -> Result<Option<i64>, Error> {
+        Err(Error::UnknownIdentifier)
     }
 }

@@ -8,7 +8,7 @@ use esp_hal::{
     main,
 };
 use esp_println::{print, println};
-use micropython_rs::{HardwareBridge, Interpreter, Output};
+use micropython_rs::{Error, HardwareBridge, Interpreter, Output};
 
 esp_bootloader_esp_idf::esp_app_desc!();
 
@@ -28,7 +28,7 @@ struct Esp32Board<'d> {
 }
 
 impl<'d> HardwareBridge for Esp32Board<'d> {
-    fn call(&mut self, name: &str, args: &[i64]) -> Result<Option<i64>, ()> {
+    fn call(&mut self, name: &str, args: &[i64]) -> Result<Option<i64>, Error> {
         match (name, args) {
             ("led_on", []) => {
                 self.led.set_high();
@@ -42,7 +42,7 @@ impl<'d> HardwareBridge for Esp32Board<'d> {
                 self.delay.delay_millis(*ms as u32);
                 Ok(None)
             }
-            _ => Err(()),
+            _ => Err(Error::UnknownIdentifier),
         }
     }
 }
