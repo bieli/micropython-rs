@@ -96,8 +96,20 @@ def main():
     if args.command in ("run", "save", "exec") and not args.arg:
         parser.error(f"{args.command} needs an argument")
 
-    board = Board(args.port, args.baud)
-    board.enter_raw()
+    try:
+        board = Board(args.port, args.baud)
+    except serial.SerialException as err:
+        sys.exit(f"Cannot open {args.port}: {err}\nPick the board's port with --port (e.g. /dev/ttyUSB0) or $MPY_PORT.")
+    try:
+        board.enter_raw()
+    except TimeoutError:
+        sys.exit(
+            f"The board on {args.port} doesn't answer the raw REPL.\n"
+            "Most likely it runs firmware older than the REPL (or other firmware, e.g. MicroPython\n"
+            "with a different setup). Flash the current firmware once, then retry:\n"
+            "    make flash FEATURES=tft      # TTGO T-Display (plain ESP32 boards: make flash)\n"
+            "If more than one board is connected, pick the right one with --port."
+        )
     try:
         if args.command == "reset":
             board.soft_reset()

@@ -21,6 +21,9 @@ SAMPLE_MS = 50        # one graph point every 50 ms
 BATTERY_MS = 2000     # battery reading interval
 BAT_EMPTY = 3300      # Li-ion: 0 % at 3.3 V ...
 BAT_FULL = 4200       # ... 100 % at 4.2 V
+BAT_NONE = 3000       # below this no usable cell is connected (board runs from USB;
+                      # the battery pin then only sees the charger, ~2.6-2.7 V)
+BAT_CHARGING = 4250   # above this a cell is charging from USB
 
 # Graph area (the screen is 240 x 135)
 GX = 30
@@ -151,6 +154,20 @@ def draw_stats():
 
 def draw_battery():
     bat = battery_mv(8)
+    x = WIDTH - 66
+    display.fill_rect(x, 1, 66, 11, display.BLACK)
+    display.fill_rect(150, 16, WIDTH - 150, 18, display.BLACK)
+    display.font(1)
+    if bat < BAT_NONE:
+        # No battery: a grey empty icon and "USB" instead of a misleading 0 %
+        display.rect(x, 1, 26, 11, display.GRAY)
+        display.fill_rect(x + 26, 4, 2, 5, display.GRAY)
+        display.text(x + 32, 3, 'USB', display.CYAN)
+        display.font(2)
+        w = display.text_width('no battery')
+        display.text(WIDTH - 2 - w, 18, 'no battery', LABEL)
+        return
+
     pct = (bat - BAT_EMPTY) * 100 // (BAT_FULL - BAT_EMPTY)
     pct = max(0, min(100, pct))
     if pct > 50:
@@ -160,16 +177,15 @@ def draw_battery():
     else:
         color = display.RED
     # Icon: body 26 x 11 with a nub, filled by the charge level
-    x = WIDTH - 66
-    display.fill_rect(x, 1, 60, 11, display.BLACK)
     display.rect(x, 1, 26, 11, display.WHITE)
     display.fill_rect(x + 26, 4, 2, 5, display.WHITE)
     display.fill_rect(x + 2, 3, 22 * pct // 100, 7, color)
-    display.font(1)
-    w = display.number(x + 32, 3, pct, color)
-    display.text(x + 32 + w, 3, '%', color)
+    if bat > BAT_CHARGING:
+        display.text(x + 32, 3, 'CHG', display.CYAN)
+    else:
+        w = display.number(x + 32, 3, pct, color)
+        display.text(x + 32 + w, 3, '%', color)
     # Battery voltage, right-aligned under the icon
-    display.fill_rect(150, 16, WIDTH - 150, 18, display.BLACK)
     display.font(2)
     x = WIDTH - 2 - display.text_width('0.00 V')
     w = draw_volts(x, 18, bat)

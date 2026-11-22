@@ -531,8 +531,9 @@ tools/mpy.py erase                         # back to the built-in demo
 
 * Each point is the average of 16 readings (`adc_mv(pin, 16)`); the average shown is a moving average.
 * Below about 150 mV the ESP32 ADC reads 0, shown as `< 150 mV`; at the top of its range it saturates, shown as `> 3.1 V`.
-* The battery level is linear from 3.3 V (0 %) to 4.2 V (100 %) for a Li-ion cell. With USB power and no battery the
-  battery pin floats (about 2.7 V on the test board), so the gauge only means something with a battery connected.
+* The battery level is linear from 3.3 V (0 %) to 4.2 V (100 %) for a Li-ion cell. Above 4.25 V it shows `CHG`
+  (on USB, a charging cell reads about 4.4–4.5 V). Below 3.0 V no usable cell is connected, so the gauge shows a grey
+  icon, `USB` and `no battery` instead of a misleading 0 %.
 * To match a multimeter, measure one known voltage and set `CAL_NUM` / `CAL_DEN` (gain) and `CAL_OFFSET` (mV) at the
   top of the script.
 
@@ -551,6 +552,10 @@ tools/mpy.py save scripts/voltmeter.py     # start it at every boot
 (`mV = (vref * 196602 / 4096 * raw + 32768) / 65536 + 142`), with the reference voltage the factory stored in eFuse.
 ESP-IDF adds a lookup table for the top of the 11 dB range, which isn't included here, so readings above about
 2.6 V are a few percent less accurate. Useful range: about 0.15–3.1 V. Averaging (`samples`) reduces the noise.
+
+The firmware also works around an `esp-hal` 1.0 bug: on the ESP32, `Adc::new` sets the result inversion bit only for
+ADC2, so ADC1 readings (GPIO32–39) came out mirrored (`4095 - value`; an unconnected pin read 4095 instead of 0).
+`Board::new` sets `SENS.sar_read_ctrl.sar1_data_inv` like ESP-IDF does.
 | [`scripts/watchdog.py`](micropython-esp32/scripts/watchdog.py) | The watchdog resetting a hung script, and `reset_cause()` after the reboot |
 | [`scripts/errors.py`](micropython-esp32/scripts/errors.py) | A forbidden pin reported as `ValueError` with its line number |
 
