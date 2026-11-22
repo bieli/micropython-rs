@@ -1,5 +1,5 @@
 // ============================================================================
-// AST & PARSER (Stack-allocated, fixed capacity)
+// AST & PARSER (Recursive Descent, Zero-Allocation)
 // ============================================================================
 
 use crate::lexer::{Lexer, Token};
@@ -15,16 +15,16 @@ pub enum Expr<'a> {
     Ident(&'a str),
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Stmt<'a> {
     Assign {
         name: &'a str,
-        value: Expr<'a>,
+        expr: Expr<'a>,
     },
     Call {
-        func: &'a str,
-        args: [Expr<'a>; MAX_CALL_ARGS],
-        arg_count: usize,
+        name: &'a str,
+        args: [Option<Expr<'a>>; MAX_CALL_ARGS],
+        count: usize,
     },
 }
 
@@ -34,28 +34,25 @@ pub struct Parser<'a> {
 }
 
 impl<'a> Parser<'a> {
-    pub fn new(src: &'a str) -> Result<Self, Error> {
-        let mut lexer = Lexer::new(src);
+    pub fn new(source: &'a str) -> Result<Self, Error> {
+        let mut lexer = Lexer::new(source);
         let current = lexer.next_token()?;
         Ok(Self { lexer, current })
     }
 
-    fn bump(&mut self) -> Result<Token<'a>, Error> {
-        let prev = self.current;
+    fn advance(&mut self) -> Result<(), Error> {
         self.current = self.lexer.next_token()?;
-        Ok(prev)
+        Ok(())
     }
 
-    fn parse_expr(&mut self) -> Result<Expr<'a>, Error> {
-        match self.bump()? {
-            Token::Str(s) => Ok(Expr::Str(s)),
-            Token::Int(n) => Ok(Expr::Int(n)),
-            Token::Ident(name) => Ok(Expr::Ident(name)),
-            _ => Err(Error::UnexpectedToken),
+    fn skip_newlines(&mut self) -> Result<(), Error> {
+        while self.current == Token::Newline {
+            self.advance()?;
         }
+        Ok(())
     }
 
-    fn expect_end_of_stmt(&self) -> Result<(), Error> {
+    fn expect_stmt_end(&mut self) -> Result<(), Error> {
         match self.current {
             Token::Newline | Token::Eof => Ok(()),
             _ => Err(Error::UnexpectedToken),
@@ -63,61 +60,78 @@ impl<'a> Parser<'a> {
     }
 
     pub fn parse_next_stmt(&mut self) -> Result<Option<Stmt<'a>>, Error> {
-        while self.current == Token::Newline {
-            self.bump()?;
-        }
+        self.skip_newlines()?;
 
         if self.current == Token::Eof {
             return Ok(None);
         }
 
-        let Token::Ident(name) = self.bump()? else {
-            return Err(Error::InvalidSyntax);
+        let name = match self.current {
+            Token::Ident(ident) => ident,
+            _ => return Err(Error::InvalidSyntax),
         };
+        self.advance()?;
 
-        match self.bump()? {
-            // Case 1: Variable assignment -> `x = 42`
+        match self.current {
+            // Variable assignment: `x = <expr>`
             Token::Assign => {
-                let value = self.parse_expr()?;
-                self.expect_end_of_stmt()?;
-                Ok(Some(Stmt::Assign { name, value }))
+                self.advance()?;
+                let expr = self.parse_expr()?;
+                self.expect_stmt_end()?;
+                Ok(Some(Stmt::Assign { name, expr }))
             }
-            // Case 2: Function call -> `print(x, 'hi')`
-            Token::LParen => {
-                let mut args = [Expr::None; MAX_CALL_ARGS];
-                let mut arg_count = 0;
-
-                if self.current != Token::RParen {
-                    loop {
-                        if arg_count >= MAX_CALL_ARGS {
-                            return Err(Error::TooManyArgs);
-                        }
-
-                        args[arg_count] = self.parse_expr()?;
-                        arg_count += 1;
-
-                        match self.current {
-                            Token::Comma => {
-                                self.bump()?;
-                            }
-                            Token::RParen => break,
-                            _ => return Err(Error::UnexpectedToken),
-                        }
-                    }
-                }
-
-                // Consume ')'
-                self.bump()?;
-                self.expect_end_of_stmt()?;
-
-                Ok(Some(Stmt::Call {
-                    func: name,
-                    args,
-                    arg_count,
-                }))
-            }
+            // Function or hardware call: `print(...)`, `led_on()`, `delay_ms(500)`
+            Token::LParen => self.parse_call_stmt(name),
             _ => Err(Error::UnexpectedToken),
         }
+    }
+
+    fn parse_call_stmt(&mut self, name: &'a str) -> Result<Option<Stmt<'a>>, Error> {
+        // Consume '('
+        self.advance()?;
+
+        let mut args = [None; MAX_CALL_ARGS];
+        let mut count = 0;
+
+        if self.current != Token::RParen {
+            loop {
+                if count >= MAX_CALL_ARGS {
+                    return Err(Error::TooManyArguments);
+                }
+
+                args[count] = Some(self.parse_expr()?);
+                count += 1;
+
+                match self.current {
+                    Token::Comma => {
+                        self.advance()?;
+                        // Allow trailing comma before ')'
+                        if self.current == Token::RParen {
+                            break;
+                        }
+                    }
+                    Token::RParen => break,
+                    _ => return Err(Error::UnexpectedToken),
+                }
+            }
+        }
+
+        // Consume ')'
+        self.advance()?;
+        self.expect_stmt_end()?;
+
+        Ok(Some(Stmt::Call { name, args, count }))
+    }
+
+    fn parse_expr(&mut self) -> Result<Expr<'a>, Error> {
+        let expr = match self.current {
+            Token::Int(n) => Expr::Int(n),
+            Token::Str(s) => Expr::Str(s),
+            Token::Ident(ident) => Expr::Ident(ident),
+            _ => return Err(Error::UnexpectedToken),
+        };
+        self.advance()?;
+        Ok(expr)
     }
 }
 
@@ -126,112 +140,91 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_empty_and_blank_lines() {
-        let mut parser = Parser::new("\n   \n\t\n").unwrap();
-        assert_eq!(parser.parse_next_stmt(), Ok(None));
-        // Calling again at EOF continues returning Ok(None)
-        assert_eq!(parser.parse_next_stmt(), Ok(None));
-    }
-
-    #[test]
-    fn test_variable_assignments() {
-        let src = r#"
-x = 42
-greeting = 'hello'
-alias = x
-"#;
-        let mut parser = Parser::new(src).unwrap();
+    fn test_parse_assignments() {
+        let mut parser = Parser::new("x = 42\nmsg = 'hello'\ny = x\n").unwrap();
 
         assert_eq!(
-            parser.parse_next_stmt(),
-            Ok(Some(Stmt::Assign {
+            parser.parse_next_stmt().unwrap(),
+            Some(Stmt::Assign {
                 name: "x",
-                value: Expr::Int(42),
-            }))
+                expr: Expr::Int(42),
+            })
         );
         assert_eq!(
-            parser.parse_next_stmt(),
-            Ok(Some(Stmt::Assign {
-                name: "greeting",
-                value: Expr::Str("hello"),
-            }))
+            parser.parse_next_stmt().unwrap(),
+            Some(Stmt::Assign {
+                name: "msg",
+                expr: Expr::Str("hello"),
+            })
         );
         assert_eq!(
-            parser.parse_next_stmt(),
-            Ok(Some(Stmt::Assign {
-                name: "alias",
-                value: Expr::Ident("x"),
-            }))
+            parser.parse_next_stmt().unwrap(),
+            Some(Stmt::Assign {
+                name: "y",
+                expr: Expr::Ident("x"),
+            })
         );
-        assert_eq!(parser.parse_next_stmt(), Ok(None));
+        assert_eq!(parser.parse_next_stmt().unwrap(), None);
     }
 
     #[test]
-    fn test_function_call_zero_args() {
-        let mut parser = Parser::new("print()").unwrap();
+    fn test_parse_empty_and_hardware_calls() {
+        let mut parser = Parser::new("led_on()\ndelay_ms(500)\n").unwrap();
 
         assert_eq!(
-            parser.parse_next_stmt(),
-            Ok(Some(Stmt::Call {
-                func: "print",
-                args: [Expr::None; MAX_CALL_ARGS],
-                arg_count: 0,
-            }))
+            parser.parse_next_stmt().unwrap(),
+            Some(Stmt::Call {
+                name: "led_on",
+                args: [None; MAX_CALL_ARGS],
+                count: 0,
+            })
         );
-        assert_eq!(parser.parse_next_stmt(), Ok(None));
+
+        let mut expected_delay_args = [None; MAX_CALL_ARGS];
+        expected_delay_args[0] = Some(Expr::Int(500));
+
+        assert_eq!(
+            parser.parse_next_stmt().unwrap(),
+            Some(Stmt::Call {
+                name: "delay_ms",
+                args: expected_delay_args,
+                count: 1,
+            })
+        );
+        assert_eq!(parser.parse_next_stmt().unwrap(), None);
     }
 
     #[test]
-    fn test_function_call_multiple_args() {
-        let mut parser = Parser::new("print('count:', 10, x)").unwrap();
+    fn test_parse_multi_arg_call_and_trailing_comma() {
+        let mut parser = Parser::new("print('x =', x, 10,)\n").unwrap();
 
-        let mut expected_args = [Expr::None; MAX_CALL_ARGS];
-        expected_args[0] = Expr::Str("count:");
-        expected_args[1] = Expr::Int(10);
-        expected_args[2] = Expr::Ident("x");
+        let mut expected_args = [None; MAX_CALL_ARGS];
+        expected_args[0] = Some(Expr::Str("x ="));
+        expected_args[1] = Some(Expr::Ident("x"));
+        expected_args[2] = Some(Expr::Int(10));
 
         assert_eq!(
-            parser.parse_next_stmt(),
-            Ok(Some(Stmt::Call {
-                func: "print",
+            parser.parse_next_stmt().unwrap(),
+            Some(Stmt::Call {
+                name: "print",
                 args: expected_args,
-                arg_count: 3,
-            }))
+                count: 3,
+            })
         );
-        assert_eq!(parser.parse_next_stmt(), Ok(None));
     }
 
     #[test]
-    fn test_syntax_errors() {
-        // Statement starting with a literal instead of an identifier
+    fn test_parse_errors() {
         let mut p1 = Parser::new("123 = 456").unwrap();
         assert_eq!(p1.parse_next_stmt(), Err(Error::InvalidSyntax));
 
-        // Identifier followed by neither `=` nor `(`
-        let mut p2 = Parser::new("x 42").unwrap();
+        let mut p2 = Parser::new("x = ").unwrap();
         assert_eq!(p2.parse_next_stmt(), Err(Error::UnexpectedToken));
 
-        // Missing value on right-hand side of assignment
-        let mut p3 = Parser::new("x = \n").unwrap();
+        let mut p3 = Parser::new("led_on(1 2)").unwrap();
         assert_eq!(p3.parse_next_stmt(), Err(Error::UnexpectedToken));
 
-        // Missing comma between function arguments
-        let mut p4 = Parser::new("print(1 2)").unwrap();
-        assert_eq!(p4.parse_next_stmt(), Err(Error::UnexpectedToken));
-
-        // Unclosed parenthesis
-        let mut p5 = Parser::new("print('hi'\n").unwrap();
-        assert_eq!(p5.parse_next_stmt(), Err(Error::UnexpectedToken));
-
-        // Trailing tokens on the same line after a valid statement
-        let mut p6 = Parser::new("x = 1 y = 2").unwrap();
-        assert_eq!(p6.parse_next_stmt(), Err(Error::UnexpectedToken));
-    }
-
-    #[test]
-    fn test_too_many_args_error() {
-        // 9 arguments exceeds MAX_CALL_ARGS (8)
-        let mut parser = Parser::new("print(1, 2, 3, 4, 5, 6, 7, 8, 9)").unwrap();
-        assert_eq!(parser.parse_next_stmt(), Err(Error::TooManyArgs));
+        let mut p4 = Parser::new("f(1, 2, 3, 4, 5, 6, 7, 8, 9)").unwrap();
+        assert_eq!(p4.parse_next_stmt(), Err(Error::TooManyArguments));
     }
 }

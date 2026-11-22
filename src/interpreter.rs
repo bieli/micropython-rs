@@ -2,8 +2,8 @@
 // INTERPRETER / EVALUATOR
 // ============================================================================
 
-use crate::ast_parser::{Expr, Parser, Stmt};
-use crate::{Error, Output};
+use crate::ast_parser::{Expr, Parser, Stmt, MAX_CALL_ARGS};
+use crate::{Error, HardwareBridge, NoHardware, Output};
 
 const MAX_VARS: usize = 32;
 
@@ -14,15 +14,27 @@ pub enum Value<'a> {
     Int(i64),
 }
 
-pub struct Interpreter<'a, 'o, O: Output> {
-    out: &'o mut O,
+pub struct Interpreter<'a, O: Output, H: HardwareBridge = NoHardware> {
+    out: &'a mut O,
+    hw: Option<&'a mut H>,
     vars: [Option<(&'a str, Value<'a>)>; MAX_VARS],
 }
 
-impl<'a, 'o, O: Output> Interpreter<'a, 'o, O> {
-    pub fn new(out: &'o mut O) -> Self {
+impl<'a, O: Output> Interpreter<'a, O, NoHardware> {
+    pub fn new(out: &'a mut O) -> Self {
         Self {
             out,
+            hw: None,
+            vars: [None; MAX_VARS],
+        }
+    }
+}
+
+impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
+    pub fn with_hardware(out: &'a mut O, hw: &'a mut H) -> Self {
+        Self {
+            out,
+            hw: Some(hw),
             vars: [None; MAX_VARS],
         }
     }
@@ -36,14 +48,12 @@ impl<'a, 'o, O: Output> Interpreter<'a, 'o, O> {
     }
 
     fn set_var(&mut self, name: &'a str, val: Value<'a>) -> Result<(), Error> {
-        // 1. Update existing variable if already defined
         for slot in self.vars.iter_mut().flatten() {
             if slot.0 == name {
                 slot.1 = val;
                 return Ok(());
             }
         }
-        // 2. Otherwise store in the first empty slot
         for slot in self.vars.iter_mut() {
             if slot.is_none() {
                 *slot = Some((name, val));
@@ -73,27 +83,41 @@ impl<'a, 'o, O: Output> Interpreter<'a, 'o, O> {
 
     fn exec_stmt(&mut self, stmt: Stmt<'a>) -> Result<(), Error> {
         match stmt {
-            Stmt::Assign { name, value } => {
-                let val = self.eval_expr(value)?;
+            Stmt::Assign { name, expr } => {
+                let val = self.eval_expr(expr)?;
                 self.set_var(name, val)
             }
-            Stmt::Call {
-                func,
-                args,
-                arg_count,
-            } => match func {
+            Stmt::Call { name, args, count } => match name {
                 "print" => {
-                    for (i, _item) in args.iter().enumerate().take(arg_count) {
+                    for (i, item) in args.iter().enumerate().take(count) {
                         if i > 0 {
                             self.out.write_str(" ");
                         }
-                        let val = self.eval_expr(args[i])?;
+                        let expr = item.ok_or(Error::InvalidSyntax)?;
+                        let val = self.eval_expr(expr)?;
                         self.print_value(val);
                     }
                     self.out.write_str("\n");
                     Ok(())
                 }
-                _ => Err(Error::UnknownIdentifier),
+                _ => {
+                    let mut eval_args = [0i64; MAX_CALL_ARGS];
+                    for (i, item) in args.iter().enumerate().take(count) {
+                        let expr = item.ok_or(Error::InvalidSyntax)?;
+                        match self.eval_expr(expr)? {
+                            Value::Int(n) => eval_args[i] = n,
+                            _ => return Err(Error::InvalidSyntax),
+                        }
+                    }
+
+                    match self.hw.as_mut() {
+                        Some(hw) => hw
+                            .call(name, &eval_args[..count])
+                            .map(|_| ())
+                            .map_err(|_| Error::UnknownIdentifier),
+                        None => Err(Error::UnknownIdentifier),
+                    }
+                }
             },
         }
     }
@@ -161,6 +185,31 @@ mod tests {
         }
     }
 
+    struct MockHardware {
+        led_state: bool,
+        total_delay_ms: i64,
+    }
+
+    impl HardwareBridge for MockHardware {
+        fn call(&mut self, name: &str, args: &[i64]) -> Result<Option<i64>, ()> {
+            match (name, args) {
+                ("led_on", []) => {
+                    self.led_state = true;
+                    Ok(None)
+                }
+                ("led_off", []) => {
+                    self.led_state = false;
+                    Ok(None)
+                }
+                ("delay_ms", [ms]) => {
+                    self.total_delay_ms += *ms;
+                    Ok(None)
+                }
+                _ => Err(()),
+            }
+        }
+    }
+
     #[test]
     fn test_variables_and_print() {
         let mut out = MockOut::new();
@@ -177,6 +226,38 @@ print('Answer:', y)
 
         vm.eval(code).unwrap();
         assert_eq!(out.as_str(), "Hello, Rust!\nAnswer: 42\n");
+    }
+
+    #[test]
+    fn test_hardware_bridge_calls() {
+        let mut out = MockOut::new();
+        let mut hw = MockHardware {
+            led_state: false,
+            total_delay_ms: 0,
+        };
+        let mut vm = Interpreter::with_hardware(&mut out, &mut hw);
+
+        let code = r#"
+wait = 250
+led_on()
+delay_ms(wait)
+led_off()
+delay_ms(500)
+led_on()
+print('LED ok')
+"#;
+
+        vm.eval(code).unwrap();
+
+        // Test error paths while `vm` still holds the mutable borrows
+        assert_eq!(vm.eval("unknown_hw()"), Err(Error::UnknownIdentifier));
+        assert_eq!(vm.eval("led_on(1)"), Err(Error::UnknownIdentifier));
+        assert_eq!(vm.eval("delay_ms('bad')"), Err(Error::InvalidSyntax));
+
+        // Now `vm` is no longer used, so we can inspect `hw` and `out`
+        assert!(hw.led_state);
+        assert_eq!(hw.total_delay_ms, 750);
+        assert_eq!(out.as_str(), "LED ok\n");
     }
 
     #[test]
@@ -204,11 +285,9 @@ print('Answer:', y)
         let mut out = MockOut::new();
         let mut vm = Interpreter::new(&mut out);
 
-        // Fill all 32 variable slots (MAX_VARS = 32)
         let mut buf = [0u8; 512];
         let mut len = 0;
         for i in 0..MAX_VARS {
-            // Write "v0 = 0\n", "v1 = 1\n", ... into a stack buffer
             let prefix = b"v";
             buf[len..len + prefix.len()].copy_from_slice(prefix);
             len += prefix.len();
@@ -227,11 +306,7 @@ print('Answer:', y)
 
         let fill_script = core::str::from_utf8(&buf[..len]).unwrap();
         assert_eq!(vm.eval(fill_script), Ok(()));
-
-        // Overwriting an existing variable still succeeds when full
         assert_eq!(vm.eval("v0 = 99"), Ok(()));
-
-        // Adding a 33rd distinct variable fails with OutOfMemory
         assert_eq!(vm.eval("overflow = 1"), Err(Error::OutOfMemory));
     }
 
