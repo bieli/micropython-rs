@@ -1,6 +1,7 @@
 # Target configuration
-EMBEDDED_TARGET := thumbv7em-none-eabihf
 MIN_COVERAGE := 30
+EMBEDDED_ARM := thumbv7em-none-eabihf
+EMBEDDED_ESP32 := riscv32imc-unknown-none-elf	
 
 FILE ?= hello.py
 
@@ -28,7 +29,8 @@ run:
 
 # Verify that src/lib.rs compiles cleanly in strict #![no_std] mode
 build-embedded:
-	cargo build --lib --target $(EMBEDDED_TARGET)
+	cargo build --lib --target $(EMBEDDED_ARM)
+	cargo build --lib --target $(EMBEDDED_ESP32)
 
 # Remove build artifacts
 clean:
