@@ -20,4 +20,5 @@ pub enum Error {
     UnknownIdentifier,
     InvalidSyntax,
     TooManyArgs,
+    OutOfMemory,
 }

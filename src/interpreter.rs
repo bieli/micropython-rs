@@ -5,16 +5,29 @@
 use crate::ast_parser::{Expr, Parser, Stmt};
 use crate::{Error, Output};
 
-pub struct Interpreter<'o, O: Output> {
-    out: &'o mut O,
+const MAX_VARS: usize = 32;
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Value<'a> {
+    None,
+    Str(&'a str),
+    Int(i64),
 }
 
-impl<'o, O: Output> Interpreter<'o, O> {
+pub struct Interpreter<'a, 'o, O: Output> {
+    out: &'o mut O,
+    vars: [Option<(&'a str, Value<'a>)>; MAX_VARS],
+}
+
+impl<'a, 'o, O: Output> Interpreter<'a, 'o, O> {
     pub fn new(out: &'o mut O) -> Self {
-        Self { out }
+        Self {
+            out,
+            vars: [None; MAX_VARS],
+        }
     }
 
-    pub fn eval(&mut self, source: &str) -> Result<(), Error> {
+    pub fn eval(&mut self, source: &'a str) -> Result<(), Error> {
         let mut parser = Parser::new(source)?;
         while let Some(stmt) = parser.parse_next_stmt()? {
             self.exec_stmt(stmt)?;
@@ -22,19 +35,60 @@ impl<'o, O: Output> Interpreter<'o, O> {
         Ok(())
     }
 
-    fn exec_stmt(&mut self, stmt: Stmt<'_>) -> Result<(), Error> {
+    fn set_var(&mut self, name: &'a str, val: Value<'a>) -> Result<(), Error> {
+        // 1. Update existing variable if already defined
+        for slot in self.vars.iter_mut().flatten() {
+            if slot.0 == name {
+                slot.1 = val;
+                return Ok(());
+            }
+        }
+        // 2. Otherwise store in the first empty slot
+        for slot in self.vars.iter_mut() {
+            if slot.is_none() {
+                *slot = Some((name, val));
+                return Ok(());
+            }
+        }
+        Err(Error::OutOfMemory)
+    }
+
+    fn get_var(&self, name: &str) -> Result<Value<'a>, Error> {
+        for (var_name, val) in self.vars.iter().flatten() {
+            if *var_name == name {
+                return Ok(*val);
+            }
+        }
+        Err(Error::UnknownIdentifier)
+    }
+
+    fn eval_expr(&self, expr: Expr<'a>) -> Result<Value<'a>, Error> {
+        match expr {
+            Expr::None => Ok(Value::None),
+            Expr::Str(s) => Ok(Value::Str(s)),
+            Expr::Int(n) => Ok(Value::Int(n)),
+            Expr::Ident(name) => self.get_var(name),
+        }
+    }
+
+    fn exec_stmt(&mut self, stmt: Stmt<'a>) -> Result<(), Error> {
         match stmt {
+            Stmt::Assign { name, value } => {
+                let val = self.eval_expr(value)?;
+                self.set_var(name, val)
+            }
             Stmt::Call {
                 func,
                 args,
                 arg_count,
             } => match func {
                 "print" => {
-                    for (i, _item) in args.iter().enumerate().take(arg_count) {
+                    for i in 0..arg_count {
                         if i > 0 {
                             self.out.write_str(" ");
                         }
-                        self.print_expr(args[i]);
+                        let val = self.eval_expr(args[i])?;
+                        self.print_value(val);
                     }
                     self.out.write_str("\n");
                     Ok(())
@@ -44,15 +98,14 @@ impl<'o, O: Output> Interpreter<'o, O> {
         }
     }
 
-    fn print_expr(&mut self, expr: Expr<'_>) {
-        match expr {
-            Expr::None => self.out.write_str("None"),
-            Expr::Str(s) => self.out.write_str(s),
-            Expr::Int(n) => self.write_i64(n),
+    fn print_value(&mut self, val: Value<'_>) {
+        match val {
+            Value::None => self.out.write_str("None"),
+            Value::Str(s) => self.out.write_str(s),
+            Value::Int(n) => self.write_i64(n),
         }
     }
 
-    /// Formats an i64 onto a stack buffer without needing `alloc` or `core::fmt`.
     fn write_i64(&mut self, mut n: i64) {
         if n == 0 {
             self.out.write_str("0");
@@ -109,17 +162,20 @@ mod tests {
     }
 
     #[test]
-    fn test_hello_world() {
+    fn test_variables_and_print() {
         let mut out = MockOut::new();
         let mut vm = Interpreter::new(&mut out);
 
         let code = r#"
-# First micropython-rs program
-print('hello world')
-print("Answer:", 42)
+msg = 'Hello, Rust!'
+x = 10
+x = 42
+y = x
+print(msg)
+print('Answer:', y)
 "#;
 
         vm.eval(code).unwrap();
-        assert_eq!(out.as_str(), "hello world\nAnswer: 42\n");
+        assert_eq!(out.as_str(), "Hello, Rust!\nAnswer: 42\n");
     }
 }
