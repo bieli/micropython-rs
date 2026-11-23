@@ -164,6 +164,12 @@ impl<'d> Board<'d> {
         let adc36 = adc_config.enable_pin(p.gpio36, Attenuation::_11dB);
         let adc39 = adc_config.enable_pin(p.gpio39, Attenuation::_11dB);
         let adc = Adc::new(p.adc1, adc_config);
+        // esp-hal 1.0 bug workaround: on the ESP32, ADC1 results from the RTC
+        // controller come out inverted (4095 - value) unless SAR1_DATA_INV is
+        // set, like ESP-IDF does. `Adc::new` only sets the ADC2 bit.
+        esp_hal::peripherals::SENS::regs()
+            .sar_read_ctrl()
+            .modify(|_, w| w.sar1_data_inv().set_bit());
 
         let mut ledc = Ledc::new(p.ledc);
         ledc.set_global_slow_clock(LSGlobalClkSource::APBClk);
