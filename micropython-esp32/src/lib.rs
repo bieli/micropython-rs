@@ -3,6 +3,7 @@
 use core::sync::atomic::AtomicBool;
 
 pub mod board;
+pub mod buttons;
 pub mod repl;
 pub mod script_store;
 pub mod serial_console;

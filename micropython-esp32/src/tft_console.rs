@@ -1,5 +1,8 @@
 use embedded_graphics::{
-    mono_font::{ascii::FONT_6X10, MonoTextStyleBuilder},
+    mono_font::{
+        ascii::{FONT_10X20, FONT_6X10, FONT_8X13},
+        MonoFont, MonoTextStyleBuilder,
+    },
     pixelcolor::{raw::RawU16, Rgb565},
     prelude::*,
     primitives::{Circle, Line, PrimitiveStyle, Rectangle, StyledDrawable, Triangle},
@@ -55,6 +58,25 @@ pub fn color_from_rgb565(value: u16) -> Rgb565 {
 /// 8-bit RGB components packed as RGB565, like MicroPython's `color565()`.
 pub fn rgb565(r: u8, g: u8, b: u8) -> u16 {
     Rgb565::new(r >> 3, g >> 2, b >> 3).into_storage()
+}
+
+/// Decimal text of `n` in `buf` (20 bytes fit any i64).
+fn format_i64(n: i64, buf: &mut [u8; 20]) -> &str {
+    let mut idx = buf.len();
+    let mut v = n.unsigned_abs();
+    loop {
+        idx -= 1;
+        buf[idx] = b'0' + (v % 10) as u8;
+        v /= 10;
+        if v == 0 {
+            break;
+        }
+    }
+    if n < 0 {
+        idx -= 1;
+        buf[idx] = b'-';
+    }
+    core::str::from_utf8(&buf[idx..]).unwrap_or("?")
 }
 
 /// One console line is rendered into this RAM strip (240 x 12 pixels,
@@ -119,6 +141,9 @@ pub struct TftConsole<'d> {
     /// The current line changed since it was last drawn.
     dirty: bool,
     strip: Strip,
+    /// Font for script text (`display.text`, `display.number`); the console
+    /// itself always uses `FONT_6X10`.
+    font: &'static MonoFont<'static>,
 }
 
 impl<'d> TftConsole<'d> {
@@ -160,6 +185,7 @@ impl<'d> TftConsole<'d> {
             strip: Strip {
                 px: [Rgb565::BLACK; STRIP_W * STRIP_H],
             },
+            font: &FONT_6X10,
         }
     }
 
@@ -192,10 +218,45 @@ impl<'d> TftConsole<'d> {
         self.draw_text_colored(x, y, s, self.color, Rgb565::BLACK);
     }
 
+    /// Selects the font for script text: 1 = 6x10, 2 = 8x13, 3 = 10x20 pixels.
+    /// Returns `false` for other sizes.
+    pub fn set_font(&mut self, size: i64) -> bool {
+        self.font = match size {
+            1 => &FONT_6X10,
+            2 => &FONT_8X13,
+            3 => &FONT_10X20,
+            _ => return false,
+        };
+        true
+    }
+
+    /// Width in pixels of one character of the script font.
+    pub fn char_width(&self) -> i32 {
+        (self.font.character_size.width + self.font.character_spacing) as i32
+    }
+
+    pub fn font_height(&self) -> i32 {
+        self.font.character_size.height as i32
+    }
+
+    /// Draws an integer without needing `str()`; returns its width in pixels.
+    pub fn draw_number(&mut self, x: i32, y: i32, n: i64, fg: Rgb565, bg: Rgb565) -> i32 {
+        let mut buf = [0u8; 20];
+        let text = format_i64(n, &mut buf);
+        self.draw_text_colored(x, y, text, fg, bg);
+        text.len() as i32 * self.char_width()
+    }
+
+    /// Width in pixels of `n` drawn with `draw_number`.
+    pub fn number_width(&self, n: i64) -> i32 {
+        let mut buf = [0u8; 20];
+        format_i64(n, &mut buf).len() as i32 * self.char_width()
+    }
+
     /// `draw_text` with explicit text and background colors.
     pub fn draw_text_colored(&mut self, x: i32, y: i32, s: &str, fg: Rgb565, bg: Rgb565) {
         let style = MonoTextStyleBuilder::new()
-            .font(&FONT_6X10)
+            .font(self.font)
             .text_color(fg)
             .background_color(bg)
             .build();
@@ -209,7 +270,7 @@ impl<'d> TftConsole<'d> {
             let text = core::str::from_utf8(&buf[..chunk.len()]).unwrap_or("");
             let _ = Text::with_baseline(text, Point::new(x, y), style, Baseline::Top)
                 .draw(&mut self.display.clipped(&SCREEN));
-            x += chunk.len() as i32 * CHAR_W;
+            x += chunk.len() as i32 * self.char_width();
         }
     }
 

@@ -285,7 +285,7 @@ impl<'d> Board<'d> {
 
     /// Busy-waits in short chunks, feeding the watchdog in between, so a
     /// long `sleep_ms` doesn't trip it.
-    fn sleep_ms(&mut self, ms: i64) -> Result<(), Error> {
+    pub fn sleep_ms(&mut self, ms: i64) -> Result<(), Error> {
         let mut remaining = non_negative(ms)?;
         while remaining > 0 {
             // Ctrl-C on the serial port interrupts long sleeps too
@@ -310,7 +310,7 @@ impl<'d> Board<'d> {
         }
     }
 
-    fn pin_mode(&mut self, pin: u8, mode: i64) -> Result<(), Error> {
+    pub fn pin_mode(&mut self, pin: u8, mode: i64) -> Result<(), Error> {
         self.check_allowed(pin)?;
         self.release_pwm(pin);
         let flex = self.pins[pin as usize]
@@ -340,6 +340,12 @@ impl<'d> Board<'d> {
         flex.0.set_input_enable(true);
         flex.1 = PinMode::Input;
         Ok(())
+    }
+
+    /// The level of a pin (an input unless configured otherwise).
+    pub fn read_pin(&mut self, pin: u8) -> Result<bool, Error> {
+        self.check_allowed(pin)?;
+        Ok(self.input(pin)?.is_high())
     }
 
     /// The pin as an output, switching it to `OUT` on first use.
@@ -482,6 +488,11 @@ pub fn reset_cause() -> i64 {
         Some(CoreDeepSleep) => DEEPSLEEP_RESET,
         _ => HARD_RESET,
     }
+}
+
+/// Milliseconds since boot.
+pub fn now_ms() -> u64 {
+    since_boot().as_millis()
 }
 
 fn since_boot() -> Duration {

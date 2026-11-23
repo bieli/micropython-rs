@@ -79,10 +79,11 @@ flags |= 1 << 3                   # bitwise & | ^ ~ << >> and augmented assignme
 | Operators | `+ - * / // % **`, `& \| ^ ~ << >>`, `== != < <= > >=` (chainable), `and or not` |
 | Assignment | `x = ...`, and `+= -= *= /= //= %= **= &= \|= ^= <<= >>=` |
 | Statements | `if`/`elif`/`else`, `while`, `break`, `continue`, `pass`, `def`, `return`; `;` between statements (`x = 1; y = 2`) |
-| Calls | `print(...)`, your own `def` functions, and hardware functions from `HardwareBridge` |
+| Calls | `print(...)`, `abs(x)`, `min(a, b, ...)`, `max(a, b, ...)`, your own `def` functions, and hardware functions from `HardwareBridge` |
+| Scope | `global a, b` in a function, to assign globals (also creates them) |
 | Modules | `import m`, `import m as x, n`, `from m import f, C as K`; `m.f(...)`, `m.CONST` for native modules written in Rust |
 
-Not supported yet: `for`, lists/dicts/tuples, floats, string operations, `global`, classes, importing `.py` files.
+Not supported yet: `for`, lists/dicts/tuples, floats, string operations, classes, importing `.py` files.
 See [ROADMAP.md](ROADMAP.md) for what's planned.
 
 ### Arithmetic operators
@@ -152,7 +153,16 @@ blink(3, 250)
 ```
 
 * Function parameters and variables assigned inside a function are **local**. Globals can be read.
-  There's no `global` keyword yet, so `counter += 1` on a global inside a function raises `Error::UnknownIdentifier`.
+  To assign a global, declare it first, as in Python:
+
+  ```python
+  count = 0
+  def press():
+      global count
+      count += 1
+  ```
+
+  Without `global`, `count += 1` inside the function raises `Error::UnknownIdentifier` (Python: `UnboundLocalError`).
 * Functions are defined at the top level (or inside `if`/`while` at the top level). A `def` inside a `def` raises `Error::InvalidSyntax`.
 * Calling with the wrong number of arguments raises `Error::TypeError`.
 * `break`/`continue` outside a loop and `return` outside a function raise `Error::InvalidSyntax`,
@@ -168,13 +178,14 @@ Limits (in `src/interpreter.rs`):
 
 | Constant | Value | Meaning | Error |
 |----------|-------|---------|-------|
-| `MAX_VARS` | 32 | Variables: globals plus the locals of all active calls | `OutOfMemory` |
-| `MAX_FUNCS` | 8 | `def` functions | `OutOfMemory` |
+| `MAX_VARS` | 64 | Variables: globals plus the locals of all active calls | `OutOfMemory` |
+| `MAX_FUNCS` | 16 | `def` functions | `OutOfMemory` |
+| `MAX_GLOBAL_DECLS` | 16 | Names declared `global` by all active calls together | `OutOfMemory` |
 | `MAX_CALL_DEPTH` | 8 | Nested function calls, recursion included | `RecursionLimit` |
 | `MAX_NESTING` | 24 | Nested blocks (`if`/`while`/function bodies) running at once | `OutOfMemory` |
 
 Native stack use grows with each nested call (an RPN buffer and value stack per call), which is why
-`MAX_CALL_DEPTH` is small. On a 64-bit host the `Interpreter` struct is about 3.4 KB; on 32-bit MCUs it's smaller.
+`MAX_CALL_DEPTH` is small. On a 64-bit host the `Interpreter` struct is about 7 KB; on 32-bit MCUs it's smaller.
 
 ### Function calls
 
@@ -463,6 +474,37 @@ boot, or run `tools/mpy.py erase`.
 | [`scripts/adc.py`](micropython-esp32/scripts/adc.py) | Averaging ADC samples and converting them to millivolts |
 | [`scripts/tft_clock.py`](micropython-esp32/scripts/tft_clock.py) | An uptime clock drawn with `text()` (TTGO only) |
 | [`scripts/display_demo.py`](micropython-esp32/scripts/display_demo.py) | `import display`: lines, rectangles, circles, triangles, pixels and text, with timings (TTGO only) |
+| [`scripts/calculator.py`](micropython-esp32/scripts/calculator.py) | A two-button calculator app: a keypad on the screen, `buttons` events, `global` state (TTGO only) |
+
+### Calculator app (TTGO T-Display)
+
+[`scripts/calculator.py`](micropython-esp32/scripts/calculator.py) is a complete app in about 190 lines of Python on top
+of the `display` and `buttons` modules:
+
+```text
+┌──────────────────────────────┐
+│ 12 +                     345 │   pending operation (small), current number (big)
+├───────┬───────┬───────┬──────┤
+│   7   │   8   │   9   │  /   │
+│   4   │   5   │   6   │  *   │   the highlighted key is orange
+│   1   │   2   │   3   │  -   │
+│   C   │   0   │   =   │  +   │
+└───────┴───────┴───────┴──────┘
+```
+
+| Button | Short press | Hold (600 ms) |
+|--------|-------------|---------------|
+| LEFT (GPIO0) | Move to the next key | Move to the previous key |
+| RIGHT (GPIO35) | Press the highlighted key | Delete the last digit |
+
+It works like a pocket calculator: integers up to 9 digits per entry, operations run left to right (`2 + 3 * 4 =` → 20),
+division rounds toward zero, and division by zero or results beyond ±999 999 999 999 show `Error` (C clears it).
+
+```bash
+tools/mpy.py run scripts/calculator.py     # try it (Ctrl-C in the terminal to stop the script on the board)
+tools/mpy.py save scripts/calculator.py    # make it the app that starts at every boot
+tools/mpy.py erase                         # back to the built-in demo
+```
 | [`scripts/watchdog.py`](micropython-esp32/scripts/watchdog.py) | The watchdog resetting a hung script, and `reset_cause()` after the reboot |
 | [`scripts/errors.py`](micropython-esp32/scripts/errors.py) | A forbidden pin reported as `ValueError` with its line number |
 
@@ -488,6 +530,7 @@ Pins are plain GPIO numbers.
 |--------|--------|----------|
 | `time` | both | `sleep(s)`, `sleep_ms(ms)`, `sleep_us(us)`, `ticks_ms()`, `ticks_us()`, `ticks_diff(new, old)`, with MicroPython's names, so `import time; time.sleep_ms(100)` works as on MicroPython |
 | `display` | `tft` | Drawing on the 240 × 135 TFT. See below |
+| `buttons` | both | Debounced button events with short and long presses. TTGO: `LEFT` = GPIO0, `RIGHT` = GPIO35; generic build: `LEFT` = BOOT button (GPIO0) |
 
 ```python
 import display
@@ -511,6 +554,37 @@ display.text(8, 120, 'hello', display.YELLOW, display.BLUE)  # text color, backg
 | `triangle(x0, y0, x1, y1, x2, y2, [color])`, `fill_triangle(...)` | Triangle outline / filled |
 | `text(x, y, s, [color], [bg])` | Text in the 6 × 10 font, top-left corner at (x, y) |
 | `rgb(r, g, b)` | Returns the RGB565 color for 0–255 components |
+| `number(x, y, n, [color], [bg])` | Draws an integer (no `str()` needed) and returns its width in pixels |
+| `font(size)` | Font for `text` and `number`: 1 = 6 × 10 (default), 2 = 8 × 13, 3 = 10 × 20 pixels |
+| `number_width(n)`, `text_width(s)`, `font_height()` | Sizes in the current font, for centering and right-aligning |
+
+```python
+display.font(3)
+w = display.number_width(total)
+display.number(display.WIDTH - 4 - w, 10, total)   # right-aligned big number
+```
+
+`buttons` functions:
+
+| Function | Returns |
+|----------|---------|
+| `wait([timeout_ms])` | The next event, waiting for it; `NONE` after `timeout_ms`. Ctrl-C stops it, and it feeds the watchdog |
+| `get()` | The next event, or `NONE` right away |
+| `pressed(button)` | 1 while `LEFT` or `RIGHT` is held down |
+
+Events: `LEFT` / `RIGHT` for a short press (sent on release), `LEFT_LONG` / `RIGHT_LONG` once a button has been held
+for `LONG_MS` (600 ms, sent while still held; no short event follows). Readings must be stable for 20 ms (debouncing),
+and up to 8 events wait in a queue.
+
+```python
+import buttons
+while True:
+    event = buttons.wait()
+    if event == buttons.LEFT:
+        print('left')
+    elif event == buttons.RIGHT_LONG:
+        break
+```
 
 * Colors are RGB565 integers, like MicroPython's `st7789` drivers. The constants are `BLACK`, `WHITE`, `RED`, `GREEN`,
   `BLUE`, `YELLOW`, `CYAN`, `MAGENTA`, `ORANGE` and `GRAY`, plus `WIDTH` and `HEIGHT`. The color defaults to `WHITE`.
@@ -556,6 +630,7 @@ print('stopped after', ticks_ms(), 'ms')
 | `micropython-esp32/src/serial_console.rs` | `EspSerialOut`, an `Output` that writes `print()` text to USB/UART with `esp_println` |
 | `micropython-esp32/src/tft_console.rs` | `TftConsole`: the scrolling text console and drawing primitives on the ST7789 (only compiled with `tft`) |
 | `micropython-esp32/src/display_module.rs` | The `display` module: its function table, constants and argument checks (only compiled with `tft`) |
+| `micropython-esp32/src/buttons.rs` | The `buttons` module: debouncing, short/long press detection and the event queue |
 | `micropython-esp32/src/repl.rs` | The REPL: boot script, line editing, blocks, paste mode, soft reset, and the raw REPL protocol |
 | `micropython-esp32/src/serial_input.rs` | UART0 receive interrupt: fills a 2 KB ring buffer and sets the global `ABORT` flag on Ctrl-C |
 | `micropython-esp32/src/script_store.rs` | `main.py` in the `nvs` flash partition (`esp-storage`), with a header and checksum |
@@ -775,6 +850,7 @@ help() lists functions. Ctrl-C stops a script, Ctrl-D soft resets, Ctrl-E pastes
 - [x] REPL over USB serial with Ctrl-C, paste mode and soft reset; MicroPython raw REPL (`mpremote run/exec`)
 - [x] `main.py` saved in flash and uploaded over USB (`tools/mpy.py save`)
 - [x] `import` of native modules written in Rust: `time` and a `display` drawing module (pixels, lines, shapes, text)
+- [x] `global` statement, `abs`/`min`/`max`; `buttons` module and a two-button calculator app on the TTGO
 - [ ] Compact Bytecode Compiler & Stack VM
 
 

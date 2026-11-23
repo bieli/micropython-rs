@@ -235,6 +235,11 @@ pub enum Stmt<'a> {
         names: [(&'a str, &'a str); MAX_IMPORTS],
         count: usize,
     },
+    /// `global a, b`: names a function assigns as globals.
+    Global {
+        names: [&'a str; MAX_IMPORTS],
+        count: usize,
+    },
     /// `from m import a, b as c`: `(name in module, bound name)` pairs.
     FromImport {
         module: &'a str,
@@ -400,6 +405,23 @@ impl<'a> Parser<'a> {
                 return Ok(Some(Stmt::Else));
             }
             Token::Def => return self.parse_def().map(Some),
+            Token::Global => {
+                self.advance()?;
+                let mut names = [""; MAX_IMPORTS];
+                let mut count = 0;
+                loop {
+                    if count >= MAX_IMPORTS {
+                        return Err(Error::TooManyArguments);
+                    }
+                    names[count] = self.expect_ident()?;
+                    count += 1;
+                    if self.current != Token::Comma {
+                        break;
+                    }
+                    self.advance()?;
+                }
+                Stmt::Global { names, count }
+            }
             Token::Import => {
                 self.advance()?;
                 let (names, count) = self.parse_import_names()?;

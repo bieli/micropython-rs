@@ -28,7 +28,7 @@ Status: ✅ done · 🚧 in progress · ⬜ planned · ➡️ moved
 Phase 2 follow-ups found while building it:
 
 * `for` loops with `range()`, the most common loop form in MicroPython code.
-* `global` statement, so functions can update global counters and state.
+* ✅ `global` statement, so functions can update global counters and state (done, with `abs`/`min`/`max`).
 * `hex()`/`bin()` output for register values (needs a small string pool, like 2.6).
 
 ## Phase 3: Hardware API (MicroPython-style names)
@@ -45,6 +45,7 @@ Start with flat functions that follow MicroPython's names. Move to `machine.Pin(
 | 3.6 | Watchdog: `wdt_feed()`, plus automatic feeding inside `sleep_ms` | Production firmware has to recover from a hung script | ✅ |
 | 3.7 | TFT functions: `cls()`, `color(r, g, b)`, `text(x, y, s)`, `backlight(on)`, and scrolling | Makes the `tft` feature useful beyond showing logs | ✅ |
 | 3.8 | **Native modules with `import`**: `import display`, `from time import sleep_ms`; a `display` drawing module (pixels, lines, rectangles, circles, triangles, text) and a `time` module | Rust code grouped into MicroPython-style modules instead of one flat namespace | ✅ |
+| 3.9 | **`buttons` module and apps**: debounced short/long presses, `display.number()` and fonts, and a two-button calculator (`scripts/calculator.py`) | Real interactive apps on the board without a PC | ✅ |
 
 Design note (✅ done): `HardwareBridge` now has a function table (`functions() -> &[HwFn]`) with argument counts,
 used for checks and `help()`, plus `constants()` and string arguments (`call_args`). Dispatch is still a `match` on the name,
