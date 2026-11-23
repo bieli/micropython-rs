@@ -304,6 +304,22 @@ pub enum Stmt<'a> {
     DelNames(Targets<'a>),
     /// `del x[key]`: `target` leaves the container and the key.
     DelItem(Expr),
+    /// Header `try:`
+    Try,
+    /// Header `except:`, `except <classes>:` or `except <classes> as name:`
+    Except {
+        classes: Option<Expr>,
+        name: Option<&'a str>,
+    },
+    /// Header `finally:`
+    Finally,
+    /// `raise` / `raise <expr>` (in `raise X from Y`, `Y` is parsed, not evaluated)
+    Raise(Option<Expr>),
+    /// `assert <cond>` / `assert <cond>, <message>`
+    Assert {
+        cond: Expr,
+        message: Option<Expr>,
+    },
     /// Header `for targets in <iter>:`
     For {
         targets: Targets<'a>,
@@ -365,6 +381,9 @@ impl Stmt<'_> {
                 | Stmt::While(_)
                 | Stmt::For { .. }
                 | Stmt::Def { .. }
+                | Stmt::Try
+                | Stmt::Except { .. }
+                | Stmt::Finally
         )
     }
 }
@@ -446,6 +465,14 @@ impl<'a> Parser<'a> {
         self.current == Token::Else
     }
 
+    pub fn at_except(&self) -> bool {
+        self.current == Token::Except
+    }
+
+    pub fn at_finally(&self) -> bool {
+        self.current == Token::Finally
+    }
+
     fn advance(&mut self) -> Result<(), Error> {
         let result = self.lexer.next_token();
         self.current_line = self.lexer.token_line();
@@ -516,6 +543,30 @@ impl<'a> Parser<'a> {
                 return Ok(Some(Stmt::Else));
             }
             Token::Def => return self.parse_def().map(Some),
+            Token::Try | Token::Finally => {
+                let stmt = if self.current == Token::Try {
+                    Stmt::Try
+                } else {
+                    Stmt::Finally
+                };
+                self.advance()?;
+                self.expect(Token::Colon)?;
+                return Ok(Some(stmt));
+            }
+            Token::Except => {
+                self.advance()?;
+                let mut classes = None;
+                let mut name = None;
+                if self.current != Token::Colon {
+                    classes = Some(self.parse_expr(code)?);
+                    if self.current == Token::As {
+                        self.advance()?;
+                        name = Some(self.expect_ident()?);
+                    }
+                }
+                self.expect(Token::Colon)?;
+                return Ok(Some(Stmt::Except { classes, name }));
+            }
             Token::For => {
                 self.advance()?;
                 let targets = self.parse_targets(Token::In)?;
@@ -556,6 +607,30 @@ impl<'a> Parser<'a> {
                     names,
                     count,
                 }
+            }
+            Token::Raise => {
+                self.advance()?;
+                if matches!(self.current, Token::Newline | Token::Eof | Token::Semicolon) {
+                    Stmt::Raise(None)
+                } else {
+                    let exc = self.parse_expr(code)?;
+                    if self.current == Token::From {
+                        self.advance()?;
+                        self.parse_expr(code)?;
+                    }
+                    Stmt::Raise(Some(exc))
+                }
+            }
+            Token::Assert => {
+                self.advance()?;
+                let cond = self.parse_expr(code)?;
+                let message = if self.current == Token::Comma {
+                    self.advance()?;
+                    Some(self.parse_expr(code)?)
+                } else {
+                    None
+                };
+                Stmt::Assert { cond, message }
             }
             Token::Del => {
                 self.advance()?;

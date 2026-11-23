@@ -22,6 +22,8 @@
 mod bytes;
 #[path = "containers.rs"]
 mod containers;
+#[path = "exceptions.rs"]
+mod exceptions;
 #[path = "strings.rs"]
 mod strings;
 
@@ -71,6 +73,8 @@ pub enum Value<'a> {
         module: u8,
         func: u8,
     },
+    /// A built-in exception class, e.g. `ValueError` (see `exceptions.rs`).
+    ExcClass(u8),
 }
 
 impl Value<'_> {
@@ -145,6 +149,10 @@ pub struct Interpreter<'a, O: Output, H: HardwareBridge = NoHardware> {
     funcs: [Option<FuncDef<'a>>; MAX_FUNCS],
     /// Objects created at runtime (empty unless `with_heap` is used).
     heap: Heap<'a>,
+    /// The exception object of the last `raise` (see `Error::Exception`).
+    exc: Value<'a>,
+    /// The exception the innermost running `except` block handles.
+    handling: Value<'a>,
 }
 
 impl<'a, O: Output> Interpreter<'a, O, NoHardware> {
@@ -180,6 +188,8 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
             heap: Heap::new(&mut []),
             stack: [Value::None; VALUE_STACK],
             sp: 0,
+            exc: Value::None,
+            handling: Value::None,
         }
     }
 
@@ -212,7 +222,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
             Value::Bytes(b) => !b.is_empty(),
             Value::HBytes(r) => !self.heap.bytes(r).is_empty(),
             Value::Obj(_) => self.container_len(v) != Some(0),
-            Value::Module(_) | Value::NativeFn { .. } => true,
+            Value::Module(_) | Value::NativeFn { .. } | Value::ExcClass(_) => true,
         }
     }
 
@@ -265,6 +275,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
         self.error_line = None;
         self.steps = 0;
         self.sp = 0;
+        self.handling = Value::None;
         let result = self.run(source);
         match result {
             Ok(()) => self.error_line = None,
@@ -578,7 +589,39 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
                 }
             }
             // `elif`/`else` without a matching `if`
-            Stmt::Elif(_) | Stmt::Else => return Err(Error::InvalidSyntax),
+            Stmt::Elif(_) | Stmt::Else | Stmt::Except { .. } | Stmt::Finally => {
+                return Err(Error::InvalidSyntax)
+            }
+            Stmt::Try => return self.exec_try(parser, indent, run, ctx, code),
+            Stmt::Raise(expr) => {
+                if run {
+                    return Err(match expr {
+                        Some(expr) => {
+                            let val = self.eval_expr(code, expr)?;
+                            self.raise_value(val)
+                        }
+                        None => self.reraise(),
+                    });
+                }
+            }
+            Stmt::Assert { cond, message } => {
+                if run {
+                    let val = self.eval_expr(code, cond)?;
+                    if !self.truthy(val) {
+                        let message = match message {
+                            Some(m) => Some(self.eval_expr(code, m)?),
+                            None => None,
+                        };
+                        let base = self.sp;
+                        if let Some(m) = message {
+                            self.push(m)?;
+                        }
+                        let err = self.raise_assertion(message);
+                        self.sp = base;
+                        return Err(err);
+                    }
+                }
+            }
             Stmt::If(cond) => return self.exec_if(cond, parser, indent, run, ctx, code),
             Stmt::While(cond) => {
                 return self.exec_while(cond, start, parser, indent, run, ctx, code)
@@ -689,6 +732,170 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
             }
         }
         Ok(flow)
+    }
+
+    /// `try:` and its `except` / `else` / `finally` clauses.
+    fn exec_try(
+        &mut self,
+        parser: &mut Parser<'a>,
+        indent: u32,
+        run: bool,
+        ctx: Ctx,
+        code: &mut Code<'a>,
+    ) -> Result<Flow<'a>, Error> {
+        let base = self.sp;
+        let result = self.run_try(parser, indent, run, ctx, code);
+        self.sp = base;
+        let (outcome, line) = result?;
+        if outcome.is_err() {
+            // Report the line where the exception happened, not the `try`
+            self.error_line = line;
+        }
+        outcome
+    }
+
+    /// The clauses of a `try`. The outer `Result` is for errors that end the
+    /// script (syntax errors); the inner one is the outcome of the statement,
+    /// with the line of its error.
+    #[allow(clippy::type_complexity)]
+    fn run_try(
+        &mut self,
+        parser: &mut Parser<'a>,
+        indent: u32,
+        run: bool,
+        ctx: Ctx,
+        code: &mut Code<'a>,
+    ) -> Result<(Result<Flow<'a>, Error>, Option<u32>), Error> {
+        let mut outcome = self.run_clause(parser, indent, run, ctx, code)?;
+        let mut line = self.error_line.take();
+        let body_ok = outcome.is_ok();
+        let mut clauses = 0;
+        let mut seen_else = false;
+        // After one handler ran, an error it raised goes to the caller,
+        // not to the next `except` clause
+        let mut handled = false;
+
+        while self.next_indent(parser)? == Some(indent) {
+            if parser.at_except() && !seen_else {
+                let Some(Stmt::Except { classes, name }) = self.parse_stmt(parser, code)? else {
+                    unreachable!("at_except() guarantees an except header");
+                };
+                let header_line = parser.stmt_line();
+                clauses += 1;
+                // Does this clause handle the pending exception?
+                let mut this = false;
+                if let (true, false, Err(err)) = (run, handled, outcome) {
+                    if let Some(class) = self.caught_class(err) {
+                        this = match classes {
+                            None => Self::bare_except_catches(class),
+                            Some(spec) => match self.eval_expr(code, spec) {
+                                Ok(spec) => match self.exc_matches(class, spec) {
+                                    Ok(m) => m,
+                                    Err(e) => {
+                                        outcome = Err(e);
+                                        line = Some(header_line);
+                                        false
+                                    }
+                                },
+                                Err(e) => {
+                                    outcome = Err(e);
+                                    line = Some(header_line);
+                                    false
+                                }
+                            },
+                        };
+                        if this {
+                            handled = true;
+                            let exc = self.exception_object(err)?;
+                            self.push(exc)?; // rooted while the handler runs
+                            self.exc = Value::None;
+                            if let Some(name) = name {
+                                self.set_var(name, exc)?;
+                            }
+                            let outer = core::mem::replace(&mut self.handling, exc);
+                            outcome = self.run_clause(parser, indent, true, ctx, code)?;
+                            line = self.error_line.take();
+                            self.handling = outer;
+                            if let Some(name) = name {
+                                // Like Python: the name is deleted after the handler
+                                let _ = self.del_var(name);
+                            }
+                        }
+                    }
+                }
+                if !this {
+                    self.exec_body(parser, indent, false, ctx, code)?;
+                }
+            } else if parser.at_else() && clauses > 0 && !seen_else {
+                self.parse_stmt(parser, code)?;
+                seen_else = true;
+                let this = run && body_ok && outcome == Ok(Flow::Normal);
+                if this {
+                    outcome = self.run_clause(parser, indent, true, ctx, code)?;
+                    line = self.error_line.take();
+                } else {
+                    self.exec_body(parser, indent, false, ctx, code)?;
+                }
+            } else if parser.at_finally() {
+                self.parse_stmt(parser, code)?;
+                clauses += 1;
+                if run {
+                    // Keep what's pending rooted while `finally` runs
+                    let (pending_exc, pending_line) = (self.exc, line);
+                    self.push(pending_exc)?;
+                    if let Ok(Flow::Return(val)) = outcome {
+                        self.push(val)?;
+                    }
+                    let result = self.run_clause(parser, indent, true, ctx, code)?;
+                    if result == Ok(Flow::Normal) {
+                        // `finally` finished: the earlier outcome stands
+                        self.exc = pending_exc;
+                        line = pending_line;
+                    } else {
+                        outcome = result;
+                        line = self.error_line.take();
+                    }
+                } else {
+                    self.exec_body(parser, indent, false, ctx, code)?;
+                }
+                break;
+            } else {
+                break;
+            }
+        }
+        if clauses == 0 {
+            // `try:` needs at least one `except` or `finally`
+            self.note_error(parser.line());
+            return Err(Error::InvalidSyntax);
+        }
+        Ok((outcome, line))
+    }
+
+    /// Runs the body of a `try` clause. If it raises a catchable error, the
+    /// rest of the body is skipped (parsed from its start without running),
+    /// so the parser is after the body either way.
+    fn run_clause(
+        &mut self,
+        parser: &mut Parser<'a>,
+        indent: u32,
+        run: bool,
+        ctx: Ctx,
+        code: &mut Code<'a>,
+    ) -> Result<Result<Flow<'a>, Error>, Error> {
+        let start = *parser;
+        let sp = self.sp;
+        match self.exec_body(parser, indent, run, ctx, code) {
+            Ok(flow) => Ok(Ok(flow)),
+            Err(err) if self.caught_class(err).is_some() => {
+                self.sp = sp;
+                let line = self.error_line.take();
+                *parser = start;
+                self.exec_body(parser, indent, false, ctx, code)?;
+                self.error_line = line;
+                Ok(Err(err))
+            }
+            Err(err) => Err(err),
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -977,6 +1184,11 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
                     .map(|&(_, val)| Value::Int(val))
                     .ok_or(err)
             })
+            .or_else(|err| {
+                exceptions::class_by_name(name)
+                    .map(Value::ExcClass)
+                    .ok_or(err)
+            })
     }
 
     fn define_func(&mut self, func: FuncDef<'a>) -> Result<(), Error> {
@@ -1150,8 +1362,11 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
                     self.push(val)?;
                 }
                 Item::GetAttr(attr) => {
-                    let module = as_module(self.stack[self.sp - 1])?;
-                    self.stack[self.sp - 1] = self.module_attr(module, attr)?;
+                    let target = self.stack[self.sp - 1];
+                    self.stack[self.sp - 1] = match target {
+                        Value::Obj(_) => self.exc_attr(target, attr)?,
+                        _ => self.module_attr(as_module(target)?, attr)?,
+                    };
                 }
                 Item::CallAttr { attr, argc } => {
                     let start = self.sp - argc as usize;
@@ -1439,6 +1654,10 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
         }
         if let Some(func) = self.find_func(name) {
             return self.call_user_func(func, args);
+        }
+        // `ValueError('bad')` creates an exception object
+        if let Ok(Value::ExcClass(class)) = self.get_var(name) {
+            return self.new_exception(class, args);
         }
 
         if name == "print" {
@@ -3213,6 +3432,7 @@ print(outer(), count)
         for (name, src, expected) in [
             case!("bytes"),
             case!("containers"),
+            case!("exceptions"),
             case!("readme_examples"),
         ] {
             let (out, result, _) = run_with_heap(src, 64 * 1024);
@@ -3303,6 +3523,100 @@ print(outer(), count)
         // A list growing past the heap fails cleanly
         let (_, result, _) = run_with_heap("a = []\nwhile True:\n    a.append(1)", 512);
         assert_eq!(result, Err(Error::OutOfMemory));
+    }
+
+    // ---- 5.4 exceptions ---------------------------------------------------
+
+    #[test]
+    fn test_exceptions_uncatchable_and_errors() {
+        // Syntax errors aren't caught, even inside `try`
+        let (err, line) = run_err("try:\n    x = 1 +\nexcept:\n    pass");
+        assert_eq!((err, line), (Error::UnexpectedToken, Some(2)));
+        let (err, _) = run_err("try:\n    pass\nprint(1)");
+        assert_eq!(err, Error::InvalidSyntax); // no except/finally
+        assert_eq!(run_err("except:\n    pass").0, Error::InvalidSyntax);
+        assert_eq!(run_err("finally:\n    pass").0, Error::InvalidSyntax);
+        assert_eq!(run_err("raise 5").0, Error::TypeError);
+
+        // Ctrl-C (KeyboardInterrupt) passes a bare `except:` but can be named
+        assert_eq!(
+            run_err("try:\n    raise KeyboardInterrupt\nexcept:\n    pass").0,
+            Error::Exception
+        );
+        assert_output(
+            "try:\n    raise KeyboardInterrupt\nexcept KeyboardInterrupt:\n    print('stop')",
+            "stop\n",
+        );
+        assert_output(
+            "try:\n    raise KeyboardInterrupt\nexcept Exception:\n    print('no')\nexcept BaseException:\n    print('base')",
+            "base\n",
+        );
+
+        // The step limit can't be caught either
+        let mut out = MockOut::new();
+        let mut vm = Interpreter::new(&mut out);
+        vm.set_step_limit(Some(50));
+        assert_eq!(
+            vm.eval("try:\n    while True:\n        pass\nexcept:\n    print('caught')"),
+            Err(Error::StepLimit)
+        );
+        assert_eq!(out.as_str(), "");
+    }
+
+    #[test]
+    fn test_uncaught_exception_line_and_text() {
+        struct Text(std::string::String);
+        impl Output for Text {
+            fn write_str(&mut self, s: &str) {
+                self.0.push_str(s);
+            }
+        }
+        let mut out = MockOut::new();
+        let mut heap = [0u8; 2048];
+        let mut vm = Interpreter::new(&mut out).with_heap(&mut heap);
+        let src = "x = 1\ntry:\n    y = 2\n    raise ValueError('bad', x)\nfinally:\n    z = 3\n";
+        assert_eq!(vm.eval(src), Err(Error::Exception));
+        assert_eq!(vm.error_line(), Some(4));
+        let mut text = Text(std::string::String::new());
+        vm.write_exception(Error::Exception, &mut text);
+        assert_eq!(text.0, "ValueError: ('bad', 1)");
+
+        // A caught error doesn't leave a stale line behind
+        assert_eq!(
+            vm.eval("try:\n    1 // 0\nexcept ZeroDivisionError:\n    pass\nx = y_missing"),
+            Err(Error::UnknownIdentifier)
+        );
+        assert_eq!(vm.error_line(), Some(5));
+        let mut text = Text(std::string::String::new());
+        vm.write_exception(Error::ZeroDivision, &mut text);
+        assert_eq!(text.0, "ZeroDivisionError: division by zero");
+        let mut text = Text(std::string::String::new());
+        vm.write_exception(Error::Interrupted, &mut text);
+        assert_eq!(text.0, "KeyboardInterrupt");
+
+        // A bare `raise` outside a handler
+        assert_eq!(vm.eval("raise"), Err(Error::Exception));
+        let mut text = Text(std::string::String::new());
+        vm.write_exception(Error::Exception, &mut text);
+        assert_eq!(text.0, "RuntimeError: No active exception to reraise");
+    }
+
+    #[test]
+    fn test_gc_keeps_pending_exceptions() {
+        // The exception waits while `finally` makes lots of garbage
+        let src = "def f():\n    try:\n        raise ValueError('k' * 20)\n    finally:\n        \
+                   i = 0\n        while i < 100:\n            t = [str(i)] * 3\n            i += 1\n\
+                   try:\n    f()\nexcept ValueError as e:\n    print(e)\n\
+                   def g():\n    try:\n        return 'r' * 30\n    finally:\n        \
+                   j = 0\n        while j < 100:\n            u = 'u' * 40\n            j += 1\n\
+                   print(g())";
+        let (out, result, collections) = run_with_heap(src, 512);
+        assert_eq!(result, Ok(()));
+        assert_eq!(
+            out,
+            std::format!("{}\n{}\n", "k".repeat(20), "r".repeat(30))
+        );
+        assert!(collections > 5, "only {} collections", collections);
     }
 
     #[test]

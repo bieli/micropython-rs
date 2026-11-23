@@ -1,0 +1,33 @@
+caught zero
+lookup ok
+value: bad value ValueError('bad value') ('bad value',)
+key: 'k' KeyError('k')
+os: [Errno 2] no file 2 (2, 'no file')
+exception base
+finally runs
+from try
+body 0
+fin 0
+fin 1
+fin 2
+g done
+else runs
+finally after else
+handled inner
+re-raised inner
+outer got converted
+cleanup
+propagated ValueError()
+assert: math is broken
+assert no msg AssertionError()
+name error
+type error
+import error
+bare except ok
+retry 1
+retry 2
+count 3
+stop
+e deleted: yes
+from function: deep
+<class 'ValueError'> end

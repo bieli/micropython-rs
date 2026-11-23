@@ -40,6 +40,7 @@ const T_MODULE: u8 = 7;
 const T_NATIVE: u8 = 8;
 const T_EMPTY_STR: u8 = 9;
 const T_EMPTY_BYTES: u8 = 10;
+const T_EXC_CLASS: u8 = 11;
 
 /// Encodes a value for a slot. Source strings must be copied to the heap
 /// first (`Interpreter::stored`); only empty ones are encoded directly.
@@ -55,6 +56,7 @@ fn encode(v: Value<'_>) -> [u8; SLOT] {
         Value::Obj(r) => (T_OBJ, r.index() as u64),
         Value::Module(m) => (T_MODULE, m as u64),
         Value::NativeFn { module, func } => (T_NATIVE, (module as u64) << 8 | func as u64),
+        Value::ExcClass(c) => (T_EXC_CLASS, c as u64),
         Value::Str(_) => (T_EMPTY_STR, 0),
         Value::Bytes(_) => (T_EMPTY_BYTES, 0),
     };
@@ -82,18 +84,19 @@ fn decode<'a>(slot: &[u8]) -> Value<'a> {
         },
         T_EMPTY_STR => Value::Str(""),
         T_EMPTY_BYTES => Value::Bytes(b""),
+        T_EXC_CLASS => Value::ExcClass(n as u8),
         _ => Value::None,
     }
 }
 
 /// Number of elements (pairs for a dict) of a container.
-fn count(view: &HeapView<'_>, r: ObjRef) -> usize {
+pub(super) fn count(view: &HeapView<'_>, r: ObjRef) -> usize {
     let b = view.bytes(r);
     u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize
 }
 
 /// Slot `i` of a container (for a dict, slot `2k` is a key, `2k + 1` its value).
-fn slot<'a>(view: &HeapView<'_>, r: ObjRef, i: usize) -> Value<'a> {
+pub(super) fn slot<'a>(view: &HeapView<'_>, r: ObjRef, i: usize) -> Value<'a> {
     let at = HEADER + i * SLOT;
     decode(&view.bytes(r)[at..at + SLOT])
 }
@@ -147,6 +150,43 @@ pub(crate) fn render(
         Value::HBytes(r) => super::bytes::write_bytes_repr(view.bytes(r), sink),
         Value::Obj(r) => {
             let kind = view.kind(r);
+            if kind == Kind::Exception {
+                // `ValueError('bad')` (repr) or `bad` (str)
+                let class = match slot(view, r, 0) {
+                    Value::Int(c) => c as u8,
+                    _ => 0,
+                };
+                let n = count(view, r) - 1;
+                let key_error = super::exceptions::class_name(class) == "KeyError";
+                if repr {
+                    sink(super::exceptions::class_name(class));
+                    sink("(");
+                } else if n == 1 {
+                    let arg = slot(view, r, 1);
+                    return render(view, modules, arg, key_error, depth + 1, sink);
+                } else if n == 0 {
+                    return;
+                } else if let (true, 2, Value::Int(errno)) =
+                    (super::exceptions::is_os_error(class), n, slot(view, r, 1))
+                {
+                    // `OSError(2, 'no file')` prints as `[Errno 2] no file`
+                    let mut buf = [0u8; 20];
+                    sink("[Errno ");
+                    sink(super::strings::format_i64(errno, &mut buf));
+                    sink("] ");
+                    return render(view, modules, slot(view, r, 2), false, depth + 1, sink);
+                } else {
+                    sink("("); // several arguments: str() is the tuple of them
+                }
+                for i in 0..n {
+                    if i > 0 {
+                        sink(", ");
+                    }
+                    render(view, modules, slot(view, r, i + 1), true, depth + 1, sink);
+                }
+                sink(")");
+                return;
+            }
             if kind == Kind::Range {
                 let (start, stop, step) = range_parts(view, r);
                 let mut buf = [0u8; 20];
@@ -468,7 +508,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
                 }
             }
             (Value::None, Value::None) => true,
-            (Value::Module(_) | Value::NativeFn { .. }, _) => a == b,
+            (Value::Module(_) | Value::NativeFn { .. } | Value::ExcClass(_), _) => a == b,
             _ => false,
         }
     }

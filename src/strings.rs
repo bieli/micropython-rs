@@ -57,6 +57,10 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
             self.mark_value(self.stack[i], &mut work, &mut n);
             self.trace(&mut work, &mut n);
         }
+        for v in [self.exc, self.handling] {
+            self.mark_value(v, &mut work, &mut n);
+            self.trace(&mut work, &mut n);
+        }
         self.heap.sweep();
     }
 
@@ -789,6 +793,11 @@ pub(crate) fn write_plain(
         }
         Value::Bytes(b) => super::bytes::write_bytes_repr(b, sink),
         Value::HStr(_) | Value::HBytes(_) | Value::Obj(_) => sink("?"),
+        Value::ExcClass(c) => {
+            for part in ["<class '", super::exceptions::class_name(c), "'>"] {
+                sink(part);
+            }
+        }
         Value::Module(m) => {
             let name = modules(m).map_or("?", |m| m.name);
             for part in ["<module '", name, "'>"] {

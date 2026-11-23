@@ -44,12 +44,18 @@ pub enum Kind {
     Dict,
     /// `range(start, stop, step)`: three i64.
     Range,
+    /// An exception instance: laid out like a tuple of its class number
+    /// followed by its arguments.
+    Exception,
 }
 
 impl Kind {
     /// True for objects whose bytes hold references to other objects.
     pub const fn is_container(self) -> bool {
-        matches!(self, Kind::List | Kind::Tuple | Kind::Dict)
+        matches!(
+            self,
+            Kind::List | Kind::Tuple | Kind::Dict | Kind::Exception
+        )
     }
 }
 

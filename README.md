@@ -85,12 +85,13 @@ flags |= 1 << 3                   # bitwise & | ^ ~ << >> and augmented assignme
 | Operators | `+ - * / // % **`, `& \| ^ ~ << >>`, `== != < <= > >=` (chainable), `in`, `not in`, `is`, `is not`, `and or not`, `a if c else b` |
 | Assignment | `x = ...`, `a, b = b, a`, `(a, b) = ...`, `a = b = 0`, `x[k] = v`, `+= -= *= /= //= %= **= &= \|= ^= <<= >>=` (also `x[k] += v`), `del a, b`, `del x[k]` |
 | Statements | `if`/`elif`/`else`, `while`, `for x in ...` (also `for k, v in d.items()`), `break`, `continue`, `pass`, `def`, `return`; `;` between statements (`x = 1; y = 2`) |
+| Exceptions | `try`/`except`/`else`/`finally`, `except (A, B) as e`, `raise`, `raise X('msg')`, bare `raise`, `assert`; built-in classes such as `ValueError`, `KeyError`, `OSError`, `Exception` with CPython's hierarchy; `e.args`, `e.errno` |
 | Calls | `print(...)`, `abs`, `min`, `max`, `bool`, `len`, `list`, `tuple`, `dict`, `range`, `sorted`, `reversed`, `sum`, `any`, `all`, `enumerate`, `zip`, your own `def` functions, and hardware functions from `HardwareBridge` |
 | Scope | `global a, b` in a function, to assign globals (also creates them) |
 | Modules | `import m`, `import m as x, n`, `from m import f, C as K`; `m.f(...)`, `m.CONST` for native modules written in Rust |
 
-Not supported yet: floats, sets, `format`/`%`/f-strings, exceptions (`try`), keyword arguments, classes, importing `.py`
-files.
+Not supported yet: floats, sets, `format`/`%`/f-strings, keyword arguments, classes (also your own exception
+classes), importing `.py` files.
 See [ROADMAP.md](ROADMAP.md) for what's planned.
 
 ### Arithmetic operators
@@ -227,6 +228,35 @@ print(binascii.unhexlify('48656c6c6f').decode(), binascii.hexlify(b'OK'))   # He
 `Error::ValueError` (CPython raises `binascii.Error` and `UnicodeDecodeError`, both subclasses of `ValueError`).
 Not supported yet: `bytearray`, `bytes([1, 2])`, and the text methods (`upper`, `split`...) on bytes.
 
+### Exceptions
+
+```python
+def read_sensor(pin):
+    if pin not in (32, 33, 34, 35, 36, 39):
+        raise ValueError('not an ADC1 pin: ' + str(pin))
+    return adc_read(pin)
+
+try:
+    mv = read_sensor(5)
+except ValueError as e:
+    print('config error:', e)                   # config error: not an ADC1 pin: 5
+except OSError:
+    print('sensor failed')
+finally:
+    led_off()                                   # runs in every case
+```
+
+* Errors of the interpreter are Python exceptions: `1 // 0` raises `ZeroDivisionError`, `{}['k']` a `KeyError`, a
+  failing flash file operation an `OSError`, and so on, with CPython's class hierarchy (`except LookupError` catches
+  both `KeyError` and `IndexError`; `except Exception` catches all of them).
+* An uncaught exception prints a Python traceback on the board (and in Thonny / mpremote):
+  `Traceback (most recent call last):`, `File "<stdin>", line 4, in <module>`, `ValueError: not an ADC1 pin: 5`.
+* Can't be caught: syntax errors (like in Python, where they happen before the code runs) and the step limit.
+  **Ctrl-C** raises `KeyboardInterrupt`, which `except KeyboardInterrupt:` catches, but a bare `except:` doesn't,
+  unlike CPython: a `while True: try: ... except: pass` loop can still be stopped.
+* Not supported yet: your own exception classes (they need classes), exception chaining (`raise X from Y` ignores
+  `Y`), and tracebacks through function calls (the line is where the exception happened).
+
 ### Lists, tuples and dicts
 
 ```python
@@ -296,11 +326,17 @@ Calls are expressions, so they can be nested and combined with operators: `print
 ```rust
 if let Err(err) = vm.eval(script) {
     match vm.error_line() {
-        Some(line) => println!("Python Error at line {}: {:?}", line, err),
-        None => println!("Python Error: {:?}", err),
+        Some(line) => print!("Error at line {}: ", line),
+        None => print!("Error: "),
     }
+    vm.write_exception(err, &mut uart);    // `ZeroDivisionError: division by zero`, `ValueError: bad`
+    println!();
 }
 ```
+
+`Error` says what went wrong (`Error::ZeroDivision`, ...). A script's own `raise` returns `Error::Exception`;
+`write_exception` prints its class and message, the way Python's traceback ends (`print_exception` writes to the
+interpreter's own `Output`).
 
 Syntax errors point at the offending token, and runtime errors at the statement that failed.
 
@@ -512,7 +548,9 @@ $ make monitor                      # or: mpremote connect /dev/ttyACM0 repl, pi
 ...
 >>> blink(6)
 >>> while True: pass
-KeyboardInterrupt                   # after pressing Ctrl-C
+Traceback (most recent call last):  # after pressing Ctrl-C
+  File "<stdin>", line 1, in <module>
+KeyboardInterrupt
 >>>
 ```
 
@@ -573,11 +611,12 @@ version 1, tick 1
 version 2, tick 100
 myapp.py:2: syntax error: unexpected EOF while parsing - not uploaded
 --- 21:33:55 running myapp.py ---
---- Error at line 2: ZeroDivision ---
+--- ZeroDivisionError: division by zero (line 2) ---
 ```
 
 Thonny's own MicroPython mode (file browser, "Save to device") doesn't work yet: Thonny runs helper code on the board
-that needs classes, `try`/`except`, lists, dicts and the `os` module, which the interpreter doesn't support yet.
+that needs keyword arguments, `globals()`, the `os` module and file objects (and, for Thonny 4/5, classes), which are
+being added in Phase 5 of the [ROADMAP](ROADMAP.md).
 
 `tools/mpy.py` needs `pyserial` and takes `--port` (default `/dev/ttyACM0`, or `$MPY_PORT`). It exits with status 1
 when the script raises an error. `mpremote`'s file commands (`cp`, `ls`, `fs`) don't work yet, because they run Python

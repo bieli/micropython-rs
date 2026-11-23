@@ -24,6 +24,7 @@ Needs pyserial (`pip install pyserial`). Exit code 1 if the script raised an err
 
 import argparse
 import codecs
+import re
 import os
 import sys
 import time
@@ -92,7 +93,7 @@ class Board:
         """Runs a `#@` file command; returns its output, raises on an error."""
         output, error = self.execute(code, stream=False)
         if error:
-            raise FileCommandError(error.decode("utf-8", "replace").strip())
+            raise FileCommandError(error_summary(error.decode("utf-8", "replace")))
         return output
 
     def put(self, data, name):
@@ -124,6 +125,18 @@ class Board:
         error = self.read_until(b"\x04")[:-1]
         self.read_until(b">")
         return output, error
+
+
+def error_summary(text):
+    """The last line of a traceback, with its line number:
+    `ZeroDivisionError: division by zero (line 2)`."""
+    lines = [line.strip() for line in text.strip().splitlines() if line.strip()]
+    if not lines:
+        return ""
+    where = re.search(r"line (\d+)", text)
+    if where and len(lines) > 1:
+        return f"{lines[-1]} (line {where.group(1)})"
+    return lines[-1]
 
 
 class Watcher:
@@ -216,8 +229,8 @@ class Watcher:
                 self.error += bytes([byte])
         elif byte == ord(">"):
             self.running = False
-            error = self.error.decode("utf-8", "replace").strip()
-            if error == "KeyboardInterrupt":
+            error = error_summary(self.error.decode("utf-8", "replace"))
+            if error.startswith("KeyboardInterrupt"):
                 print("--- stopped ---")
             elif error:
                 print(f"--- {error} ---")

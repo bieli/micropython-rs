@@ -4,3 +4,6 @@ button 0
 buzzer 25
 {'the': 2, 'cat': 1, 'dog': 1}
 20 10
+config error: not an ADC1 pin: 5
+led off
+1234

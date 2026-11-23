@@ -238,14 +238,17 @@ impl<'a, O: Output, H: HardwareBridge> Repl<'a, O, H> {
         result
     }
 
+    /// Prints a Python-style traceback (Thonny and mpremote show it as is).
     fn report_error(&mut self, err: Error) {
         let line = self.vm.error_line();
         let mut out = Fmt(self.vm.output());
-        let _ = match (err, line) {
-            (Error::Interrupted, _) => write!(out, "KeyboardInterrupt\n"),
-            (err, Some(line)) => write!(out, "Error at line {}: {:?}\n", line, err),
-            (err, None) => write!(out, "Error: {:?}\n", err),
+        let _ = out.write_str("Traceback (most recent call last):\n");
+        let _ = match line {
+            Some(line) => write!(out, "  File \"<stdin>\", line {}, in <module>\n", line),
+            None => out.write_str("  File \"<stdin>\", in <module>\n"),
         };
+        self.vm.print_exception(err);
+        self.write("\n");
     }
 
     fn banner(&mut self) {

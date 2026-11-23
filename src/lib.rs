@@ -46,6 +46,37 @@ pub enum Error {
     IndexError,
     /// A dict has no such key.
     KeyError,
+    /// A Python exception from `raise` (or an error re-raised by `raise`):
+    /// `Interpreter::write_exception` prints its class and message.
+    Exception,
+}
+
+impl Error {
+    /// A short description, like the message of the Python exception.
+    pub const fn message(&self) -> &'static str {
+        match self {
+            Error::UnexpectedChar(_) => "invalid character",
+            Error::UnexpectedToken | Error::InvalidSyntax => "invalid syntax",
+            Error::UnterminatedString => "unterminated string",
+            Error::UnknownIdentifier => "name is not defined",
+            Error::OutOfMemory => "memory allocation failed",
+            Error::TooManyArguments => "too many arguments or names",
+            Error::TypeError => "unsupported operand or argument type",
+            Error::ZeroDivision => "division by zero",
+            Error::Overflow => "integer overflow",
+            Error::StepLimit => "step limit reached",
+            Error::Interrupted => "",
+            Error::IndentationError => "unexpected indent or dedent",
+            Error::RecursionLimit => "maximum recursion depth exceeded",
+            Error::ValueError => "invalid value",
+            Error::IoError => "I/O error",
+            Error::ImportError => "no module or name to import",
+            Error::AttributeError => "no such attribute",
+            Error::IndexError => "index out of range",
+            Error::KeyError => "key not found",
+            Error::Exception => "",
+        }
+    }
 }
 
 pub trait Output {

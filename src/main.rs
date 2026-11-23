@@ -9,6 +9,14 @@ impl Output for StdoutSink {
     }
 }
 
+struct StderrSink;
+
+impl Output for StderrSink {
+    fn write_str(&mut self, s: &str) {
+        eprint!("{}", s);
+    }
+}
+
 fn main() {
     let args: Vec<String> = env::args().collect();
 
@@ -27,15 +35,19 @@ fn main() {
     };
 
     let mut out = StdoutSink;
-    // Objects created at runtime (strings built by the script) live here
+    // Objects created at runtime (strings, lists, ...) live here
     let mut heap = vec![0u8; 256 * 1024];
     let mut vm = Interpreter::new(&mut out).with_heap(&mut heap);
 
     if let Err(err) = vm.eval(&script) {
+        // Like Python: the traceback goes to stderr
+        eprintln!("Traceback (most recent call last):");
         match vm.error_line() {
-            Some(line) => eprintln!("{}:{}: Error: {:?}", path, line, err),
-            None => eprintln!("{}: Error: {:?}", path, err),
+            Some(line) => eprintln!("  File \"{}\", line {}, in <module>", path, line),
+            None => eprintln!("  File \"{}\", in <module>", path),
         }
+        vm.write_exception(err, &mut StderrSink);
+        eprintln!();
         process::exit(1);
     }
 }
