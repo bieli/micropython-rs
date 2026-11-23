@@ -5,7 +5,7 @@ EMBEDDED_ESP32 := riscv32imc-unknown-none-elf
 
 FILE ?= hello.py
 
-.PHONY: all check test coverage run build-embedded clean
+.PHONY: all check test coverage run build-embedded clean cpython-expected
 
 # Default target: run host tests, enforce coverage, and verify bare-metal compilation
 all: test coverage build-embedded
@@ -32,6 +32,10 @@ run:
 build-embedded:
 	cargo build --lib --target $(EMBEDDED_ARM)
 	cargo build --lib --target $(EMBEDDED_ESP32)
+
+# Regenerate the expected output of the CPython conformance scripts (needs python3)
+cpython-expected:
+	for f in tests/cpython/*.py; do python3 -W ignore "$$f" > "$${f%.py}.out"; done
 
 # Remove build artifacts
 clean:

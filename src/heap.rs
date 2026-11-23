@@ -19,6 +19,17 @@ pub const MAX_OBJECTS: usize = 256;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ObjRef(u16);
 
+impl ObjRef {
+    pub const fn index(self) -> usize {
+        self.0 as usize
+    }
+
+    /// The handle with table index `i` (as stored inside containers).
+    pub const fn from_index(i: usize) -> Self {
+        Self(i as u16)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
     Free,
@@ -26,6 +37,20 @@ pub enum Kind {
     Str,
     /// Raw bytes.
     Bytes,
+    /// Containers: a length (u32) followed by encoded values (see
+    /// `interpreter/containers.rs`); a dict stores key/value pairs.
+    List,
+    Tuple,
+    Dict,
+    /// `range(start, stop, step)`: three i64.
+    Range,
+}
+
+impl Kind {
+    /// True for objects whose bytes hold references to other objects.
+    pub const fn is_container(self) -> bool {
+        matches!(self, Kind::List | Kind::Tuple | Kind::Dict)
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -101,9 +126,65 @@ impl<'a> Heap<'a> {
         self.table[r.0 as usize].kind
     }
 
+    /// Changes the kind of a live object (e.g. a finished list into a tuple).
+    pub fn set_kind(&mut self, r: ObjRef, kind: Kind) {
+        self.table[r.0 as usize].kind = kind;
+    }
+
     pub fn bytes(&self, r: ObjRef) -> &[u8] {
         let e = self.table[r.0 as usize];
         &self.mem[e.offset as usize..(e.offset + e.len) as usize]
+    }
+
+    /// Changes the size of an object, keeping its handle and its contents
+    /// (new bytes are zeroed). Without collecting; `false` if it doesn't fit.
+    /// A grown object that isn't the last one moves to the top; its old
+    /// bytes are reclaimed by the next collection.
+    pub fn realloc(&mut self, r: ObjRef, new_len: usize) -> bool {
+        let e = self.table[r.0 as usize];
+        let (off, len) = (e.offset as usize, e.len as usize);
+        if off + len == self.top {
+            if off + new_len > self.mem.len() {
+                return false;
+            }
+            if new_len > len {
+                self.mem[off + len..off + new_len].fill(0);
+            }
+            self.top = off + new_len;
+        } else if new_len > len {
+            if self.mem.len() - self.top < new_len {
+                return false;
+            }
+            let at = self.top;
+            self.mem.copy_within(off..off + len, at);
+            self.mem[at + len..at + new_len].fill(0);
+            self.table[r.0 as usize].offset = at as u32;
+            self.top = at + new_len;
+        }
+        self.table[r.0 as usize].len = new_len as u32;
+        true
+    }
+
+    /// Read-only access to all objects.
+    pub fn view(&self) -> HeapView<'_> {
+        HeapView {
+            mem: self.mem,
+            table: &self.table,
+        }
+    }
+
+    /// Reads all other objects while writing `dst`, which must be the most
+    /// recently allocated object (so every other object lies below it).
+    pub fn view_and_dst(&mut self, dst: ObjRef) -> (HeapView<'_>, &mut [u8]) {
+        let e = self.table[dst.0 as usize];
+        let (low, high) = self.mem.split_at_mut(e.offset as usize);
+        (
+            HeapView {
+                mem: low,
+                table: &self.table,
+            },
+            &mut high[..e.len as usize],
+        )
     }
 
     pub fn bytes_mut(&mut self, r: ObjRef) -> &mut [u8] {
@@ -146,8 +227,12 @@ impl<'a> Heap<'a> {
         }
     }
 
-    pub fn mark(&mut self, r: ObjRef) {
-        self.table[r.0 as usize].marked = true;
+    /// Marks an object as reachable; `true` if it wasn't marked yet.
+    pub fn mark(&mut self, r: ObjRef) -> bool {
+        let e = &mut self.table[r.0 as usize];
+        let new = !e.marked;
+        e.marked = true;
+        new
     }
 
     /// Frees unmarked objects and moves the marked ones to the start of the
@@ -184,6 +269,28 @@ impl<'a> Heap<'a> {
             top += len;
         }
         self.top = top;
+    }
+}
+
+/// Read-only view of the heap's objects (see `Heap::view_and_dst`).
+#[derive(Clone, Copy)]
+pub struct HeapView<'h> {
+    mem: &'h [u8],
+    table: &'h [Entry; MAX_OBJECTS],
+}
+
+impl<'h> HeapView<'h> {
+    pub fn kind(&self, r: ObjRef) -> Kind {
+        self.table[r.0 as usize].kind
+    }
+
+    pub fn bytes(&self, r: ObjRef) -> &'h [u8] {
+        let e = self.table[r.0 as usize];
+        &self.mem[e.offset as usize..(e.offset + e.len) as usize]
+    }
+
+    pub fn str(&self, r: ObjRef) -> &'h str {
+        core::str::from_utf8(self.bytes(r)).unwrap_or("")
     }
 }
 
@@ -228,6 +335,38 @@ mod tests {
         assert_eq!(heap.str(a), "aaaaaaaaaa");
         assert_eq!(heap.capacity(), 64);
         assert_eq!(heap.collections, 1);
+    }
+
+    #[test]
+    fn test_realloc_keeps_handle_and_contents() {
+        let mut mem = [0u8; 64];
+        let mut heap = Heap::new(&mut mem);
+        let a = heap.alloc(Kind::List, 4).unwrap();
+        heap.bytes_mut(a).copy_from_slice(b"abcd");
+        // The last object grows in place
+        assert!(heap.realloc(a, 8));
+        assert_eq!(heap.bytes(a), b"abcd\0\0\0\0");
+        assert_eq!(heap.used(), 8);
+        // Not the last one any more: it moves to the top
+        let b = heap.alloc(Kind::Str, 4).unwrap();
+        assert!(heap.realloc(a, 12));
+        assert_eq!(&heap.bytes(a)[..4], b"abcd");
+        assert_eq!(heap.used(), 24);
+        assert!(!heap.realloc(b, 64));
+        // Its old bytes are garbage, reclaimed by compaction
+        heap.begin_mark();
+        assert!(heap.mark(a));
+        assert!(!heap.mark(a));
+        heap.mark(b);
+        heap.sweep();
+        assert_eq!(heap.used(), 16);
+        assert_eq!(&heap.bytes(a)[..4], b"abcd");
+        // Writing the newest object while reading the others
+        let c = heap.alloc(Kind::Str, 2).unwrap();
+        let (view, out) = heap.view_and_dst(c);
+        out.copy_from_slice(&view.bytes(a)[..2]);
+        assert_eq!(view.kind(a), Kind::List);
+        assert_eq!(heap.str(c), "ab");
     }
 
     #[test]

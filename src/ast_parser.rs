@@ -45,7 +45,11 @@ pub const MAX_PARAMS: usize = MAX_CALL_ARGS;
 /// Maximum number of names in one `import` / `from ... import` statement.
 pub const MAX_IMPORTS: usize = 8;
 /// Maximum number of RPN items (operands + operators) in one statement.
-pub const MAX_EXPR_ITEMS: usize = 32;
+pub const MAX_EXPR_ITEMS: usize = 64;
+/// Maximum number of names on the left of `a, b = ...` or in `for a, b in`.
+pub const MAX_TARGETS: usize = 6;
+/// Maximum number of links in a comparison chain (`a < b < c` has two).
+const MAX_CHAIN: usize = 16;
 /// Maximum nesting of parentheses / unary operators (bounds parser recursion).
 pub const MAX_EXPR_DEPTH: usize = 16;
 
@@ -81,6 +85,10 @@ pub enum CmpOp {
     In,
     /// `x not in y`
     NotIn,
+    /// `x is y`: the same object
+    Is,
+    /// `x is not y`
+    IsNot,
 }
 
 /// One RPN instruction.
@@ -141,6 +149,29 @@ pub enum Item<'a> {
         attr: &'a str,
         argc: u8,
     },
+    /// `[a, b]`, `(a, b)`: pops `n` values, pushes a new list / tuple.
+    BuildList(u8),
+    BuildTuple(u8),
+    /// `{k: v, ...}`: pops `n` key/value pairs, pushes a new dict.
+    BuildDict(u8),
+    /// A comprehension: `[a for targets in iter if cond]` or
+    /// `{a: b for targets in iter if cond}`. The header is followed by its
+    /// parts, each a complete expression of the given length: `a`, `b` (dict
+    /// only), `targets` `Ident` items, `iter`, `cond` (0 if there's no `if`).
+    Comp {
+        dict: bool,
+        targets: u8,
+        a: u8,
+        b: u8,
+        iter: u8,
+        cond: u8,
+    },
+    /// `a if cond else b`: followed by the parts `a`, `cond` and `b`.
+    IfElse {
+        a: u8,
+        cond: u8,
+        b: u8,
+    },
 }
 
 /// A range of RPN items inside a statement's `Code` buffer.
@@ -167,6 +198,27 @@ impl<'a> Code<'a> {
 
     fn clear(&mut self) {
         self.len = 0;
+    }
+
+    /// Inserts `item` at `at`, moving the items after it. Jumps stay valid:
+    /// their `skip` counts are relative, and jumps waiting to be patched are
+    /// always before `at` (they belong to enclosing expressions).
+    fn insert(&mut self, at: usize, item: Item<'a>) -> Result<(), Error> {
+        if self.len >= MAX_EXPR_ITEMS {
+            return Err(Error::OutOfMemory);
+        }
+        self.items.copy_within(at..self.len, at + 1);
+        self.items[at] = item;
+        self.len += 1;
+        Ok(())
+    }
+
+    fn last(&self) -> Option<Item<'a>> {
+        self.len.checked_sub(1).map(|i| self.items[i])
+    }
+
+    fn pop(&mut self) {
+        self.len -= 1;
     }
 
     fn push(&mut self, item: Item<'a>) -> Result<(), Error> {
@@ -210,12 +262,52 @@ impl Default for Code<'_> {
     }
 }
 
+/// Names assigned by `a, b = ...`, `a = b = ...` or `for a, b in ...`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Targets<'a> {
+    pub names: [&'a str; MAX_TARGETS],
+    pub count: usize,
+    /// `a, b = ...` / `for a, b in`: the value is unpacked into the names.
+    pub unpack: bool,
+}
+
+impl<'a> Targets<'a> {
+    pub fn names(&self) -> &[&'a str] {
+        &self.names[..self.count]
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Stmt<'a> {
     /// `name = <expr>`
     Assign {
         name: &'a str,
         expr: Expr,
+    },
+    /// `a, b = <expr>` (unpacking) or `a = b = <expr>` (same value)
+    AssignMulti {
+        targets: Targets<'a>,
+        expr: Expr,
+    },
+    /// `x[key] = <expr>`: `target` leaves the container and the key.
+    SetItem {
+        target: Expr,
+        value: Expr,
+    },
+    /// `x[key] += <expr>`
+    AugSetItem {
+        target: Expr,
+        op: BinOp,
+        value: Expr,
+    },
+    /// `del a, b`
+    DelNames(Targets<'a>),
+    /// `del x[key]`: `target` leaves the container and the key.
+    DelItem(Expr),
+    /// Header `for targets in <iter>:`
+    For {
+        targets: Targets<'a>,
+        iter: Expr,
     },
     /// `name += <expr>` (any `BinOp`)
     AugAssign {
@@ -267,7 +359,12 @@ impl Stmt<'_> {
     pub const fn is_compound(&self) -> bool {
         matches!(
             self,
-            Stmt::If(_) | Stmt::Elif(_) | Stmt::Else | Stmt::While(_) | Stmt::Def { .. }
+            Stmt::If(_)
+                | Stmt::Elif(_)
+                | Stmt::Else
+                | Stmt::While(_)
+                | Stmt::For { .. }
+                | Stmt::Def { .. }
         )
     }
 }
@@ -419,6 +516,14 @@ impl<'a> Parser<'a> {
                 return Ok(Some(Stmt::Else));
             }
             Token::Def => return self.parse_def().map(Some),
+            Token::For => {
+                self.advance()?;
+                let targets = self.parse_targets(Token::In)?;
+                self.expect(Token::In)?;
+                let iter = self.parse_expr_list(code)?;
+                self.expect(Token::Colon)?;
+                return Ok(Some(Stmt::For { targets, iter }));
+            }
             Token::Global => {
                 self.advance()?;
                 let mut names = [""; MAX_IMPORTS];
@@ -452,6 +557,27 @@ impl<'a> Parser<'a> {
                     count,
                 }
             }
+            Token::Del => {
+                self.advance()?;
+                if let (
+                    Token::Ident(_),
+                    Token::Newline | Token::Eof | Token::Semicolon | Token::Comma,
+                ) = (self.current, self.peek()?)
+                {
+                    Stmt::DelNames(self.parse_targets(Token::Newline)?)
+                } else {
+                    let start = code.len;
+                    self.parse_test(code)?;
+                    if code.last() != Some(Item::Index) {
+                        return Err(Error::InvalidSyntax);
+                    }
+                    code.pop();
+                    Stmt::DelItem(Expr {
+                        start: start as u8,
+                        len: (code.len - start) as u8,
+                    })
+                }
+            }
             Token::Pass | Token::Break | Token::Continue => {
                 let stmt = match self.current {
                     Token::Pass => Stmt::Pass,
@@ -466,7 +592,7 @@ impl<'a> Parser<'a> {
                 if self.at_line_end() {
                     Stmt::Return(None)
                 } else {
-                    Stmt::Return(Some(self.parse_expr(code)?))
+                    Stmt::Return(Some(self.parse_expr_list(code)?))
                 }
             }
             // Variable assignment: `x = <expr>`, `x += <expr>`
@@ -474,9 +600,43 @@ impl<'a> Parser<'a> {
                 Token::Assign => {
                     self.advance()?; // name
                     self.advance()?; // '='
-                    Stmt::Assign {
-                        name,
-                        expr: self.parse_expr(code)?,
+                                     // `a = b = <expr>`
+                    let mut targets = Targets {
+                        names: [name; MAX_TARGETS],
+                        count: 1,
+                        unpack: false,
+                    };
+                    while let (Token::Ident(next), Token::Assign) = (self.current, self.peek()?) {
+                        if targets.count >= MAX_TARGETS {
+                            return Err(Error::TooManyArguments);
+                        }
+                        targets.names[targets.count] = next;
+                        targets.count += 1;
+                        self.advance()?;
+                        self.advance()?;
+                    }
+                    let expr = self.parse_expr_list(code)?;
+                    if targets.count == 1 {
+                        Stmt::Assign { name, expr }
+                    } else {
+                        Stmt::AssignMulti { targets, expr }
+                    }
+                }
+                // `a, b = <expr>`, or an expression statement like `a, b`
+                Token::Comma => {
+                    let saved = *self;
+                    match self.parse_targets(Token::Assign) {
+                        Ok(targets) if self.current == Token::Assign => {
+                            self.advance()?;
+                            Stmt::AssignMulti {
+                                targets,
+                                expr: self.parse_expr_list(code)?,
+                            }
+                        }
+                        _ => {
+                            *self = saved;
+                            self.parse_expr_stmt(code)?
+                        }
                     }
                 }
                 Token::AugAssign(op) => {
@@ -488,18 +648,114 @@ impl<'a> Parser<'a> {
                         expr: self.parse_expr(code)?,
                     }
                 }
-                _ => Stmt::Expr(self.parse_expr(code)?),
+                _ => self.parse_expr_stmt(code)?,
             },
-            // `123 = 456`, `'a' += 1`: assignment to something that is not a name
-            _ if matches!(self.peek()?, Token::Assign | Token::AugAssign(_)) => {
-                return Err(Error::InvalidSyntax)
-            }
-            // Expression statement: `print(x)`, `led_on()`, `delay_ms(t * 2)`
-            _ => Stmt::Expr(self.parse_expr(code)?),
+            // Expression statement: `print(x)`, `led_on()`, `delay_ms(t * 2)`,
+            // or an assignment to an element: `d[k] = v`
+            _ => self.parse_expr_stmt(code)?,
         };
 
         self.expect_stmt_end()?;
         Ok(Some(stmt))
+    }
+
+    /// An expression statement, or an assignment to an element (`x[k] = v`,
+    /// `x[k] += v`): the target is parsed as an expression ending in `Index`,
+    /// which is then removed, so the target leaves the container and the key.
+    fn parse_expr_stmt(&mut self, code: &mut Code<'a>) -> Result<Stmt<'a>, Error> {
+        let start = code.len;
+        self.parse_test(code)?;
+        match self.current {
+            Token::Assign | Token::AugAssign(_) => {
+                let op = match self.current {
+                    Token::AugAssign(op) => Some(op),
+                    _ => None,
+                };
+                // `(a, b) = ...`, `[a, b] = ...`: a tuple of names unpacks
+                if let (None, Some(Item::BuildTuple(n) | Item::BuildList(n))) = (op, code.last()) {
+                    let names = &code.items[start..code.len - 1];
+                    if names.len() == n as usize
+                        && n as usize <= MAX_TARGETS
+                        && names.iter().all(|i| matches!(i, Item::Ident(_)))
+                    {
+                        let mut targets = Targets {
+                            names: [""; MAX_TARGETS],
+                            count: n as usize,
+                            unpack: true,
+                        };
+                        for (slot, item) in targets.names.iter_mut().zip(names) {
+                            if let Item::Ident(name) = item {
+                                *slot = name;
+                            }
+                        }
+                        code.len = start;
+                        self.advance()?;
+                        let expr = self.parse_expr_list(code)?;
+                        return Ok(Stmt::AssignMulti { targets, expr });
+                    }
+                }
+                // `123 = 456`, `f() = 1`, `a[1:2] = x`: not assignable here
+                if code.last() != Some(Item::Index) {
+                    return Err(Error::InvalidSyntax);
+                }
+                code.pop();
+                let target = Expr {
+                    start: start as u8,
+                    len: (code.len - start) as u8,
+                };
+                self.advance()?;
+                let value = self.parse_expr_list(code)?;
+                Ok(match op {
+                    Some(op) => Stmt::AugSetItem { target, op, value },
+                    None => Stmt::SetItem { target, value },
+                })
+            }
+            Token::Comma => {
+                let n = self.parse_more_elements(code, Token::Newline)?;
+                code.push(Item::BuildTuple(n))?;
+                Ok(Stmt::Expr(Expr {
+                    start: start as u8,
+                    len: (code.len - start) as u8,
+                }))
+            }
+            _ => Ok(Stmt::Expr(Expr {
+                start: start as u8,
+                len: (code.len - start) as u8,
+            })),
+        }
+    }
+
+    /// targets := IDENT (',' IDENT)* [','] | '(' targets ')', up to `end`.
+    fn parse_targets(&mut self, end: Token<'a>) -> Result<Targets<'a>, Error> {
+        let parens = self.current == Token::LParen;
+        if parens {
+            self.advance()?;
+        }
+        let mut t = Targets {
+            names: [""; MAX_TARGETS],
+            count: 0,
+            unpack: false,
+        };
+        loop {
+            if t.count >= MAX_TARGETS {
+                return Err(Error::TooManyArguments);
+            }
+            t.names[t.count] = self.expect_ident()?;
+            t.count += 1;
+            if self.current != Token::Comma {
+                break;
+            }
+            t.unpack = true;
+            self.advance()?;
+            if self.current == end || self.current == Token::RParen {
+                break;
+            }
+        }
+        if parens {
+            self.expect(Token::RParen)?;
+            t.unpack = true;
+        }
+        Ok(t)
     }
 
     /// import_names := IDENT ['as' IDENT] (',' IDENT ['as' IDENT])*
@@ -580,11 +836,167 @@ impl<'a> Parser<'a> {
     /// Parses one full expression and returns its range in `code`.
     fn parse_expr(&mut self, code: &mut Code<'a>) -> Result<Expr, Error> {
         let start = code.len;
-        self.parse_or(code)?;
+        self.parse_test(code)?;
         Ok(Expr {
             start: start as u8,
             len: (code.len - start) as u8,
         })
+    }
+
+    /// Like `parse_expr`, but `a, b` (without parentheses) is a tuple, as on
+    /// the right of `=`, after `return` and after `for ... in`.
+    fn parse_expr_list(&mut self, code: &mut Code<'a>) -> Result<Expr, Error> {
+        let start = code.len;
+        self.parse_test(code)?;
+        if self.current == Token::Comma {
+            let n = self.parse_more_elements(code, Token::Colon)?;
+            code.push(Item::BuildTuple(n))?;
+        }
+        Ok(Expr {
+            start: start as u8,
+            len: (code.len - start) as u8,
+        })
+    }
+
+    /// After a first element, at a `,`: parses `, b, c [,]` up to `end` (or
+    /// the end of the line); returns the number of elements including the first.
+    fn parse_more_elements(&mut self, code: &mut Code<'a>, end: Token<'a>) -> Result<u8, Error> {
+        let mut n = 1u8;
+        while self.current == Token::Comma {
+            self.advance()?;
+            if self.current == end
+                || matches!(
+                    self.current,
+                    Token::Newline
+                        | Token::Eof
+                        | Token::Semicolon
+                        | Token::RParen
+                        | Token::RBracket
+                        | Token::Assign
+                )
+            {
+                break;
+            }
+            self.nested(|p| p.parse_test(code))?;
+            n = n.checked_add(1).ok_or(Error::TooManyArguments)?;
+        }
+        Ok(n)
+    }
+
+    /// test := or ['if' or 'else' test]
+    fn parse_test(&mut self, code: &mut Code<'a>) -> Result<(), Error> {
+        let start = code.len;
+        self.parse_or(code)?;
+        if self.current != Token::If {
+            return Ok(());
+        }
+        let a = code.len - start;
+        self.advance()?;
+        self.nested(|p| p.parse_or(code))?;
+        let cond = code.len - start - a;
+        self.expect(Token::Else)?;
+        self.nested(|p| p.parse_test(code))?;
+        let b = code.len - start - a - cond;
+        code.insert(
+            start,
+            Item::IfElse {
+                a: a as u8,
+                cond: cond as u8,
+                b: b as u8,
+            },
+        )
+    }
+
+    /// The rest of a comprehension, at `for`: the element part(s) are
+    /// already in `code` from `start` (`a` and, for a dict, `b` items).
+    fn parse_comprehension(
+        &mut self,
+        code: &mut Code<'a>,
+        start: usize,
+        dict: bool,
+        a: usize,
+    ) -> Result<(), Error> {
+        let b = code.len - start - a;
+        self.advance()?; // 'for'
+        let targets = self.parse_targets(Token::In)?;
+        for &name in targets.names() {
+            code.push(Item::Ident(name))?;
+        }
+        self.expect(Token::In)?;
+        let before_iter = code.len;
+        self.nested(|p| p.parse_or(code))?;
+        let iter = code.len - before_iter;
+        let mut cond = 0;
+        if self.current == Token::If {
+            self.advance()?;
+            let before = code.len;
+            self.nested(|p| p.parse_or(code))?;
+            cond = code.len - before;
+        }
+        if self.current == Token::For {
+            return Err(Error::InvalidSyntax); // one `for` per comprehension
+        }
+        code.insert(
+            start,
+            Item::Comp {
+                dict,
+                targets: targets.count as u8,
+                a: a as u8,
+                b: b as u8,
+                iter: iter as u8,
+                cond: cond as u8,
+            },
+        )
+    }
+
+    /// `[...]`, `(...)` and `{...}` displays, at the opening bracket.
+    fn parse_display(&mut self, code: &mut Code<'a>) -> Result<(), Error> {
+        let open = self.current;
+        self.advance()?;
+        let (close, build): (Token<'a>, fn(u8) -> Item<'a>) = match open {
+            Token::LParen => (Token::RParen, Item::BuildTuple),
+            Token::LBracket => (Token::RBracket, Item::BuildList),
+            _ => (Token::RBrace, Item::BuildDict),
+        };
+        if self.current == close {
+            self.advance()?;
+            return code.push(build(0));
+        }
+        let start = code.len;
+        self.parse_test(code)?;
+        let key_len = code.len - start;
+        let dict = open == Token::LBrace;
+        if dict {
+            // Sets (`{a, b}`) aren't supported
+            self.expect(Token::Colon)?;
+            self.nested(|p| p.parse_test(code))?;
+        }
+        if self.current == Token::For {
+            let a = if dict { key_len } else { code.len - start };
+            self.parse_comprehension(code, start, dict, a)?;
+            // `(x for x in y)` is evaluated as a list (no generators)
+            return self.expect(close);
+        }
+        let mut n = 1u8;
+        if dict {
+            while self.current == Token::Comma {
+                self.advance()?;
+                if self.current == close {
+                    break;
+                }
+                self.nested(|p| p.parse_test(code))?;
+                self.expect(Token::Colon)?;
+                self.nested(|p| p.parse_test(code))?;
+                n = n.checked_add(1).ok_or(Error::TooManyArguments)?;
+            }
+        } else if self.current == Token::Comma {
+            n = self.parse_more_elements(code, close)?;
+        } else if open == Token::LParen {
+            // `(x)` is just `x`
+            return self.expect(close);
+        }
+        self.expect(close)?;
+        code.push(build(n))
     }
 
     /// or := and ('or' and)*
@@ -631,13 +1043,16 @@ impl<'a> Parser<'a> {
             return Ok(());
         };
 
-        let mut chain_jumps = [0usize; MAX_EXPR_ITEMS];
+        let mut chain_jumps = [0u8; MAX_CHAIN];
         let mut links = 0;
         loop {
             self.parse_bitor(code)?;
             match self.take_cmp_op()? {
                 Some(next) => {
-                    chain_jumps[links] = code.push_jump(Item::CmpChain { op, skip: 0 })?;
+                    if links >= MAX_CHAIN {
+                        return Err(Error::OutOfMemory);
+                    }
+                    chain_jumps[links] = code.push_jump(Item::CmpChain { op, skip: 0 })? as u8;
                     links += 1;
                     op = next;
                 }
@@ -648,7 +1063,7 @@ impl<'a> Parser<'a> {
             }
         }
         for &jump in &chain_jumps[..links] {
-            code.patch_skip(jump);
+            code.patch_skip(jump as usize);
         }
         Ok(())
     }
@@ -661,6 +1076,11 @@ impl<'a> Parser<'a> {
                 CmpOp::NotIn
             }
             Token::In => CmpOp::In,
+            Token::Is if self.peek()? == Token::Not => {
+                self.advance()?;
+                CmpOp::IsNot
+            }
+            Token::Is => CmpOp::Is,
             other => match cmp_op(other) {
                 Some(op) => op,
                 None => return Ok(None),
@@ -793,13 +1213,13 @@ impl<'a> Parser<'a> {
                     self.advance()?;
                     let has_start = self.current != Token::Colon;
                     if has_start {
-                        self.nested(|p| p.parse_or(code))?;
+                        self.nested(|p| p.parse_test(code))?;
                     }
                     if self.current == Token::Colon {
                         self.advance()?;
                         let has_end = self.current != Token::RBracket;
                         if has_end {
-                            self.nested(|p| p.parse_or(code))?;
+                            self.nested(|p| p.parse_test(code))?;
                         }
                         code.push(Item::Slice { has_start, has_end })?;
                     } else {
@@ -828,10 +1248,8 @@ impl<'a> Parser<'a> {
                 }
                 return code.push(Item::Ident(name));
             }
-            Token::LParen => {
-                self.advance()?;
-                self.nested(|p| p.parse_or(code))?;
-                return self.expect(Token::RParen);
+            Token::LParen | Token::LBracket | Token::LBrace => {
+                return self.nested(|p| p.parse_display(code));
             }
             _ => return Err(Error::UnexpectedToken),
         };
@@ -857,8 +1275,14 @@ impl<'a> Parser<'a> {
             if argc >= MAX_CALL_ARGS {
                 return Err(Error::TooManyArguments);
             }
-            self.parse_or(code)?;
+            let start = code.len;
+            self.parse_test(code)?;
             argc += 1;
+            // `sum(x for x in y)`: a generator as the only argument
+            if argc == 1 && self.current == Token::For {
+                self.parse_comprehension(code, start, false, code.len - start)?;
+                break;
+            }
 
             match self.current {
                 // A trailing comma before ')' is allowed
@@ -1100,7 +1524,8 @@ mod tests {
             parser.parse_next_stmt(&mut code),
             Err(Error::UnexpectedToken)
         );
-        assert_eq!(parser.line(), 2);
+        // Inside brackets the statement continues, up to the end of the input
+        assert_eq!(parser.line(), 3);
 
         let mut parser = Parser::new("x = 1\n\nprint('open").unwrap();
         parser.parse_next_stmt(&mut code).unwrap();
@@ -1338,7 +1763,7 @@ mod tests {
             ("from a b", Error::UnexpectedToken),
             ("from a import *", Error::InvalidSyntax),
             ("x = a.", Error::InvalidSyntax),
-            ("a.b = 1", Error::UnexpectedToken),
+            ("a.b = 1", Error::InvalidSyntax),
             ("import a, b, c, d, e, f, g, h, i", Error::TooManyArguments),
         ] {
             let mut parser = Parser::new(src).unwrap();
@@ -1388,7 +1813,7 @@ mod tests {
             "x = 1 +",
             "x = (1 + 2",
             "x = 1 + * 2",
-            "x = ()",
+            "x = (,)",
             "x = 2 **",
             "x = 1 2",
         ] {

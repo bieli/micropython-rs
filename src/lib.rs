@@ -42,8 +42,10 @@ pub enum Error {
     /// `module.name` for a name the module doesn't have, or `.` on a value
     /// that isn't a module.
     AttributeError,
-    /// An index outside a string (or, later, a list).
+    /// An index outside a string, bytes, list or tuple.
     IndexError,
+    /// A dict has no such key.
+    KeyError,
 }
 
 pub trait Output {

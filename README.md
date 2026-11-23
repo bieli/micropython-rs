@@ -25,7 +25,7 @@ If you are new to Rust or embedded development, this codebase is a clean, readab
   (a byte buffer you provide) with a garbage collector for strings built at runtime. No `Vec`, `String` or `alloc`.
 * **Hardware Agnostic (`#![no_std]`):** Connects to any display, UART serial port, or terminal via a simple 1-method `Output` trait.
 * **Modular & Easy to Read:** Split into small, self-contained files (`lexer.rs`, `ast_parser.rs`, `interpreter.rs`,
-  `strings.rs`, `bytes.rs`, `heap.rs`, `flatfs.rs` and `lib.rs`).
+  `strings.rs`, `bytes.rs`, `containers.rs`, `heap.rs`, `flatfs.rs` and `lib.rs`).
 
 ---
 
@@ -76,19 +76,21 @@ flags |= 1 << 3                   # bitwise & | ^ ~ << >> and augmented assignme
 
 | Area | Supported |
 |------|-----------|
-| Values | `int` (64-bit), `str`, `bytes`, `bool` (`True`/`False`), `None` |
-| Strings | Escapes (`'\n'`, `'\x41'`, `'\u263a'`), `+`, `*`, `len()`, `s[i]`, `s[a:b]`, `in` / `not in`, `str()`, `repr()`, `int(s, base)`, `ord()`, `chr()`, `s.encode()`, and methods `upper lower strip lstrip rstrip startswith endswith find count replace isdigit isalpha isalnum isspace isupper islower` |
+| Values | `int` (64-bit), `str`, `bytes`, `bool` (`True`/`False`), `None`, `list`, `tuple`, `dict`, `range` |
+| Containers | `[1, 2]`, `(1, 2)`, `{'k': v}`, `x[i]`, `x[a:b]`, `x[k] = v`, `del x[k]`, `+`, `*`, `in`, `==`/`<`, comprehensions `[f(x) for x in it if c]` / `{k: v for ...}`, list methods `append extend insert pop remove index count clear reverse sort copy`, dict methods `get pop setdefault update keys values items clear copy` |
+| Strings | Escapes (`'\n'`, `'\x41'`, `'\u263a'`), `+`, `*`, `len()`, `s[i]`, `s[a:b]`, `in` / `not in`, `str()`, `repr()`, `int(s, base)`, `ord()`, `chr()`, `s.encode()`, and methods `upper lower strip lstrip rstrip startswith endswith find count replace split join isdigit isalpha isalnum isspace isupper islower` |
 | Bytes | `b'...'` literals with escapes, `bytes()`, `bytes(n)`, `bytes(s, 'utf-8')`, `+`, `*`, `len()`, `b[i]` (an `int`), `b[a:b]`, `in`, `==`/`<`, `hex()`, `decode()`, `startswith endswith find` |
 | Modules | `binascii` (`hexlify`, `unhexlify`), built in; plus the native modules of the firmware (e.g. `display`) |
-| Literals | `42`, `1_000`, `0x1F`, `0o17`, `0b1010`, `'single'`, `"double"` |
-| Operators | `+ - * / // % **`, `& \| ^ ~ << >>`, `== != < <= > >=` (chainable), `and or not` |
-| Assignment | `x = ...`, and `+= -= *= /= //= %= **= &= \|= ^= <<= >>=` |
-| Statements | `if`/`elif`/`else`, `while`, `break`, `continue`, `pass`, `def`, `return`; `;` between statements (`x = 1; y = 2`) |
-| Calls | `print(...)`, `abs(x)`, `min(a, b, ...)`, `max(a, b, ...)`, your own `def` functions, and hardware functions from `HardwareBridge` |
+| Literals | `42`, `1_000`, `0x1F`, `0o17`, `0b1010`, `'single'`, `"double"`, `'''triple'''`; lines join inside brackets and after `\` |
+| Operators | `+ - * / // % **`, `& \| ^ ~ << >>`, `== != < <= > >=` (chainable), `in`, `not in`, `is`, `is not`, `and or not`, `a if c else b` |
+| Assignment | `x = ...`, `a, b = b, a`, `(a, b) = ...`, `a = b = 0`, `x[k] = v`, `+= -= *= /= //= %= **= &= \|= ^= <<= >>=` (also `x[k] += v`), `del a, b`, `del x[k]` |
+| Statements | `if`/`elif`/`else`, `while`, `for x in ...` (also `for k, v in d.items()`), `break`, `continue`, `pass`, `def`, `return`; `;` between statements (`x = 1; y = 2`) |
+| Calls | `print(...)`, `abs`, `min`, `max`, `bool`, `len`, `list`, `tuple`, `dict`, `range`, `sorted`, `reversed`, `sum`, `any`, `all`, `enumerate`, `zip`, your own `def` functions, and hardware functions from `HardwareBridge` |
 | Scope | `global a, b` in a function, to assign globals (also creates them) |
 | Modules | `import m`, `import m as x, n`, `from m import f, C as K`; `m.f(...)`, `m.CONST` for native modules written in Rust |
 
-Not supported yet: `for`, lists/dicts/tuples, floats, `split`/`join`/`format`/f-strings, classes, importing `.py` files.
+Not supported yet: floats, sets, `format`/`%`/f-strings, exceptions (`try`), keyword arguments, classes, importing `.py`
+files.
 See [ROADMAP.md](ROADMAP.md) for what's planned.
 
 ### Arithmetic operators
@@ -133,7 +135,8 @@ The limits are in `src/ast_parser.rs`:
 
 | Constant | Value | Meaning |
 |----------|-------|---------|
-| `MAX_EXPR_ITEMS` | 32 | Operands and operators per statement, all call arguments included |
+| `MAX_EXPR_ITEMS` | 64 | Operands and operators per statement, all call arguments and list elements included |
+| `MAX_TARGETS` | 6 | Names in `a, b = ...` and `for a, b in ...` |
 | `MAX_EXPR_DEPTH` | 16 | Nesting of parentheses and unary operators |
 | `MAX_CALL_ARGS` | 8 | Arguments per function call (and parameters per `def`) |
 
@@ -207,8 +210,8 @@ print('v=' + str(adc_vref()) + ' mV', int('0x1F', 16), chr(9786), ord('A'))
 * `repr()` returns a valid Python literal (quotes and escapes chosen like CPython), which is also what the REPL echoes.
 * `str(s)` returns `s` itself (strings never change); a missing index raises `Error::IndexError`, `int('x')` raises
   `Error::ValueError`.
-* All test expressions are checked against CPython. Not supported yet: `split`, `join`, `format`, `%` and f-strings
-  (they need lists or formatting), and bound methods (`f = s.upper` without calling it).
+* All test expressions are checked against CPython. Not supported yet: `format`, `%` and f-strings, and bound
+  methods (`f = s.upper` without calling it).
 
 ### Bytes
 
@@ -222,15 +225,47 @@ print(binascii.unhexlify('48656c6c6f').decode(), binascii.hexlify(b'OK'))   # He
 `print()`, `str()` and `repr()` of bytes all give the `b'...'` literal, like Python. Bytes and strings never mix:
 `b'a' + 'a'` raises `Error::TypeError` and `b'a' == 'a'` is `False`. Invalid hex digits and undecodable UTF-8 raise
 `Error::ValueError` (CPython raises `binascii.Error` and `UnicodeDecodeError`, both subclasses of `ValueError`).
-Not supported yet: `bytearray`, `bytes([1, 2])` (needs lists), and the text methods (`upper`, `split`...) on bytes.
+Not supported yet: `bytearray`, `bytes([1, 2])`, and the text methods (`upper`, `split`...) on bytes.
+
+### Lists, tuples and dicts
+
+```python
+readings = [adc_read(36) for _ in range(8)]          # a list comprehension
+print(sum(readings) // len(readings), max(readings), sorted(readings)[:3])
+
+pins = {'led': 2, 'button': 0}
+pins['buzzer'] = 25
+for name, pin in pins.items():
+    print(name, pin)
+
+counts = {}
+for word in 'the cat the dog'.split():
+    counts[word] = counts.get(word, 0) + 1
+print(counts)                                        # {'the': 2, 'cat': 1, 'dog': 1}
+x, y = 10, 20
+x, y = y, x
+```
+
+* Lists, tuples, dicts and ranges are objects on the heap (see Memory below). `b = a` shares the list, as in Python:
+  `b.append(1)` changes `a` too. A list grows as needed; a dict keeps insertion order and finds keys by comparing
+  them one by one (fine for the small dicts of a microcontroller).
+* Dict keys can be numbers, strings, bytes, `None`, bools and tuples of those; a list or dict as a key raises
+  `Error::TypeError`, a missing key `Error::KeyError`.
+* Differences from CPython, to stay small: `d.keys()`, `d.values()`, `d.items()`, `enumerate()`, `zip()` and
+  `reversed()` return lists, and a generator expression (`sum(x for x in a)`) is evaluated as a list. A
+  comprehension has one `for` (and optionally one `if`). Slices have no step (`a[::2]`). Containers nested more than
+  8 levels deep are printed as `[...]`.
+* All behaviour above (results and error kinds) is checked against CPython.
 
 **Memory.** A literal without escapes, and any slice of it, points into the script source and costs no memory.
-Strings and bytes created at runtime (`+`, `*`, `str()`, escapes, `upper()`, `hexlify()`, ...) live in a fixed-size **heap**: a byte buffer
-the application passes to `Interpreter::with_heap`. When it's full, a **mark-and-sweep garbage collector** keeps
-everything reachable from variables and from the value stack (the operands of every expression being evaluated,
-including those of calling functions), frees the rest and moves the survivors together. Values refer to heap objects
-through handles, so moving them is safe. Limits: the buffer size and 256 live objects (`heap::MAX_OBJECTS`); beyond
-that, `Error::OutOfMemory`. Without a heap, building strings raises `Error::OutOfMemory`; everything else works.
+Strings, bytes, lists, tuples and dicts created at runtime (`+`, `*`, `str()`, escapes, `upper()`, `hexlify()`,
+`[...]`, `{...}`, ...) live in a fixed-size **heap**: a byte buffer the application passes to `Interpreter::with_heap`.
+When it's full, a **mark-and-sweep garbage collector** keeps everything reachable from variables and from the value
+stack (the operands of every expression being evaluated, including those of calling functions, and the iterables of
+running `for` loops), and everything inside reachable lists and dicts. It frees the rest (cycles included) and moves
+the survivors together. Values refer to heap objects through handles, so moving them is safe. Limits: the buffer size
+and 256 live objects (`heap::MAX_OBJECTS`; every string inside a list counts); beyond that, `Error::OutOfMemory`.
+Without a heap, creating strings or containers raises `Error::OutOfMemory`; everything else works.
 
 ```rust
 let mut heap = [0u8; 16 * 1024];

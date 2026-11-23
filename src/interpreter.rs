@@ -20,6 +20,8 @@
 
 #[path = "bytes.rs"]
 mod bytes;
+#[path = "containers.rs"]
+mod containers;
 #[path = "strings.rs"]
 mod strings;
 
@@ -27,9 +29,9 @@ use core::cmp::Ordering as CmpOrdering;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::ast_parser::{
-    BinOp, CmpOp, Code, Expr, Item, Parser, Stmt, MAX_CALL_ARGS, MAX_EXPR_ITEMS, MAX_PARAMS,
+    BinOp, CmpOp, Code, Expr, Item, Parser, Stmt, Targets, MAX_CALL_ARGS, MAX_PARAMS, MAX_TARGETS,
 };
-use crate::heap::{Heap, ObjRef};
+use crate::heap::{Heap, Kind, ObjRef};
 use crate::{Arg, Error, HardwareBridge, Module, NoHardware, Output};
 
 /// Variable slots, shared by globals and the locals of active function calls.
@@ -45,7 +47,7 @@ pub const MAX_NESTING: usize = 24;
 /// Values in flight: the operands of every expression being evaluated,
 /// including those of the calling functions. They are roots for the garbage
 /// collector, which is why there is one shared stack instead of one per call.
-pub const VALUE_STACK: usize = 4 * MAX_EXPR_ITEMS;
+pub const VALUE_STACK: usize = 128;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Value<'a> {
@@ -60,6 +62,8 @@ pub enum Value<'a> {
     Bytes(&'a [u8]),
     /// Bytes created at runtime, on the heap.
     HBytes(ObjRef),
+    /// A list, tuple, dict or range on the heap (see `containers.rs`).
+    Obj(ObjRef),
     /// An imported native module (index into `HardwareBridge::modules()`).
     Module(u8),
     /// A function of a native module, e.g. after `from display import line`.
@@ -207,6 +211,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
             Value::HStr(r) => !self.heap.str(r).is_empty(),
             Value::Bytes(b) => !b.is_empty(),
             Value::HBytes(r) => !self.heap.bytes(r).is_empty(),
+            Value::Obj(_) => self.container_len(v) != Some(0),
             Value::Module(_) | Value::NativeFn { .. } => true,
         }
     }
@@ -259,6 +264,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
     pub fn eval(&mut self, source: &'a str) -> Result<(), Error> {
         self.error_line = None;
         self.steps = 0;
+        self.sp = 0;
         let result = self.run(source);
         match result {
             Ok(()) => self.error_line = None,
@@ -457,11 +463,74 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
                     self.set_var(name, val)?;
                 }
             }
+            Stmt::AssignMulti { targets, expr } => {
+                if run {
+                    let val = self.eval_expr(code, expr)?;
+                    if targets.unpack {
+                        self.assign_targets(&targets, val)?;
+                    } else {
+                        for &name in targets.names() {
+                            self.set_var(name, val)?;
+                        }
+                    }
+                }
+            }
+            Stmt::SetItem { target, value } => {
+                if run {
+                    let base = self.sp;
+                    let result = self.exec_set_item(code, target, None, value);
+                    self.sp = base;
+                    result?;
+                }
+            }
+            Stmt::AugSetItem { target, op, value } => {
+                if run {
+                    let base = self.sp;
+                    let result = self.exec_set_item(code, target, Some(op), value);
+                    self.sp = base;
+                    result?;
+                }
+            }
+            Stmt::DelNames(targets) => {
+                if run {
+                    for &name in targets.names() {
+                        self.del_var(name)?;
+                    }
+                }
+            }
+            Stmt::DelItem(target) => {
+                if run {
+                    let base = self.sp;
+                    let result = self.run_items(code.items(target)).and_then(|()| {
+                        if self.sp != base + 2 {
+                            return Err(Error::InvalidSyntax);
+                        }
+                        self.del_item(self.stack[base], self.stack[base + 1])
+                    });
+                    self.sp = base;
+                    result?;
+                }
+            }
+            Stmt::For { targets, iter } => {
+                return self.exec_for(targets, iter, parser, indent, run, ctx, code)
+            }
             Stmt::AugAssign { name, op, expr } => {
                 if run {
                     // Like Python, `x += 1` needs `x` in the current scope
                     // (a global can't be updated from inside a function).
                     let current = self.get_scope_var(name)?;
+                    if op == BinOp::Add && self.obj_kind(current) == Some(Kind::List) {
+                        // `list += iterable` extends the list in place
+                        let base = self.sp;
+                        let result = self.push(current).and_then(|()| {
+                            let rhs = self.eval_expr(code, expr)?;
+                            self.push(rhs)?;
+                            self.call_method(current, "extend", &[rhs])
+                        });
+                        self.sp = base;
+                        result?;
+                        return Ok(Flow::Normal);
+                    }
                     // Both operands stay on the value stack while `op` may allocate
                     let base = self.sp;
                     let result = self.push(current).and_then(|()| {
@@ -663,9 +732,141 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
         }
     }
 
+    /// `x[key] = value` or `x[key] op= value`.
+    fn exec_set_item(
+        &mut self,
+        code: &Code<'a>,
+        target: Expr,
+        op: Option<BinOp>,
+        value: Expr,
+    ) -> Result<(), Error> {
+        let base = self.sp;
+        // Python evaluates the value first, then the container and the key
+        let val = self.eval_expr(code, value)?;
+        self.push(val)?;
+        self.run_items(code.items(target))?;
+        if self.sp != base + 3 {
+            return Err(Error::InvalidSyntax);
+        }
+        let (container, key) = (self.stack[base + 1], self.stack[base + 2]);
+        let val = match op {
+            None => val,
+            Some(op) => {
+                let current = self.index_value(container, key)?;
+                self.push(current)?;
+                self.push(val)?;
+                self.apply_bin(op)?;
+                self.stack[self.sp - 1]
+            }
+        };
+        self.set_item(container, key, val)
+    }
+
+    /// Assigns `val` (rooted while it is unpacked) to the names of `targets`.
+    fn assign_targets(&mut self, targets: &Targets<'a>, val: Value<'a>) -> Result<(), Error> {
+        if !targets.unpack {
+            return self.set_var(targets.names[0], val);
+        }
+        let base = self.sp;
+        let mut parts = [Value::None; MAX_TARGETS];
+        let result = self.push(val).and_then(|()| {
+            self.unpack(val, &mut parts[..targets.count])?;
+            // The parts stay rooted until all names are set
+            for &p in &parts[..targets.count] {
+                self.push(p)?;
+            }
+            for (&name, &p) in targets.names().iter().zip(&parts) {
+                self.set_var(name, p)?;
+            }
+            Ok(())
+        });
+        self.sp = base;
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn exec_for(
+        &mut self,
+        targets: Targets<'a>,
+        iter: Expr,
+        parser: &mut Parser<'a>,
+        indent: u32,
+        run: bool,
+        ctx: Ctx,
+        code: &mut Code<'a>,
+    ) -> Result<Flow<'a>, Error> {
+        let loop_ctx = Ctx {
+            in_loop: true,
+            ..ctx
+        };
+        let body = *parser;
+        if run {
+            let it = self.eval_expr(code, iter)?;
+            // The iterable stays on the value stack (rooted) during the loop
+            let base = self.sp;
+            self.push(it)?;
+            let result = self.run_for(&targets, it, body, parser, indent, loop_ctx, code);
+            self.sp = base;
+            if let Some(flow) = result? {
+                return Ok(flow);
+            }
+            // The body never ran: it's parsed below
+        }
+        *parser = body;
+        self.exec_body(parser, indent, false, loop_ctx, code)?;
+        Ok(Flow::Normal)
+    }
+
+    /// The passes of a `for` loop; `None` if the body never ran (the parser
+    /// is then still at the body).
+    #[allow(clippy::too_many_arguments)]
+    fn run_for(
+        &mut self,
+        targets: &Targets<'a>,
+        it: Value<'a>,
+        body: Parser<'a>,
+        parser: &mut Parser<'a>,
+        indent: u32,
+        ctx: Ctx,
+        code: &mut Code<'a>,
+    ) -> Result<Option<Flow<'a>>, Error> {
+        let mut state = 0;
+        let mut ran = false;
+        while let Some(item) = self.iter_next(it, &mut state)? {
+            if ran {
+                self.tick()?;
+            }
+            ran = true;
+            self.assign_targets(targets, item)?;
+            *parser = body;
+            match self.exec_body(parser, indent, true, ctx, code)? {
+                Flow::Break => return Ok(Some(Flow::Normal)),
+                Flow::Return(val) => return Ok(Some(Flow::Return(val))),
+                Flow::Normal | Flow::Continue => {}
+            }
+        }
+        Ok(ran.then_some(Flow::Normal))
+    }
+
     // ------------------------------------------------------------------
     // Variables and functions
     // ------------------------------------------------------------------
+
+    /// Removes a variable of the current scope (or a declared global).
+    fn del_var(&mut self, name: &str) -> Result<(), Error> {
+        let (i, global) = if self.is_declared_global(name) {
+            (self.find_in(0..self.globals_len, name), true)
+        } else {
+            (self.find_in(self.scope_start()..self.nvars, name), false)
+        };
+        let i = i.ok_or(Error::UnknownIdentifier)?;
+        self.vars.copy_within(i + 1..self.nvars, i);
+        self.nvars -= 1;
+        if global || (self.call_depth > 0 && i < self.globals_len) {
+            self.globals_len -= 1;
+        }
+        Ok(())
+    }
 
     /// Slots of the current scope: all globals at the top level, or the
     /// locals of the innermost function call.
@@ -860,14 +1061,25 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
     /// Evaluates one RPN expression on the shared value stack.
     fn eval_expr(&mut self, code: &Code<'a>, expr: Expr) -> Result<Value<'a>, Error> {
         let base = self.sp;
-        let result = self.eval_items(code.items(expr), base);
+        let result = self.eval_items(code.items(expr));
         self.sp = base;
         result
     }
 
+    /// Evaluates a complete expression and leaves its value on the stack.
+    fn eval_items(&mut self, items: &[Item<'a>]) -> Result<Value<'a>, Error> {
+        let base = self.sp;
+        self.run_items(items)?;
+        // The parser only emits well-formed expressions, which leave exactly one value.
+        if self.sp != base + 1 {
+            return Err(Error::InvalidSyntax);
+        }
+        Ok(self.stack[base])
+    }
+
     /// Runs RPN items. Operands are replaced by their result only after the
     /// result exists, so anything that allocates keeps its inputs rooted.
-    fn eval_items(&mut self, items: &[Item<'a>], base: usize) -> Result<Value<'a>, Error> {
+    fn run_items(&mut self, items: &[Item<'a>]) -> Result<(), Error> {
         let mut i = 0;
         while i < items.len() {
             let item = items[i];
@@ -973,26 +1185,141 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
                     self.sp -= bounds;
                     self.stack[self.sp - 1] = val;
                 }
+                Item::BuildList(n) => self.build(Kind::List, n as usize)?,
+                Item::BuildTuple(n) => self.build(Kind::Tuple, n as usize)?,
+                Item::BuildDict(n) => self.build(Kind::Dict, n as usize)?,
+                Item::IfElse { a, cond, b } => {
+                    let (a, cond, b) = (a as usize, cond as usize, b as usize);
+                    let parts = &items[i..i + a + cond + b];
+                    i += a + cond + b;
+                    let c = self.eval_items(&parts[a..a + cond])?;
+                    self.sp -= 1;
+                    let chosen = if self.truthy(c) {
+                        &parts[..a]
+                    } else {
+                        &parts[a + cond..]
+                    };
+                    self.eval_items(chosen)?;
+                }
+                Item::Comp {
+                    dict,
+                    targets,
+                    a,
+                    b,
+                    iter,
+                    cond,
+                } => {
+                    let lens = [a, b, targets, iter, cond].map(|n| n as usize);
+                    let total: usize = lens.iter().sum();
+                    let parts = &items[i..i + total];
+                    i += total;
+                    self.comprehension(dict, parts, lens)?;
+                }
             }
         }
+        Ok(())
+    }
 
-        // The parser only emits well-formed expressions, which leave exactly one value.
-        if self.sp != base + 1 {
-            return Err(Error::InvalidSyntax);
+    /// Runs a comprehension (see `Item::Comp`) and pushes the new list/dict.
+    fn comprehension(
+        &mut self,
+        dict: bool,
+        parts: &[Item<'a>],
+        lens: [usize; 5],
+    ) -> Result<(), Error> {
+        let [a, b, ntargets, iter, cond] = lens;
+        let (elem, rest) = parts.split_at(a);
+        let (value, rest) = rest.split_at(b);
+        let (target_items, rest) = rest.split_at(ntargets);
+        let (iter_items, cond_items) = rest.split_at(iter);
+
+        let mut targets = Targets {
+            names: [""; MAX_TARGETS],
+            count: ntargets,
+            unpack: ntargets > 1,
+        };
+        for (slot, item) in targets.names.iter_mut().zip(target_items) {
+            if let Item::Ident(name) = item {
+                *slot = name;
+            }
         }
-        Ok(self.stack[base])
+        let base = self.sp;
+        let it = self.eval_items(iter_items)?;
+        let result = self.new_container(if dict { Kind::Dict } else { Kind::List }, 0)?;
+        self.push(Value::Obj(result))?;
+        // Like Python 3, the loop variables don't leak: save what they were
+        // (kept on the stack, so the old values stay rooted)
+        let mut existed = [false; MAX_TARGETS];
+        for (k, &name) in targets.names().iter().enumerate() {
+            let old = self.get_scope_var(name);
+            existed[k] = old.is_ok();
+            self.push(old.unwrap_or(Value::None))?;
+        }
+        let saved = self.sp - ntargets;
+        if !dict && targets.count == 1 && targets.unpack {
+            targets.unpack = false;
+        }
+
+        let mut state = 0;
+        let outcome = loop {
+            // One pass: `Ok(false)` when the iterable is exhausted
+            let pass = (|| {
+                let Some(item) = self.iter_next(it, &mut state)? else {
+                    return Ok(false);
+                };
+                self.assign_targets(&targets, item)?;
+                if cond > 0 {
+                    let c = self.eval_items(cond_items)?;
+                    self.sp -= 1;
+                    if !self.truthy(c) {
+                        return Ok(true);
+                    }
+                }
+                let top = self.sp;
+                let k = self.eval_items(elem)?;
+                if dict {
+                    let v = self.eval_items(value)?;
+                    self.dict_set(result, k, v)?;
+                } else {
+                    self.list_append(result, k)?;
+                }
+                self.sp = top;
+                self.tick().map(|()| true)
+            })();
+            match pass {
+                Ok(true) => {}
+                Ok(false) => break Ok(()),
+                Err(e) => break Err(e),
+            }
+        };
+
+        // Restore (or remove) the loop variables
+        for (k, &name) in targets.names().iter().enumerate() {
+            if existed[k] {
+                self.set_var(name, self.stack[saved + k])?;
+            } else {
+                let _ = self.del_var(name);
+            }
+        }
+        outcome?;
+        self.sp = base;
+        self.push(Value::Obj(result))
     }
 
     /// Replaces the top two stack values with `lhs op rhs`.
     fn apply_bin(&mut self, op: BinOp) -> Result<(), Error> {
         let (lhs, rhs) = (self.stack[self.sp - 2], self.stack[self.sp - 1]);
-        let val =
-            if Self::is_str(lhs) || Self::is_str(rhs) || Self::is_bytes(lhs) || Self::is_bytes(rhs)
-            {
-                self.str_binop(op, lhs, rhs)?
-            } else {
-                binop(op, lhs, rhs)?
-            };
+        let val = if matches!(lhs, Value::Obj(_)) || matches!(rhs, Value::Obj(_)) {
+            self.container_binop(op, lhs, rhs)?
+        } else if Self::is_str(lhs)
+            || Self::is_str(rhs)
+            || Self::is_bytes(lhs)
+            || Self::is_bytes(rhs)
+        {
+            self.str_binop(op, lhs, rhs)?
+        } else {
+            binop(op, lhs, rhs)?
+        };
         self.sp -= 1;
         self.stack[self.sp - 1] = val;
         Ok(())
@@ -1014,6 +1341,9 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
             }
             Value::Str(_) | Value::HStr(_) => self.str_method(receiver, attr, args),
             Value::Bytes(_) | Value::HBytes(_) => self.bytes_method(receiver, attr, args),
+            Value::Obj(_) => self
+                .container_method(receiver, attr, args)
+                .unwrap_or(Err(Error::AttributeError)),
             _ => Err(Error::AttributeError),
         }
     }
@@ -1022,6 +1352,31 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
     /// compare among themselves; `==`/`!=` between other types are simply
     /// false/true; ordering between other types is a `TypeError`.
     fn compare(&self, op: CmpOp, lhs: Value<'a>, rhs: Value<'a>) -> Result<bool, Error> {
+        match op {
+            CmpOp::Is => return Ok(self.identical(lhs, rhs)),
+            CmpOp::IsNot => return Ok(!self.identical(lhs, rhs)),
+            _ => {}
+        }
+        if matches!(op, CmpOp::In | CmpOp::NotIn) {
+            if let Some(found) = self.contains(rhs, lhs) {
+                return Ok(found? == (op == CmpOp::In));
+            }
+        }
+        if matches!(lhs, Value::Obj(_)) || matches!(rhs, Value::Obj(_)) {
+            return match op {
+                CmpOp::Eq => Ok(self.equal(lhs, rhs)),
+                CmpOp::Ne => Ok(!self.equal(lhs, rhs)),
+                _ => {
+                    let ordering = self.seq_order(lhs, rhs)?;
+                    Ok(match op {
+                        CmpOp::Lt => ordering == CmpOrdering::Less,
+                        CmpOp::Le => ordering != CmpOrdering::Greater,
+                        CmpOp::Gt => ordering == CmpOrdering::Greater,
+                        _ => ordering != CmpOrdering::Less,
+                    })
+                }
+            };
+        }
         if matches!(op, CmpOp::In | CmpOp::NotIn) {
             let found = if let Some(hay) = self.bytes_of(rhs) {
                 // `5 in b` looks for a byte value, `b'ab' in b` for a sequence
@@ -1070,7 +1425,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
             CmpOp::Le => ordering != CmpOrdering::Greater,
             CmpOp::Gt => ordering == CmpOrdering::Greater,
             CmpOp::Ge => ordering != CmpOrdering::Less,
-            CmpOp::In | CmpOp::NotIn => unreachable!("handled above"),
+            CmpOp::In | CmpOp::NotIn | CmpOp::Is | CmpOp::IsNot => unreachable!("handled above"),
         })
     }
 
@@ -1099,6 +1454,9 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
         if let Some(result) = self.str_builtin(name, args) {
             return result;
         }
+        if let Some(result) = self.container_builtin(name, args) {
+            return result;
+        }
 
         match (name, args) {
             ("abs", [val]) => {
@@ -1106,6 +1464,8 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
                 return n.checked_abs().map(Value::Int).ok_or(Error::Overflow);
             }
             ("abs", _) => return Err(Error::TypeError),
+            ("bool", []) => return Ok(Value::Bool(false)),
+            ("bool", [val]) => return Ok(Value::Bool(self.truthy(*val))),
             ("min" | "max", [first, rest @ ..]) if !rest.is_empty() => {
                 let want = if name == "min" { CmpOp::Lt } else { CmpOp::Gt };
                 let mut best = *first;
@@ -1268,7 +1628,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
     /// functions and constants of the bridge.
     fn print_help(&mut self) {
         self.out.write_str(
-            "Built-in:\n  print(...)\n  help()\n  abs(x), min(a, b, ...), max(a, b, ...)\n  len(s), str(x), repr(x), int(x, [base]), ord(c), chr(n), bytes(x)\n",
+            "Built-in:\n  print(...)\n  help()\n  abs(x), min(a, b, ...), max(a, b, ...)\n  len(s), str(x), repr(x), int(x, [base]), ord(c), chr(n), bytes(x), bool(x)\n  list(x), tuple(x), dict(x), range(...), sorted(x), reversed(x), sum(x),\n  any(x), all(x), enumerate(x), zip(a, b)\n",
         );
 
         let mut funcs = self.funcs.iter().flatten().peekable();
@@ -1434,14 +1794,14 @@ mod tests {
     use super::*;
 
     struct MockOut {
-        buf: [u8; 512],
+        buf: [u8; 4096],
         len: usize,
     }
 
     impl MockOut {
         const fn new() -> Self {
             Self {
-                buf: [0; 512],
+                buf: [0; 4096],
                 len: 0,
             }
         }
@@ -1717,7 +2077,7 @@ print(nothing)
 
         // Parse and lexer errors report the line of the offending token
         assert_eq!(vm.eval("a = 1\nb = (a +\n"), Err(Error::UnexpectedToken));
-        assert_eq!(vm.error_line(), Some(2));
+        assert_eq!(vm.error_line(), Some(3));
         assert_eq!(
             vm.eval("a = 1\nb = 2\nc = 'open"),
             Err(Error::UnterminatedString)
@@ -2144,8 +2504,9 @@ print(fact(7), fib(7))
         let interp = core::mem::size_of::<Interpreter<'_, MockOut, MockHardware>>();
         let code = core::mem::size_of::<Code<'_>>();
         let parser = core::mem::size_of::<Parser<'_>>();
+        std::println!("interp={} code={} parser={}", interp, code, parser);
         assert!(interp <= 16384, "Interpreter is {} bytes", interp);
-        assert!(code <= 1024, "Code is {} bytes", code);
+        assert!(code <= 1600, "Code is {} bytes", code);
         assert!(parser <= 128, "Parser is {} bytes", parser);
     }
 
@@ -2314,7 +2675,7 @@ print(fact(7), fib(7))
         assert_eq!(vm.eval("help(1)"), Err(Error::TypeError));
         assert_eq!(
             out.as_str(),
-            "Built-in:\n  print(...)\n  help()\n  abs(x), min(a, b, ...), max(a, b, ...)\n  len(s), str(x), repr(x), int(x, [base]), ord(c), chr(n), bytes(x)\n\
+            "Built-in:\n  print(...)\n  help()\n  abs(x), min(a, b, ...), max(a, b, ...)\n  len(s), str(x), repr(x), int(x, [base]), ord(c), chr(n), bytes(x), bool(x)\n  list(x), tuple(x), dict(x), range(...), sorted(x), reversed(x), sum(x),\n  any(x), all(x), enumerate(x), zip(a, b)\n\
              Script functions:\n  blink(times, ms)\n\
              Modules (import them, then help(module)):\n  binascii\n\
              Hardware:\n  pin_write(pin, value) - Set an output pin\n  pin_read(pin) - Read a pin\n  \
@@ -2327,7 +2688,7 @@ print(fact(7), fib(7))
         Interpreter::new(&mut out).eval("help()").unwrap();
         assert_eq!(
             out.as_str(),
-            "Built-in:\n  print(...)\n  help()\n  abs(x), min(a, b, ...), max(a, b, ...)\n  len(s), str(x), repr(x), int(x, [base]), ord(c), chr(n), bytes(x)\n\
+            "Built-in:\n  print(...)\n  help()\n  abs(x), min(a, b, ...), max(a, b, ...)\n  len(s), str(x), repr(x), int(x, [base]), ord(c), chr(n), bytes(x), bool(x)\n  list(x), tuple(x), dict(x), range(...), sorted(x), reversed(x), sum(x),\n  any(x), all(x), enumerate(x), zip(a, b)\n\
              Modules (import them, then help(module)):\n  binascii\n"
         );
     }
@@ -2834,6 +3195,114 @@ print(outer(), count)
         ] {
             assert_eq!(run_err(src).0, err, "{}", src);
         }
+    }
+
+    /// Scripts in `tests/cpython/` must print exactly what CPython printed
+    /// into the `.out` file next to them (`make cpython-expected` updates them).
+    #[test]
+    fn test_cpython_conformance() {
+        macro_rules! case {
+            ($name:literal) => {
+                (
+                    $name,
+                    include_str!(concat!("../tests/cpython/", $name, ".py")),
+                    include_str!(concat!("../tests/cpython/", $name, ".out")),
+                )
+            };
+        }
+        for (name, src, expected) in [
+            case!("bytes"),
+            case!("containers"),
+            case!("readme_examples"),
+        ] {
+            let (out, result, _) = run_with_heap(src, 64 * 1024);
+            assert_eq!(result, Ok(()), "{}.py, output so far:\n{}", name, out);
+            assert_eq!(out, expected, "{}.py", name);
+        }
+    }
+
+    // ---- 5.3 containers (expected output checked with CPython) ----------
+
+    #[test]
+    fn test_containers_basics() {
+        assert_output(
+            "a = [1, 2, 3]\nb = a\nb.append(4)\nprint(a, len(a), a[-1], a[1:3])\n\
+             t = (1, 'two', (3,), [])\nprint(t, (), (5,), t[1])\n\
+             d = {'a': 1, 'b': [1, 2], 3: 'x'}\nd['c'] = 5\nd['a'] = 10\n\
+             print(d, d['b'], 'a' in d, d.get('z', 0))\n\
+             for k, v in d.items():\n    print(k, v)\n\
+             print(list(range(2, 10, 3)), range(3), [x * x for x in range(4)])\n\
+             print({k: k * 2 for k in range(3) if k}, sum(x for x in range(10)))\n\
+             x, y = 1, 2\nx, y = y, x\n(m, n) = [5, 6]\ni = j = 7\nprint(x, y, m, n, i, j)\n\
+             print('a,b,,c'.split(','), ' a b '.split(), '-'.join(['a', 'b']))\n\
+             print(sorted([(2, 'b'), (1, 'z')]), [1, 2] == [1, 2], (1, 2) < (1, 3))",
+            "[1, 2, 3, 4] 4 4 [2, 3]\n(1, 'two', (3,), []) () (5,) two\n\
+             {'a': 10, 'b': [1, 2], 3: 'x', 'c': 5} [1, 2] True 0\n\
+             a 10\nb [1, 2]\n3 x\nc 5\n\
+             [2, 5, 8] range(0, 3) [0, 1, 4, 9]\n{1: 2, 2: 4} 45\n\
+             2 1 5 6 7 7\n['a', 'b', '', 'c'] ['a', 'b'] a-b\n\
+             [(1, 'z'), (2, 'b')] True True\n",
+        );
+        // Loop variables of a comprehension don't leak (an existing one is kept)
+        assert_output(
+            "n = 'old'\nr = [n for n in range(3)]\nprint(n, r)",
+            "old [0, 1, 2]\n",
+        );
+        assert_eq!(
+            run_err("q = [z for z in 'ab']\nprint(z)").0,
+            Error::UnknownIdentifier
+        );
+    }
+
+    #[test]
+    fn test_containers_errors() {
+        for (src, err) in [
+            ("[1][5]", Error::IndexError),
+            ("{}['k']", Error::KeyError),
+            ("{[1]: 2}", Error::TypeError),
+            ("[1] + (2,)", Error::TypeError),
+            ("[].pop()", Error::IndexError),
+            ("a, b = [1, 2, 3]", Error::ValueError),
+            ("a, b = 1", Error::TypeError),
+            ("x = (1, 2)\nx[0] = 5", Error::TypeError),
+            ("sorted([1, 'a'])", Error::TypeError),
+            ("min([])", Error::ValueError),
+            ("[x for x in 5]", Error::TypeError),
+            ("for a, b in [1]:\n    pass", Error::TypeError),
+            ("[x for x in y for y in z]", Error::InvalidSyntax),
+            ("{1, 2}", Error::UnexpectedToken),
+        ] {
+            assert_eq!(run_err(src).0, err, "{}", src);
+        }
+    }
+
+    #[test]
+    fn test_gc_traces_containers() {
+        // Lists, dicts and their strings survive collections in a 1 KB heap
+        // while 300 temporary lists are created and dropped
+        let src = "keep = {'name': 'x' * 10, 'items': [str(i) for i in range(5)]}\n\
+                   i = 0\nwhile i < 300:\n    tmp = [i, str(i), (i, 'y' * 8)]\n    i += 1\n\
+                   keep['items'].append('last')\nprint(keep, tmp)";
+        let (out, result, collections) = run_with_heap(src, 1024);
+        assert_eq!(result, Ok(()));
+        assert_eq!(
+            out,
+            "{'name': 'xxxxxxxxxx', 'items': ['0', '1', '2', '3', '4', 'last']} \
+             [299, '299', (299, 'yyyyyyyy')]\n"
+        );
+        assert!(collections > 5, "only {} collections", collections);
+
+        // A list that contains itself is printed with a depth limit, and a
+        // cycle is collected once unreachable
+        let src = "a = [1]\na.append(a)\nprint(len(a), a[1][1][0])\na = None\n\
+                   i = 0\nwhile i < 100:\n    t = [0] * 20\n    i += 1\nprint('ok')";
+        let (out, result, _) = run_with_heap(src, 512);
+        assert_eq!(result, Ok(()));
+        assert_eq!(out, "2 1\nok\n");
+
+        // A list growing past the heap fails cleanly
+        let (_, result, _) = run_with_heap("a = []\nwhile True:\n    a.append(1)", 512);
+        assert_eq!(result, Err(Error::OutOfMemory));
     }
 
     #[test]

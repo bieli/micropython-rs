@@ -361,8 +361,10 @@ impl<'a, O: Output, H: HardwareBridge> Repl<'a, O, H> {
         let line = &self.arena.pending()[line_start..];
         let blank = line.iter().all(|&b| b == b' ');
         let opens_block = ends_with_colon(line);
+        // `x = [1,` continues on the next line until the brackets are closed
+        let open_brackets = brackets_open(self.arena.pending());
 
-        if in_block && !blank || !in_block && opens_block {
+        if open_brackets || in_block && !blank || !in_block && opens_block {
             // Continue the block on the next line
             if self.arena.push(b'\n') {
                 self.write("... ");
@@ -634,6 +636,36 @@ fn hex_decode(hex: &[u8], out: &mut [u8]) -> Option<usize> {
 
 /// True if a line ends with `:` (ignoring trailing spaces and a comment),
 /// i.e. it starts an indented block.
+/// True if `code` has more opening than closing brackets (outside strings
+/// and comments).
+fn brackets_open(code: &[u8]) -> bool {
+    let mut depth = 0i32;
+    let mut quote = None;
+    let mut iter = code.iter();
+    while let Some(&b) = iter.next() {
+        match (quote, b) {
+            (Some(_), b'\\') => {
+                iter.next();
+            }
+            (Some(q), _) if b == q => quote = None,
+            (Some(_), b'\n') => quote = None, // unterminated: the parser reports it
+            (Some(_), _) => {}
+            (None, b'\'' | b'"') => quote = Some(b),
+            (None, b'#') => {
+                for &c in iter.by_ref() {
+                    if c == b'\n' {
+                        break;
+                    }
+                }
+            }
+            (None, b'(' | b'[' | b'{') => depth += 1,
+            (None, b')' | b']' | b'}') => depth -= 1,
+            _ => {}
+        }
+    }
+    depth > 0
+}
+
 fn ends_with_colon(line: &[u8]) -> bool {
     let code = match line.iter().position(|&b| b == b'#') {
         Some(hash) => &line[..hash],

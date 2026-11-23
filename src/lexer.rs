@@ -26,6 +26,16 @@ pub enum Token<'a> {
     From,
     As,
     Global,
+    For,
+    Del,
+    Try,
+    Except,
+    Finally,
+    Raise,
+    Class,
+    With,
+    Is,
+    Lambda,
     In,
     And,
     Or,
@@ -63,6 +73,8 @@ pub enum Token<'a> {
     RParen,
     LBracket,
     RBracket,
+    LBrace,
+    RBrace,
     Comma,
     Colon,
     /// `.` in `module.name`
@@ -90,6 +102,8 @@ pub struct Lexer<'a> {
     line_indent: u32,
     /// Indentation of the line the most recently lexed token is on.
     token_indent: u32,
+    /// Open brackets: inside `()`, `[]` and `{}` newlines don't end statements.
+    depth: u16,
 }
 
 impl<'a> Lexer<'a> {
@@ -102,6 +116,7 @@ impl<'a> Lexer<'a> {
             at_line_start: true,
             line_indent: 0,
             token_indent: 0,
+            depth: 0,
         }
     }
 
@@ -155,6 +170,24 @@ impl<'a> Lexer<'a> {
                     }
                     self.advance();
                 }
+                // Implicit line joining inside brackets
+                '\n' if self.depth > 0 => {
+                    self.advance();
+                }
+                '#' if self.depth > 0 => {
+                    while self.peek().is_some_and(|c| c != '\n') {
+                        self.advance();
+                    }
+                }
+                // Explicit line joining: a backslash at the end of a line
+                '\\' if matches!(self.src.as_bytes().get(self.pos + 1), Some(b'\n' | b'\r')) => {
+                    self.advance();
+                    while self.peek().is_some_and(|c| c != '\n') {
+                        self.advance();
+                    }
+                    self.advance();
+                    self.at_line_start = false;
+                }
                 _ => break,
             }
         }
@@ -169,10 +202,22 @@ impl<'a> Lexer<'a> {
         }
 
         let token = match ch {
-            '(' => Token::LParen,
-            ')' => Token::RParen,
-            '[' => Token::LBracket,
-            ']' => Token::RBracket,
+            '(' | '[' | '{' => {
+                self.depth = self.depth.saturating_add(1);
+                match ch {
+                    '(' => Token::LParen,
+                    '[' => Token::LBracket,
+                    _ => Token::LBrace,
+                }
+            }
+            ')' | ']' | '}' => {
+                self.depth = self.depth.saturating_sub(1);
+                match ch {
+                    ')' => Token::RParen,
+                    ']' => Token::RBracket,
+                    _ => Token::RBrace,
+                }
+            }
             ',' => Token::Comma,
             ':' => Token::Colon,
             ';' => Token::Semicolon,
@@ -240,6 +285,10 @@ impl<'a> Lexer<'a> {
     /// A string literal, returned as written (escape sequences such as `\n`
     /// are decoded by the interpreter, so plain literals stay zero-copy).
     fn lex_string(&mut self, quote: char) -> Result<Token<'a>, Error> {
+        let q = quote as u8;
+        if self.src.as_bytes()[self.pos..].starts_with(&[q, q]) {
+            return self.lex_long_string(q);
+        }
         let start = self.pos;
         while let Some(ch) = self.peek() {
             if ch == quote {
@@ -256,6 +305,28 @@ impl<'a> Lexer<'a> {
                 if self.peek().is_some_and(|c| c != '\n') {
                     self.advance();
                 }
+            }
+        }
+        Err(Error::UnterminatedString)
+    }
+
+    /// A triple-quoted string (the first quote is already consumed); it may
+    /// span lines.
+    fn lex_long_string(&mut self, q: u8) -> Result<Token<'a>, Error> {
+        self.advance();
+        self.advance();
+        let start = self.pos;
+        while let Some(ch) = self.peek() {
+            if self.src.as_bytes()[self.pos..].starts_with(&[q, q, q]) {
+                let end = self.pos;
+                for _ in 0..3 {
+                    self.advance();
+                }
+                return Ok(Token::Str(&self.src[start..end]));
+            }
+            self.advance();
+            if ch == '\\' && self.peek().is_some() {
+                self.advance();
             }
         }
         Err(Error::UnterminatedString)
@@ -339,6 +410,16 @@ impl<'a> Lexer<'a> {
             "from" => Token::From,
             "as" => Token::As,
             "global" => Token::Global,
+            "for" => Token::For,
+            "del" => Token::Del,
+            "try" => Token::Try,
+            "except" => Token::Except,
+            "finally" => Token::Finally,
+            "raise" => Token::Raise,
+            "class" => Token::Class,
+            "with" => Token::With,
+            "is" => Token::Is,
+            "lambda" => Token::Lambda,
             "in" => Token::In,
             "and" => Token::And,
             "or" => Token::Or,
@@ -524,6 +605,38 @@ mod tests {
             &tokens[..count],
             &[Token::Ident("d"), Token::Dot, Token::Ident("line")]
         );
+    }
+
+    #[test]
+    fn test_brackets_join_lines_and_long_strings() {
+        let (tokens, count) = collect_tokens::<16>("x = [1,\n  2, # two\n  {}]\ny = 1 + \\\n 2");
+        assert_eq!(
+            &tokens[..count],
+            &[
+                Token::Ident("x"),
+                Token::Assign,
+                Token::LBracket,
+                Token::Int(1),
+                Token::Comma,
+                Token::Int(2),
+                Token::Comma,
+                Token::LBrace,
+                Token::RBrace,
+                Token::RBracket,
+                Token::Newline,
+                Token::Ident("y"),
+                Token::Assign,
+                Token::Int(1),
+                Token::Plus,
+                Token::Int(2),
+            ]
+        );
+        let mut lexer = Lexer::new("'''a\n'b'''\n\"\" '''x");
+        assert_eq!(lexer.next_token(), Ok(Token::Str("a\n'b")));
+        assert_eq!(lexer.next_token(), Ok(Token::Newline));
+        assert_eq!(lexer.token_line(), 2);
+        assert_eq!(lexer.next_token(), Ok(Token::Str("")));
+        assert_eq!(lexer.next_token(), Err(Error::UnterminatedString));
     }
 
     #[test]

@@ -1,0 +1,15 @@
+b'hello' 5 104 111 b'el' b'' b'llo'
+b'hello' b'hello' b'hello world' b'hellohello' b'abab' b''
+b'\x00\xff\n\t\\' b"it's" b'say "hi"' b'both \' and "'
+b'AA' 3 b'\\q' 2 b'\\u263a' 6
+True False False True True
+True False True True True
+68656c6c6f 01ab hello hello b'za\xc5\xbc\xc3\xb3\xc5\x82\xc4\x87'
+10 zażółć True
+b'0010fe' b'Hello' b'\x00\xff'
+b'round trip'
+b'' b'\x00\x00\x00' b'x' b'\xc4\x85b'
+True True 2 -1
+b'\x00A\x00A\x00A\x00A\x00A' 10
+non-empty is true
+b'a\x00' b'\x7f\x80'

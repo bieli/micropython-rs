@@ -84,7 +84,7 @@ Thonny reads and saves device files by running Python helper code on the board (
 |---|---------|-----------|--------|
 | 5.1 | **Real strings** on a fixed-size heap with a garbage collector: escapes, `+`/`*`, `len`, indexing/slicing, `in`, `str()`/`repr()`, `int()`/`ord()`/`chr()`, string methods | Thonny 3.2.7+ | ✅ |
 | 5.2 | **`bytes`**: `b'...'` literals, `binascii.hexlify`/`unhexlify`, `encode()`/`decode()`, `hex()` | Thonny 3.2.7+ (file transfer) | ✅ |
-| 5.3 | **Containers**: list, tuple, dict, `for` with `range()`, list/dict comprehensions, `split`/`join` | Thonny 3.2.7+ | ⬜ |
+| 5.3 | **Containers**: list, tuple, dict, `for` with `range()`, list/dict comprehensions, `split`/`join`, `del`, `is`, `x if c else y` | Thonny 3.2.7+ | ✅ |
 | 5.4 | **Exceptions**: `try`/`except`/`else`/`finally`, `OSError`/`ImportError`, `except X as e`, `raise` | Thonny 3.2.7+ | ⬜ |
 | 5.5 | **Built-ins**: keyword arguments (`print(..., sep=, end=)`), `hasattr`, `globals()`, `del`, `id`, `isinstance` | Thonny 3.2.7+ | ⬜ |
 | 5.6 | **`os` and `open()`** on the flash file system | Thonny 3.2.7+, `mpremote cp/ls` | ⬜ |
