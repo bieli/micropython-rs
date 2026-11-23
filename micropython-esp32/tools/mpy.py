@@ -10,6 +10,8 @@ firmware doesn't need reflashing to try or replace a script.
     tools/mpy.py cat                       # print the saved main.py
     tools/mpy.py erase                     # remove main.py (the built-in script runs again)
     tools/mpy.py reset                     # soft reset: clears variables, reruns main.py
+    tools/mpy.py watch scripts/voltmeter.py         # rerun the file on the board at every save
+    tools/mpy.py watch scripts/voltmeter.py --save  # ... and store each version as main.py
 
 Options: --port /dev/ttyUSB0 (default: /dev/ttyACM0 or $MPY_PORT), --baud 115200.
 Needs pyserial (`pip install pyserial`). Exit code 1 if the script raised an error.
@@ -63,8 +65,8 @@ class Board:
         self.read_until(b"soft reboot\r\n")
         self.read_until(RAW_PROMPT)
 
-    def execute(self, code, stream=True):
-        """Runs `code` in the raw REPL. Returns (output, error) bytes."""
+    def send_code(self, code):
+        """Sends `code` to the raw REPL and starts it (Ctrl-D, then `OK`)."""
         data = code.encode() if isinstance(code, str) else code
         for i in range(0, len(data), 256):
             self.serial.write(data[i : i + 256])
@@ -73,6 +75,10 @@ class Board:
         reply = self.serial.read(2)
         if reply != b"OK":
             raise RuntimeError(f"board did not accept the code: {reply!r}")
+
+    def execute(self, code, stream=True):
+        """Runs `code` in the raw REPL. Returns (output, error) bytes."""
+        self.send_code(code)
 
         def show(chunk):
             if stream and chunk != b"\x04":
@@ -85,15 +91,127 @@ class Board:
         return output, error
 
 
+class Watcher:
+    """`watch`: runs a file on the board and restarts it whenever it's saved.
+
+    The board's output is shown live. A running program, even an endless
+    loop, is stopped with Ctrl-C before the new version starts.
+    """
+
+    def __init__(self, board, path, save):
+        self.board = board
+        self.path = path
+        self.save = save
+        self.running = False
+        self.section = 0  # 0 = program output, 1 = error text, 2 = waiting for ">"
+        self.error = b""
+
+    def run_forever(self):
+        last_mtime = None
+        print(f"watching {self.path} - save it to rerun it on the board, Ctrl-C to stop")
+        while True:
+            try:
+                mtime = os.stat(self.path).st_mtime
+            except FileNotFoundError:
+                mtime = None
+            if mtime is not None and mtime != last_mtime:
+                last_mtime = mtime
+                time.sleep(0.1)  # let the editor finish writing
+                self.restart()
+            self.pump(0.2)
+
+    def restart(self):
+        with open(self.path, "rb") as f:
+            code = f.read()
+        # The board runs a subset of Python, so CPython finds syntax errors first
+        try:
+            compile(code, self.path, "exec")
+        except SyntaxError as err:
+            print(f"\n{self.path}:{err.lineno}: syntax error: {err.msg} - not uploaded")
+            return
+        if self.running:
+            self.stop()
+        self.board.soft_reset()
+        if self.save:
+            _, error = self.board.execute(b"#@save\n" + code, stream=False)
+            if error:
+                print(error.decode("utf-8", "replace").strip())
+        stamp = time.strftime("%H:%M:%S")
+        saved = " and saved as main.py" if self.save else ""
+        print(f"\n--- {stamp} running {self.path}{saved} ---")
+        self.board.send_code(code)
+        self.running = True
+        self.section = 0
+        self.error = b""
+
+    def stop(self):
+        """Interrupts the running program and waits for the raw prompt."""
+        self.board.serial.write(b"\x03")
+        deadline = time.time() + 5
+        while self.running and time.time() < deadline:
+            self.pump(0.1)
+        if self.running:
+            raise TimeoutError("the program didn't stop after Ctrl-C")
+
+    def pump(self, seconds):
+        """Shows the board's output for up to `seconds`."""
+        deadline = time.time() + seconds
+        while time.time() < deadline:
+            data = self.board.serial.read(256)
+            if not data:
+                continue
+            if not self.running:
+                continue
+            for byte in data:
+                self.feed(byte)
+
+    def feed(self, byte):
+        # Raw REPL reply: output, \x04, error text, \x04, ">"
+        if self.section == 0:
+            if byte == 4:
+                self.section = 1
+            else:
+                sys.stdout.write(chr(byte) if byte < 128 else "?")
+                sys.stdout.flush()
+        elif self.section == 1:
+            if byte == 4:
+                self.section = 2
+            else:
+                self.error += bytes([byte])
+        elif byte == ord(">"):
+            self.running = False
+            error = self.error.decode("utf-8", "replace").strip()
+            if error == "KeyboardInterrupt":
+                print("--- stopped ---")
+            elif error:
+                print(f"--- {error} ---")
+            else:
+                print("--- program finished ---")
+
+    def finish(self):
+        """Ctrl-C on the host: stop the program; with --save, let main.py run."""
+        if self.running:
+            self.stop()
+        if self.save:
+            self.board.soft_reset()
+            self.board.exit_raw()
+            time.sleep(0.3)
+            self.board.serial.write(b"\x04")  # soft reset in the normal REPL runs main.py
+            print("\nboard runs the saved main.py on its own now")
+        else:
+            print("\nstopped watching")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--port", default=os.environ.get("MPY_PORT", "/dev/ttyACM0"))
     parser.add_argument("--baud", type=int, default=115200)
-    parser.add_argument("command", choices=["run", "exec", "save", "cat", "erase", "reset"])
-    parser.add_argument("arg", nargs="?", help="file (run/save) or code (exec)")
+    parser.add_argument("command", choices=["run", "exec", "save", "cat", "erase", "reset", "watch"])
+    parser.add_argument("arg", nargs="?", help="file (run/save/watch) or code (exec)")
+    parser.add_argument("--save", action="store_true", help="watch: also store each version as main.py")
     args = parser.parse_args()
 
-    if args.command in ("run", "save", "exec") and not args.arg:
+    if args.command in ("run", "save", "exec", "watch") and not args.arg:
         parser.error(f"{args.command} needs an argument")
 
     try:
@@ -110,6 +228,16 @@ def main():
             "    make flash FEATURES=tft      # TTGO T-Display (plain ESP32 boards: make flash)\n"
             "If more than one board is connected, pick the right one with --port."
         )
+    if args.command == "watch":
+        watcher = Watcher(board, args.arg, args.save)
+        try:
+            watcher.run_forever()
+        except KeyboardInterrupt:
+            watcher.finish()
+            if not args.save:
+                board.exit_raw()
+        return 0
+
     try:
         if args.command == "reset":
             board.soft_reset()
