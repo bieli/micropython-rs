@@ -164,6 +164,13 @@ const TTGO_FNS: &[HwFn] = micropython_esp32::board_functions!(
         "Fill a rectangle in the current color"
     ),
     HwFn::new("backlight", "on", "Display backlight on/off"),
+    HwFn::with_args(
+        "battery_mv",
+        0,
+        1,
+        "[samples]",
+        "Battery voltage in mV (GPIO34 divider)"
+    ),
 );
 
 /// The TTGO's two buttons (pressed = 0) and its battery voltage divider,
@@ -183,6 +190,28 @@ struct TtgoHardware<'a, 'd> {
     board: Board<'d>,
     buttons: Buttons,
     console: &'a RefCell<TftConsole<'d>>,
+}
+
+/// GPIO14 connects the TTGO's battery voltage divider (2 x 100 kOhm) to GPIO34.
+#[cfg(feature = "tft")]
+const TTGO_ADC_EN: u8 = 14;
+#[cfg(feature = "tft")]
+const TTGO_BAT_ADC: i64 = 34;
+
+#[cfg(feature = "tft")]
+impl TtgoHardware<'_, '_> {
+    /// Battery voltage: the divider halves it, so the ADC reading is doubled.
+    /// The divider is only switched on while measuring, so it doesn't drain
+    /// the battery.
+    fn battery_mv(&mut self, samples: i64) -> Result<i64, Error> {
+        let on = [Arg::Int(TTGO_ADC_EN as i64), Arg::Int(1)];
+        self.board.call("pin_write", &on)?;
+        self.board.sleep_ms(2)?;
+        let result = self.board.adc_mv(TTGO_BAT_ADC, samples);
+        let off = [Arg::Int(TTGO_ADC_EN as i64), Arg::Int(0)];
+        self.board.call("pin_write", &off)?;
+        Ok(result? * 2)
+    }
 }
 
 #[cfg(feature = "tft")]
@@ -206,6 +235,14 @@ impl HardwareBridge for TtgoHardware<'_, '_> {
             "text" => console.draw_text(coord(0)?, coord(1)?, args[2].str()?),
             "rect" => console.fill_rect(coord(0)?, coord(1)?, size(2)?, size(3)?, true),
             "backlight" => console.set_backlight(int(0)? != 0),
+            "battery_mv" => {
+                drop(console);
+                let samples = match args.first() {
+                    Some(arg) => arg.int()?,
+                    None => 16,
+                };
+                return self.battery_mv(samples).map(Some);
+            }
             _ => {
                 drop(console);
                 return self.board.call(name, args);
