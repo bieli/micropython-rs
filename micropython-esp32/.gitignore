@@ -24,3 +24,6 @@ target/
 
 # Ignore .DS_Store file in mac
 **/.DS_Store
+
+# Private experiments (not part of the project)
+scripts/voltmeter_dark.py
