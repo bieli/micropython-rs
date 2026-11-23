@@ -382,6 +382,7 @@ make flash PORT=/dev/ttyUSB0                 # pick a serial port explicitly
 
 make build                                   # build only
 make monitor                                 # serial monitor only (CTRL+R reset, CTRL+C exit)
+make erase-files                             # delete all files on the board (keeps the firmware)
 make clean                                   # remove build artifacts
 ```
 
@@ -389,7 +390,7 @@ make clean                                   # remove build artifacts
 |---------------|---------|---------|
 | `FEATURES` | *(empty)* | Cargo features passed as `--features ...` (e.g. `tft`) |
 | `SCRIPT` | *(empty: the board's demo)* | Python file to embed, relative to `micropython-esp32/`. It must be inside the repository, because the Docker build only sees the repository |
-| `KEEP_MAIN` | *(empty)* | `KEEP_MAIN=1` keeps a `main.py` saved in flash. By default `make flash` erases it, so the new build runs its embedded script |
+| `ERASE_FILES` | *(empty)* | Files on the board survive `make flash`. `ERASE_FILES=1` deletes them all (then the embedded `SCRIPT` runs at boot, as no `main.py` is left); `make erase-files` does the same without flashing |
 | `PORT` | *(empty, espflash picks the saved port)* | Serial port for `flash` / `monitor` |
 
 The `SCRIPT` file is compiled into the firmware (`include_str!`). To change scripts without reflashing, use the REPL
@@ -448,6 +449,10 @@ tools/mpy.py save scripts/blink.py       # store as main.py in flash: it runs at
 tools/mpy.py cat                         # print the saved main.py
 tools/mpy.py erase                       # remove it (the built-in script runs again)
 tools/mpy.py reset                       # soft reset
+tools/mpy.py ls                          # files on the board (see "Files on the board")
+tools/mpy.py put lib.py                  # copy a file to the board
+tools/mpy.py get data.txt                # copy a file from the board
+tools/mpy.py rm old.py                   # delete a file on the board
 
 mpremote connect /dev/ttyACM0 run scripts/blink.py
 mpremote connect /dev/ttyACM0 exec "print(ticks_ms())"
@@ -484,12 +489,61 @@ Thonny's own MicroPython mode (file browser, "Save to device") doesn't work yet:
 that needs classes, `try`/`except`, lists, dicts and the `os` module, which the interpreter doesn't support yet.
 
 `tools/mpy.py` needs `pyserial` and takes `--port` (default `/dev/ttyACM0`, or `$MPY_PORT`). It exits with status 1
-when the script raises an error. `mpremote`'s file commands (`cp`, `ls`, `fs`) don't work, because the firmware has no
-file system or `os` module; use `tools/mpy.py save` instead. Like with MicroPython, `mpremote` soft-resets the board
+when the script raises an error. `mpremote`'s file commands (`cp`, `ls`, `fs`) don't work yet, because they run Python
+helper code that needs the `os` module and more of the language; use `tools/mpy.py ls/put/get/rm`. Like with MicroPython, `mpremote` soft-resets the board
 before each command unless you add `resume`.
 
-`main.py` is stored in the `nvs` flash partition (24 KB max) with a checksum. If it hangs the board, press Ctrl-C at
-boot, or run `tools/mpy.py erase`.
+If `main.py` hangs the board, press Ctrl-C at boot, or run `tools/mpy.py erase`.
+
+### Files on the board
+
+The firmware has a small flat file system (no directories) in the `vfs` flash partition, defined in
+[`micropython-esp32/partitions.csv`](micropython-esp32/partitions.csv): a 3 MB app partition plus 960 KB for files,
+so the same layout fits ESP32 boards with 4 MB or more flash. `main.py` lives there and runs at boot.
+
+```bash
+tools/mpy.py ls                          # list files
+tools/mpy.py put scripts/calculator.py   # copy a file to the board (as calculator.py)
+tools/mpy.py put notes.txt data.txt      # ... under another name
+tools/mpy.py get data.txt                # copy it back to the PC
+tools/mpy.py rm data.txt                 # delete it
+tools/mpy.py save scripts/voltmeter.py   # = put as main.py
+```
+
+```text
+$ tools/mpy.py ls
+main.py 1512
+calculator.py 4780
+# 2 of 30 files, max 32704 bytes each
+```
+
+| Property | Value |
+|----------|-------|
+| Files | Up to 30, flat (no directories), names of 1–40 characters from `A-Z a-z 0-9 . _ -` |
+| File size | Up to 32 704 bytes each (one 32 KB slot per file) |
+| Crash safety | A new version is written to a free slot and committed last; the old one is dropped only after that. A reset or power cut while saving keeps the previous version (tested by resetting the board in the middle of an upload) |
+| Wear | Each save goes to the next free slot, so rewriting `main.py` spreads over the whole partition |
+| Integrity | Every file has a checksum; a damaged file reads as `OSError: file corrupted` |
+| Transfer | Hex-encoded in 2 KB chunks (binary-safe): about 4 KB/s up and 5 KB/s down at 115 200 baud |
+| Errors | `OSError: no such file`, `file too large`, `bad file name`, `no free file slot` |
+
+* Saving needs one free slot, even to replace a file, because the new version is written before the old one is
+  dropped. With 30 files, delete one first.
+* Files survive `make flash`; `make flash ERASE_FILES=1` or `make erase-files` deletes them all.
+* A `main.py` saved by older firmware (in the `nvs` partition) is moved into the file system at the first boot.
+* If the firmware is flashed without `partitions.csv` (no `vfs` partition), it says so at boot and runs without files.
+* Scripts can't open files yet (`open()`, `os`); that's the next step towards Thonny support (see below).
+
+The file system itself is hardware-independent code in the core library
+([`src/flatfs.rs`](src/flatfs.rs)): any board provides a `Flash` implementation (read, write into erased flash,
+erase 4 KB sectors). Its tests run on the PC against a simulated NOR flash, including a power cut at every
+possible write during a replace.
+
+**Thonny.** Thonny reads and saves device files by running Python helper code on the board. Thonny 3.2.7 (Ubuntu
+20.04) needs strings with escape sequences, `bytes`, a dict comprehension, `print(..., sep=, end=)`, `repr()`,
+`try`/`except`, `del`, `open()` file objects and `binascii`; Thonny 4.x/5.x additionally need classes,
+`@classmethod`, exception classes, list comprehensions and slicing. The flat file system matches Thonny's
+"device without directories" mode, so supporting those language features is what's left.
 
 ### Example scripts
 
@@ -719,12 +773,13 @@ print('stopped after', ticks_ms(), 'ms')
 | `micropython-esp32/src/buttons.rs` | The `buttons` module: debouncing, short/long press detection and the event queue |
 | `micropython-esp32/src/repl.rs` | The REPL: boot script, line editing, blocks, paste mode, soft reset, and the raw REPL protocol |
 | `micropython-esp32/src/serial_input.rs` | UART0 receive interrupt: fills a 2 KB ring buffer and sets the global `ABORT` flag on Ctrl-C |
-| `micropython-esp32/src/script_store.rs` | `main.py` in the `nvs` flash partition (`esp-storage`), with a header and checksum |
+| `micropython-esp32/src/storage.rs` | Finds the `vfs` partition, implements the file system's `Flash` trait with `esp-storage`, and moves an old `nvs` `main.py` into the file system |
+| `micropython-esp32/partitions.csv` | Partition table: `nvs`, `phy_init`, 3 MB `factory` app, 960 KB `vfs` for files |
 | `micropython-esp32/tools/mpy.py` | Host tool: run, save, show and erase scripts over USB serial |
 | `micropython-esp32/scripts/` | The demo and example scripts |
 | `micropython-esp32/build.rs` | Picks the script (`MPY_SCRIPT`, or the board's demo) and hands its path to `include_str!` |
 | `micropython-esp32/Cargo.toml` | Declares the `tft` feature. `mipidsi`, `embedded-graphics` and `embedded-hal-bus` are optional dependencies, so boards without a display don't pull them in |
-| `micropython-esp32/Makefile` | Docker build and host flash/monitor, with the `FEATURES`, `SCRIPT`, `KEEP_MAIN` and `PORT` variables |
+| `micropython-esp32/Makefile` | Docker build and host flash/monitor (with `partitions.csv`), with the `FEATURES`, `SCRIPT`, `ERASE_FILES` and `PORT` variables |
 
 #### How the hardware layer works
 
@@ -862,7 +917,8 @@ I (36) boot: Partition Table:
 I (39) boot: ## Label            Usage          Type ST Offset   Length
 I (45) boot:  0 nvs              WiFi data        01 02 00009000 00006000
 I (51) boot:  1 phy_init         RF data          01 01 0000f000 00001000
-I (58) boot:  2 factory          factory app      00 00 00010000 00fa0000
+I (58) boot:  2 factory          factory app      00 00 00010000 00300000
+I (64) boot:  3 vfs              Unknown data     01 06 00310000 000f0000
 I (65) esp_image: segment 0: paddr=00010020 vaddr=3f400020 size=02084h (  8324) map
 I (75) esp_image: segment 1: paddr=000120ac vaddr=3ffb0000 size=004cch (  1228) load
 I (80) esp_image: segment 2: paddr=00012580 vaddr=40080000 size=013b8h (  5048) load

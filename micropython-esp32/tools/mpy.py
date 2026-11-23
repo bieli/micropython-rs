@@ -9,6 +9,11 @@ firmware doesn't need reflashing to try or replace a script.
     tools/mpy.py save scripts/blink.py     # store as main.py in flash (runs at boot)
     tools/mpy.py cat                       # print the saved main.py
     tools/mpy.py erase                     # remove main.py (the built-in script runs again)
+    tools/mpy.py ls                        # list the files on the board
+    tools/mpy.py put lib/tools.py          # copy a file to the board (as tools.py)
+    tools/mpy.py put local.txt remote.txt  # ... under another name
+    tools/mpy.py get remote.txt [local]    # copy a file from the board
+    tools/mpy.py rm remote.txt             # delete a file on the board
     tools/mpy.py reset                     # soft reset: clears variables, reruns main.py
     tools/mpy.py watch scripts/voltmeter.py         # rerun the file on the board at every save
     tools/mpy.py watch scripts/voltmeter.py --save  # ... and store each version as main.py
@@ -28,6 +33,12 @@ except ImportError:
     sys.exit("tools/mpy.py needs pyserial: pip install pyserial")
 
 RAW_PROMPT = b"raw REPL; CTRL-B to exit\r\n>"
+# Data bytes per `#@write` (sent as twice as many hex characters)
+PUT_CHUNK = 2048
+
+
+class FileCommandError(Exception):
+    pass
 
 
 class Board:
@@ -75,6 +86,25 @@ class Board:
         reply = self.serial.read(2)
         if reply != b"OK":
             raise RuntimeError(f"board did not accept the code: {reply!r}")
+
+    def command(self, code):
+        """Runs a `#@` file command; returns its output, raises on an error."""
+        output, error = self.execute(code, stream=False)
+        if error:
+            raise FileCommandError(error.decode("utf-8", "replace").strip())
+        return output
+
+    def put(self, data, name):
+        """Uploads bytes as file `name` (hex-encoded in chunks, so any byte is safe)."""
+        self.command("#@open " + name)
+        for i in range(0, len(data), PUT_CHUNK):
+            self.command("#@write " + data[i : i + PUT_CHUNK].hex())
+        written = int(self.command("#@close").decode() or "-1")
+        if written != len(data):
+            raise FileCommandError(f"board stored {written} bytes, expected {len(data)}")
+
+    def get(self, name):
+        return bytes.fromhex(self.command("#@get " + name).decode())
 
     def execute(self, code, stream=True):
         """Runs `code` in the raw REPL. Returns (output, error) bytes."""
@@ -202,16 +232,40 @@ class Watcher:
             print("\nstopped watching")
 
 
+def file_command(board, args):
+    if args.command == "ls":
+        sys.stdout.write(board.command("#@ls").decode("utf-8", "replace").replace("\r\n", "\n"))
+    elif args.command in ("put", "save"):
+        with open(args.arg, "rb") as f:
+            data = f.read()
+        name = "main.py" if args.command == "save" else (args.arg2 or os.path.basename(args.arg))
+        board.put(data, name)
+        print(f"saved {name} ({len(data)} bytes)")
+    elif args.command == "get":
+        data = board.get(args.arg)
+        local = args.arg2 or os.path.basename(args.arg)
+        with open(local, "wb") as f:
+            f.write(data)
+        print(f"{args.arg} -> {local} ({len(data)} bytes)")
+    elif args.command == "rm":
+        board.command("#@rm " + args.arg)
+        print(f"removed {args.arg}")
+    return 0
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--port", default=os.environ.get("MPY_PORT", "/dev/ttyACM0"))
     parser.add_argument("--baud", type=int, default=115200)
-    parser.add_argument("command", choices=["run", "exec", "save", "cat", "erase", "reset", "watch"])
-    parser.add_argument("arg", nargs="?", help="file (run/save/watch) or code (exec)")
+    parser.add_argument(
+        "command", choices=["run", "exec", "save", "cat", "erase", "reset", "watch", "ls", "put", "get", "rm"]
+    )
+    parser.add_argument("arg", nargs="?", help="file (run/save/watch/put/get/rm) or code (exec)")
+    parser.add_argument("arg2", nargs="?", help="put/get: name on the other side")
     parser.add_argument("--save", action="store_true", help="watch: also store each version as main.py")
     args = parser.parse_args()
 
-    if args.command in ("run", "save", "exec", "watch") and not args.arg:
+    if args.command in ("run", "save", "exec", "watch", "put", "get", "rm") and not args.arg:
         parser.error(f"{args.command} needs an argument")
 
     try:
@@ -239,6 +293,11 @@ def main():
         return 0
 
     try:
+        if args.command in ("ls", "put", "get", "rm", "save"):
+            try:
+                return file_command(board, args)
+            except FileCommandError as err:
+                sys.exit(f"Error: {err}")
         if args.command == "reset":
             board.soft_reset()
             print("soft reset done")
@@ -249,9 +308,6 @@ def main():
                 code = f.read()
         elif args.command == "exec":
             code = args.arg.encode()
-        elif args.command == "save":
-            with open(args.arg, "rb") as f:
-                code = b"#@save\n" + f.read()
         elif args.command == "cat":
             code = b"#@cat"
         else:
@@ -270,4 +326,9 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except BrokenPipeError:
+        # Output piped into e.g. `head`, which closed early: not an error
+        sys.stderr.close()
+        sys.exit(0)

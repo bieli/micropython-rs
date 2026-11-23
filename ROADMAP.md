@@ -73,7 +73,7 @@ Phase 4 follow-ups found while building it:
 
 * `str()`, string concatenation and formatting (`text()` can't show a number yet), which need a small string pool.
 * Importing `.py` files as modules (only native Rust modules can be imported), and a `machine` module with `Pin` objects.
-* A file system (`os`, `open`) so `mpremote cp`/`ls` work, instead of the single `main.py` slot.
+* 🚧 A file system: done as a flat file system in a `vfs` partition (`src/flatfs.rs`, `tools/mpy.py ls/put/get/rm`). Still open: `open()` / `os` for scripts, so `mpremote cp`/`ls` and Thonny's file browser work.
 * Raw-paste mode for faster uploads (plain raw mode works).
 
 **Later:** once loops and functions exist and profiling shows the evaluator is a bottleneck, add the

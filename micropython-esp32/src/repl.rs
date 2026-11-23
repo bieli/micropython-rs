@@ -22,8 +22,10 @@ use core::sync::atomic::Ordering;
 use esp_println::print;
 use micropython_rs::{Error, HardwareBridge, Interpreter, Output};
 
-use crate::script_store::ScriptStore;
+use micropython_rs::flatfs::{FsError, Writer};
+
 use crate::serial_input::wait_byte;
+use crate::storage::Files;
 use crate::ABORT;
 
 /// Bytes of REPL input (and the boot script) kept per session.
@@ -39,10 +41,10 @@ const TAB: u8 = 0x09;
 const ESC: u8 = 0x1B;
 const DELETE: u8 = 0x7F;
 
-/// Raw-REPL commands understood by `tools/mpy.py` (a `#@` first line).
-const SAVE_COMMAND: &str = "#@save\n";
-const ERASE_COMMAND: &str = "#@erase";
-const CAT_COMMAND: &str = "#@cat";
+/// The file run at boot, and by `#@save` / `#@cat` / `#@erase`.
+const MAIN_FILE: &str = "main.py";
+/// Data bytes per `#@get` output chunk.
+const GET_CHUNK: usize = 256;
 
 /// What the board runs at boot when no `main.py` is saved.
 pub struct BootScript {
@@ -56,7 +58,7 @@ pub fn run<O: Output, H: HardwareBridge>(
     out: &mut O,
     hw: &mut H,
     boot: &BootScript,
-    store: &mut ScriptStore<'_>,
+    files: &mut Option<Files>,
 ) -> ! {
     let mut memory = [0u8; ARENA_SIZE];
     let mut mode = Mode::Normal;
@@ -72,13 +74,13 @@ pub fn run<O: Output, H: HardwareBridge>(
 
         // Like MicroPython, a soft reset in the raw REPL skips main.py
         if run_boot_script {
-            repl.run_boot_script(boot, store);
+            repl.run_boot_script(boot, files.as_mut());
         }
 
         loop {
             mode = match mode {
                 Mode::Normal => repl.normal_mode(),
-                Mode::Raw => repl.raw_mode(store),
+                Mode::Raw => repl.raw_mode(files.as_mut()),
                 Mode::SoftReset(_) => unreachable!(),
             };
             if let Mode::SoftReset(raw) = mode {
@@ -176,27 +178,32 @@ impl<'a, O: Output, H: HardwareBridge> Repl<'a, O, H> {
         self.vm.output().write_str(s);
     }
 
-    fn run_boot_script(&mut self, boot: &BootScript, store: &mut ScriptStore<'_>) {
-        let saved = store.load(self.arena.free_space());
+    fn run_boot_script(&mut self, boot: &BootScript, files: Option<&mut Files>) {
+        let saved = files.map(|fs| fs.read(MAIN_FILE, self.arena.free_space()));
         let source = match saved {
-            Some(len) => {
+            Some(Ok(len)) => {
                 self.arena.pending = len;
                 match self.arena.commit() {
                     Ok(source) => {
                         let _ = write!(
                             Fmt(self.vm.output()),
-                            "main.py from flash ({} bytes)\n",
-                            len
+                            "main.py from flash ({} bytes); built-in {} not used\n",
+                            len,
+                            boot.name
                         );
                         source
                     }
                     Err(_) => {
-                        self.write("main.py in flash is not valid UTF-8, skipped\n");
+                        self.write("main.py is not valid UTF-8, skipped\n");
                         return;
                     }
                 }
             }
-            None => {
+            Some(Err(err)) if err != FsError::NotFound => {
+                let _ = write!(Fmt(self.vm.output()), "main.py: {}\n", err.message());
+                return;
+            }
+            _ => {
                 let _ = write!(Fmt(self.vm.output()), "{} (built-in)\n", boot.name);
                 boot.source
             }
@@ -420,10 +427,12 @@ impl<'a, O: Output, H: HardwareBridge> Repl<'a, O, H> {
     /// MicroPython's raw REPL: input isn't echoed; Ctrl-D runs it and the
     /// reply is `OK`, the output, `\x04`, the error text, `\x04`, `>`.
     /// The framing goes to the serial port only, never to a display.
-    fn raw_mode(&mut self, store: &mut ScriptStore<'_>) -> Mode {
+    fn raw_mode(&mut self, mut files: Option<&mut Files>) -> Mode {
         print!("raw REPL; CTRL-B to exit\r\n>");
         self.arena.clear();
         let mut overflow = false;
+        // A file being uploaded with #@open / #@write / #@close
+        let mut upload: Option<Writer> = None;
 
         loop {
             match wait_byte() {
@@ -446,14 +455,18 @@ impl<'a, O: Output, H: HardwareBridge> Repl<'a, O, H> {
                     print!("OK");
                     let result = if overflow {
                         self.arena.clear();
-                        Err(Error::OutOfMemory)
+                        Err(RawError::Python(Error::OutOfMemory))
                     } else {
-                        self.run_raw(store)
+                        self.run_raw(files.as_deref_mut(), &mut upload)
                     };
                     overflow = false;
                     print!("\x04");
-                    if let Err(err) = result {
-                        self.report_error(err);
+                    match result {
+                        Ok(()) => {}
+                        Err(RawError::Python(err)) => self.report_error(err),
+                        Err(RawError::Fs(err)) => {
+                            let _ = write!(Fmt(self.vm.output()), "OSError: {}\n", err.message());
+                        }
                     }
                     print!("\x04>");
                 }
@@ -473,44 +486,142 @@ impl<'a, O: Output, H: HardwareBridge> Repl<'a, O, H> {
         }
     }
 
-    /// Runs a raw-REPL program, or a `#@` command from `tools/mpy.py`.
-    fn run_raw(&mut self, store: &mut ScriptStore<'_>) -> Result<(), Error> {
-        let pending = self.arena.pending();
+    /// Runs a raw-REPL program, or a `#@` file command from `tools/mpy.py`.
+    fn run_raw(
+        &mut self,
+        files: Option<&mut Files>,
+        upload: &mut Option<Writer>,
+    ) -> Result<(), RawError> {
+        if !self.arena.pending().starts_with(b"#@") {
+            let source = self.arena.commit().map_err(RawError::Python)?;
+            return self.eval(source, false).map_err(RawError::Python);
+        }
+        let result = self.file_command(files, upload);
+        self.arena.clear();
+        result
+    }
 
-        if let Some(script) = pending.strip_prefix(SAVE_COMMAND.as_bytes()) {
-            let len = script.len();
-            let result = store.save(script);
-            self.arena.clear();
-            return match result {
-                Ok(()) => {
-                    let _ = write!(Fmt(self.vm.output()), "saved main.py ({} bytes)\n", len);
-                    Ok(())
-                }
-                Err(crate::script_store::StoreError::TooLarge) => Err(Error::OutOfMemory),
-                Err(_) => Err(Error::IoError),
-            };
-        }
-        if pending.starts_with(ERASE_COMMAND.as_bytes()) {
-            self.arena.clear();
-            store.erase().map_err(|_| Error::IoError)?;
-            self.write("main.py erased\n");
-            return Ok(());
-        }
-        if pending.starts_with(CAT_COMMAND.as_bytes()) {
-            self.arena.clear();
-            // Print the saved script on the serial port only
-            let free = self.arena.free_space();
-            if let Some(len) = store.load(free) {
-                for chunk in free[..len].utf8_chunks() {
-                    print!("{}", chunk.valid());
+    /// `#@` commands. Names and hex data follow the command on its line;
+    /// `#@save` has the file text on the following lines.
+    fn file_command(
+        &mut self,
+        files: Option<&mut Files>,
+        upload: &mut Option<Writer>,
+    ) -> Result<(), RawError> {
+        let fs = files.ok_or(RawError::Fs(FsError::NoRegion))?;
+        let pending = self.arena.pending();
+        let (line, rest) = match pending.iter().position(|&b| b == b'\n') {
+            Some(i) => (&pending[..i], &pending[i + 1..]),
+            None => (pending, &[][..]),
+        };
+        let line = core::str::from_utf8(line).map_err(|_| RawError::Fs(FsError::BadName))?;
+        let (command, arg) = line.split_once(' ').unwrap_or((line, ""));
+        let arg = arg.trim();
+
+        match command {
+            // tools/mpy.py save: the text after the first line becomes main.py
+            "#@save" => {
+                fs.write(MAIN_FILE, rest)?;
+                let len = rest.len();
+                let _ = write!(Fmt(self.vm.output()), "saved main.py ({} bytes)\n", len);
+            }
+            "#@cat" => {
+                let file = fs.find(MAIN_FILE)?.ok_or(FsError::NotFound)?;
+                stream_file(fs, &file, false)?;
+            }
+            "#@erase" => {
+                fs.remove(MAIN_FILE)?;
+                self.write("main.py erased\n");
+            }
+            "#@ls" => {
+                let (used, total) = fs.usage()?;
+                fs.list(|f| print!("{} {}\r\n", f.name(), f.size))?;
+                print!(
+                    "# {} of {} files, max {} bytes each\r\n",
+                    used,
+                    total,
+                    micropython_rs::flatfs::MAX_FILE_SIZE
+                );
+            }
+            "#@get" => {
+                let file = fs.find(arg)?.ok_or(FsError::NotFound)?;
+                stream_file(fs, &file, true)?;
+            }
+            "#@rm" => fs.remove(arg)?,
+            "#@open" => *upload = Some(fs.begin(arg)?),
+            "#@write" => {
+                let writer = upload.as_mut().ok_or(FsError::NotFound)?;
+                let mut chunk = [0u8; 128];
+                for pair in arg.as_bytes().chunks(2 * chunk.len()) {
+                    let n = hex_decode(pair, &mut chunk).ok_or(FsError::BadName)?;
+                    fs.append(writer, &chunk[..n])?;
                 }
             }
+            "#@close" => {
+                let writer = upload.take().ok_or(FsError::NotFound)?;
+                let size = writer.size();
+                fs.finish(writer)?;
+                print!("{}", size);
+            }
+            _ => return Err(RawError::Python(Error::InvalidSyntax)),
+        }
+        Ok(())
+    }
+}
+
+/// Result of a raw-REPL request: a script error or a file system error.
+enum RawError {
+    Python(Error),
+    Fs(FsError),
+}
+
+impl From<FsError> for RawError {
+    fn from(err: FsError) -> Self {
+        RawError::Fs(err)
+    }
+}
+
+/// Prints a file on the serial port: as hex (binary-safe, for `#@get`) or as text.
+fn stream_file(
+    fs: &mut Files,
+    file: &micropython_rs::flatfs::FileInfo,
+    hex: bool,
+) -> Result<(), FsError> {
+    let mut buf = [0u8; GET_CHUNK];
+    let mut offset = 0;
+    loop {
+        let n = fs.read_at(file, offset, &mut buf)?;
+        if n == 0 {
             return Ok(());
         }
-
-        let source = self.arena.commit()?;
-        self.eval(source, false)
+        if hex {
+            let mut text = [0u8; 2 * GET_CHUNK];
+            for (i, b) in buf[..n].iter().enumerate() {
+                text[2 * i] = HEX[(b >> 4) as usize];
+                text[2 * i + 1] = HEX[(b & 0xF) as usize];
+            }
+            print!("{}", core::str::from_utf8(&text[..2 * n]).unwrap_or(""));
+        } else {
+            for chunk in buf[..n].utf8_chunks() {
+                print!("{}", chunk.valid());
+            }
+        }
+        offset += n as u32;
     }
+}
+
+const HEX: &[u8; 16] = b"0123456789abcdef";
+
+/// Decodes hex digit pairs into `out`; `None` for an odd length or a non-hex character.
+fn hex_decode(hex: &[u8], out: &mut [u8]) -> Option<usize> {
+    if hex.len() % 2 != 0 || hex.len() / 2 > out.len() {
+        return None;
+    }
+    let digit = |c: u8| (c as char).to_digit(16).map(|d| d as u8);
+    for (i, pair) in hex.chunks(2).enumerate() {
+        out[i] = digit(pair[0])? << 4 | digit(pair[1])?;
+    }
+    Some(hex.len() / 2)
 }
 
 /// True if a line ends with `:` (ignoring trailing spaces and a comment),

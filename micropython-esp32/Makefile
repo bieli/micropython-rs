@@ -20,10 +20,13 @@ FEATURES_FLAG := $(if $(FEATURES),--features $(FEATURES),)
 # directory; leave empty for the board's demo (scripts/demo.py or scripts/ttgo_demo.py)
 SCRIPT       ?=
 
-# `make flash` erases a main.py saved in flash (nvs partition), so the new build runs its
-# embedded script; KEEP_MAIN=1 keeps the saved main.py
-KEEP_MAIN    ?=
-ERASE_FLAG   := $(if $(KEEP_MAIN),,--erase-parts nvs)
+# Partition table with the `vfs` file system partition (main.py and other files)
+PARTITIONS   := partitions.csv
+
+# Files in the `vfs` partition survive `make flash`; ERASE_FILES=1 deletes them all
+# (then the embedded SCRIPT runs at boot, as no main.py is left)
+ERASE_FILES  ?=
+ERASE_FLAG   := $(if $(ERASE_FILES),--erase-parts vfs,)
 
 # Mount the parent directory so Cargo inside Docker can resolve `micropython-rs = { path = ".." }`
 WORKSPACE_ROOT := $(abspath ..)
@@ -31,7 +34,7 @@ WORKSPACE_ROOT := $(abspath ..)
 # Persist the Cargo registry between Docker builds (no re-download of crates on every build)
 CARGO_CACHE  := $(abspath target/cargo-registry)
 
-.PHONY: all build flash monitor clean
+.PHONY: all build flash monitor erase-files clean
 
 # Default target: compile inside Docker, then flash and open the serial monitor on the host
 all: flash
@@ -49,7 +52,11 @@ build:
 
 # Build via Docker, then flash to the ESP32 and open the serial monitor
 flash: build
-	$(ESPFLASH) flash $(PORT_FLAG) $(ERASE_FLAG) --monitor $(ELF_PATH)
+	$(ESPFLASH) flash $(PORT_FLAG) --partition-table $(PARTITIONS) $(ERASE_FLAG) --monitor $(ELF_PATH)
+
+# Delete all files on the board (the `vfs` partition) without reflashing the firmware
+erase-files:
+	$(ESPFLASH) erase-parts $(PORT_FLAG) --partition-table $(PARTITIONS) vfs
 
 # Open the serial monitor without rebuilding or reflashing
 monitor:
