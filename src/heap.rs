@@ -24,6 +24,8 @@ pub enum Kind {
     Free,
     /// UTF-8 text.
     Str,
+    /// Raw bytes.
+    Bytes,
 }
 
 #[derive(Debug, Clone, Copy)]

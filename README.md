@@ -25,7 +25,7 @@ If you are new to Rust or embedded development, this codebase is a clean, readab
   (a byte buffer you provide) with a garbage collector for strings built at runtime. No `Vec`, `String` or `alloc`.
 * **Hardware Agnostic (`#![no_std]`):** Connects to any display, UART serial port, or terminal via a simple 1-method `Output` trait.
 * **Modular & Easy to Read:** Split into small, self-contained files (`lexer.rs`, `ast_parser.rs`, `interpreter.rs`,
-  `strings.rs`, `heap.rs`, `flatfs.rs` and `lib.rs`).
+  `strings.rs`, `bytes.rs`, `heap.rs`, `flatfs.rs` and `lib.rs`).
 
 ---
 
@@ -76,8 +76,10 @@ flags |= 1 << 3                   # bitwise & | ^ ~ << >> and augmented assignme
 
 | Area | Supported |
 |------|-----------|
-| Values | `int` (64-bit), `str`, `bool` (`True`/`False`), `None` |
-| Strings | Escapes (`'\n'`, `'\x41'`, `'\u263a'`), `+`, `*`, `len()`, `s[i]`, `s[a:b]`, `in` / `not in`, `str()`, `repr()`, `int(s, base)`, `ord()`, `chr()`, and methods `upper lower strip lstrip rstrip startswith endswith find count replace isdigit isalpha isalnum isspace isupper islower` |
+| Values | `int` (64-bit), `str`, `bytes`, `bool` (`True`/`False`), `None` |
+| Strings | Escapes (`'\n'`, `'\x41'`, `'\u263a'`), `+`, `*`, `len()`, `s[i]`, `s[a:b]`, `in` / `not in`, `str()`, `repr()`, `int(s, base)`, `ord()`, `chr()`, `s.encode()`, and methods `upper lower strip lstrip rstrip startswith endswith find count replace isdigit isalpha isalnum isspace isupper islower` |
+| Bytes | `b'...'` literals with escapes, `bytes()`, `bytes(n)`, `bytes(s, 'utf-8')`, `+`, `*`, `len()`, `b[i]` (an `int`), `b[a:b]`, `in`, `==`/`<`, `hex()`, `decode()`, `startswith endswith find` |
+| Modules | `binascii` (`hexlify`, `unhexlify`), built in; plus the native modules of the firmware (e.g. `display`) |
 | Literals | `42`, `1_000`, `0x1F`, `0o17`, `0b1010`, `'single'`, `"double"` |
 | Operators | `+ - * / // % **`, `& \| ^ ~ << >>`, `== != < <= > >=` (chainable), `and or not` |
 | Assignment | `x = ...`, and `+= -= *= /= //= %= **= &= \|= ^= <<= >>=` |
@@ -208,8 +210,22 @@ print('v=' + str(adc_vref()) + ' mV', int('0x1F', 16), chr(9786), ord('A'))
 * All test expressions are checked against CPython. Not supported yet: `split`, `join`, `format`, `%` and f-strings
   (they need lists or formatting), and bound methods (`f = s.upper` without calling it).
 
+### Bytes
+
+```python
+import binascii
+data = b'\x00\x10\xfe' + 'zażółć'.encode()
+print(data, len(data), data[2], data.hex())   # b'\x00\x10\xfeza\xc5\xbc...' 13 254 0010fe7a61...
+print(binascii.unhexlify('48656c6c6f').decode(), binascii.hexlify(b'OK'))   # Hello b'4f4b'
+```
+
+`print()`, `str()` and `repr()` of bytes all give the `b'...'` literal, like Python. Bytes and strings never mix:
+`b'a' + 'a'` raises `Error::TypeError` and `b'a' == 'a'` is `False`. Invalid hex digits and undecodable UTF-8 raise
+`Error::ValueError` (CPython raises `binascii.Error` and `UnicodeDecodeError`, both subclasses of `ValueError`).
+Not supported yet: `bytearray`, `bytes([1, 2])` (needs lists), and the text methods (`upper`, `split`...) on bytes.
+
 **Memory.** A literal without escapes, and any slice of it, points into the script source and costs no memory.
-Strings created at runtime (`+`, `*`, `str()`, escapes, `upper()`, ...) live in a fixed-size **heap**: a byte buffer
+Strings and bytes created at runtime (`+`, `*`, `str()`, escapes, `upper()`, `hexlify()`, ...) live in a fixed-size **heap**: a byte buffer
 the application passes to `Interpreter::with_heap`. When it's full, a **mark-and-sweep garbage collector** keeps
 everything reachable from variables and from the value stack (the operands of every expression being evaluated,
 including those of calling functions), frees the rest and moves the survivors together. Values refer to heap objects
@@ -583,7 +599,8 @@ possible write during a replace.
 20.04) needs strings with escape sequences, `bytes`, a dict comprehension, `print(..., sep=, end=)`, `repr()`,
 `try`/`except`, `del`, `open()` file objects and `binascii`; Thonny 4.x/5.x additionally need classes,
 `@classmethod`, exception classes, list comprehensions and slicing. The flat file system matches Thonny's
-"device without directories" mode, so supporting those language features is what's left.
+"device without directories" mode, so supporting those language features is what's left. Done so far: strings,
+`repr()`, slicing, `bytes` and `binascii` (see [ROADMAP.md](ROADMAP.md), Phase 5).
 
 ### Example scripts
 

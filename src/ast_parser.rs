@@ -88,6 +88,8 @@ pub enum CmpOp {
 pub enum Item<'a> {
     Int(i64),
     Str(&'a str),
+    /// A `b'...'` literal as written (escapes decoded when evaluated).
+    Bytes(&'a str),
     Bool(bool),
     None,
     Ident(&'a str),
@@ -815,6 +817,7 @@ impl<'a> Parser<'a> {
         let item = match self.current {
             Token::Int(n) => Item::Int(n),
             Token::Str(s) => Item::Str(s),
+            Token::Bytes(s) => Item::Bytes(s),
             Token::True => Item::Bool(true),
             Token::False => Item::Bool(false),
             Token::None => Item::None,

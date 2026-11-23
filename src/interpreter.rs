@@ -18,6 +18,8 @@
 // with a garbage collector; there is no system allocator. Native recursion
 // is bounded by `MAX_NESTING` (nested blocks) and `MAX_CALL_DEPTH` (calls).
 
+#[path = "bytes.rs"]
+mod bytes;
 #[path = "strings.rs"]
 mod strings;
 
@@ -54,6 +56,10 @@ pub enum Value<'a> {
     Str(&'a str),
     /// A string created at runtime, on the heap.
     HStr(ObjRef),
+    /// A `b'...'` literal in the script source.
+    Bytes(&'a [u8]),
+    /// Bytes created at runtime, on the heap.
+    HBytes(ObjRef),
     /// An imported native module (index into `HardwareBridge::modules()`).
     Module(u8),
     /// A function of a native module, e.g. after `from display import line`.
@@ -199,6 +205,8 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
             Value::Int(n) => n != 0,
             Value::Str(s) => !s.is_empty(),
             Value::HStr(r) => !self.heap.str(r).is_empty(),
+            Value::Bytes(b) => !b.is_empty(),
+            Value::HBytes(r) => !self.heap.bytes(r).is_empty(),
             Value::Module(_) | Value::NativeFn { .. } => true,
         }
     }
@@ -870,6 +878,10 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
                     let val = self.literal(s)?;
                     self.push(val)?;
                 }
+                Item::Bytes(s) => {
+                    let val = self.bytes_literal(s)?;
+                    self.push(val)?;
+                }
                 Item::Bool(b) => self.push(Value::Bool(b))?,
                 Item::None => self.push(Value::None)?,
                 Item::Ident(name) => {
@@ -974,11 +986,13 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
     /// Replaces the top two stack values with `lhs op rhs`.
     fn apply_bin(&mut self, op: BinOp) -> Result<(), Error> {
         let (lhs, rhs) = (self.stack[self.sp - 2], self.stack[self.sp - 1]);
-        let val = if Self::is_str(lhs) || Self::is_str(rhs) {
-            self.str_binop(op, lhs, rhs)?
-        } else {
-            binop(op, lhs, rhs)?
-        };
+        let val =
+            if Self::is_str(lhs) || Self::is_str(rhs) || Self::is_bytes(lhs) || Self::is_bytes(rhs)
+            {
+                self.str_binop(op, lhs, rhs)?
+            } else {
+                binop(op, lhs, rhs)?
+            };
         self.sp -= 1;
         self.stack[self.sp - 1] = val;
         Ok(())
@@ -999,6 +1013,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
                 self.call_native(module, func, args)
             }
             Value::Str(_) | Value::HStr(_) => self.str_method(receiver, attr, args),
+            Value::Bytes(_) | Value::HBytes(_) => self.bytes_method(receiver, attr, args),
             _ => Err(Error::AttributeError),
         }
     }
@@ -1008,12 +1023,31 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
     /// false/true; ordering between other types is a `TypeError`.
     fn compare(&self, op: CmpOp, lhs: Value<'a>, rhs: Value<'a>) -> Result<bool, Error> {
         if matches!(op, CmpOp::In | CmpOp::NotIn) {
-            let hay = self.str_of(rhs).ok_or(Error::TypeError)?;
-            let needle = self.str_of(lhs).ok_or(Error::TypeError)?;
-            return Ok(hay.contains(needle) == (op == CmpOp::In));
+            let found = if let Some(hay) = self.bytes_of(rhs) {
+                // `5 in b` looks for a byte value, `b'ab' in b` for a sequence
+                match (lhs.as_int(), self.bytes_of(lhs)) {
+                    (Some(n), _) if (0..=255).contains(&n) => hay.contains(&(n as u8)),
+                    (Some(_), _) => return Err(Error::ValueError),
+                    (_, Some(needle)) => bytes::find_bytes(hay, needle).is_some(),
+                    _ => return Err(Error::TypeError),
+                }
+            } else {
+                let hay = self.str_of(rhs).ok_or(Error::TypeError)?;
+                let needle = self.str_of(lhs).ok_or(Error::TypeError)?;
+                hay.contains(needle)
+            };
+            return Ok(found == (op == CmpOp::In));
         }
-        let ordering = match (self.str_of(lhs), self.str_of(rhs)) {
-            (Some(a), Some(b)) => a.cmp(b),
+        let ordering = match (
+            self.str_of(lhs)
+                .map(str::as_bytes)
+                .or_else(|| self.bytes_of(lhs).filter(|_| Self::is_bytes(rhs))),
+            self.str_of(rhs)
+                .map(str::as_bytes)
+                .or_else(|| self.bytes_of(rhs).filter(|_| Self::is_bytes(lhs))),
+        ) {
+            // str with str and bytes with bytes; a str never equals bytes
+            (Some(a), Some(b)) if Self::is_bytes(lhs) == Self::is_bytes(rhs) => a.cmp(b),
             _ => match (lhs.as_int(), rhs.as_int()) {
                 (Some(a), Some(b)) => a.cmp(&b),
                 _ => {
@@ -1129,20 +1163,25 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
     // Native modules
     // ------------------------------------------------------------------
 
-    fn modules(&self) -> &[Module] {
+    fn hw_modules(&self) -> &[Module] {
         self.hw.as_ref().map_or(&[], |hw| hw.modules())
     }
 
+    /// Module number `i`: core modules (`binascii`) first, then the bridge's.
+    fn module(&self, i: u8) -> Option<Module> {
+        lookup_module(self.hw_modules(), i)
+    }
+
+    fn module_count(&self) -> usize {
+        CORE_MODULES.len() + self.hw_modules().len()
+    }
+
     fn find_module(&self, name: &str) -> Option<u8> {
-        self.modules()
-            .iter()
-            .position(|m| m.name == name)
-            .map(|i| i as u8)
+        (0..self.module_count() as u8).find(|&i| self.module(i).is_some_and(|m| m.name == name))
     }
 
     fn module_func(&self, module: u8, name: &str) -> Option<u8> {
-        self.modules()
-            .get(module as usize)?
+        self.module(module)?
             .functions
             .iter()
             .position(|f| f.name == name)
@@ -1154,10 +1193,9 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
         if let Some(func) = self.module_func(module, name) {
             return Ok(Value::NativeFn { module, func });
         }
-        self.modules()
-            .get(module as usize)
-            .and_then(|m| m.constants.iter().find(|(n, _)| *n == name))
-            .map(|&(_, val)| Value::Int(val))
+        self.module(module)
+            .and_then(|m| m.constants.iter().find(|(n, _)| *n == name).copied())
+            .map(|(_, val)| Value::Int(val))
             .ok_or(Error::AttributeError)
     }
 
@@ -1168,12 +1206,13 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
         func: u8,
         args: &[Value<'a>],
     ) -> Result<Value<'a>, Error> {
-        let (module_name, spec) = {
-            let m = &self.modules()[module as usize];
-            (m.name, m.functions[func as usize])
-        };
+        let m = self.module(module).ok_or(Error::UnknownIdentifier)?;
+        let (module_name, spec) = (m.name, m.functions[func as usize]);
         if args.len() < spec.min_args as usize || args.len() > spec.max_args as usize {
             return Err(Error::TypeError);
+        }
+        if (module as usize) < CORE_MODULES.len() {
+            return self.core_module_call(module_name, spec.name, args);
         }
         let mut hw_args = [Arg::Int(0); MAX_CALL_ARGS];
         for (slot, val) in hw_args.iter_mut().zip(args) {
@@ -1194,7 +1233,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
 
     /// `help(module)`: its functions and constants.
     fn print_module_help(&mut self, module: u8) {
-        let Some(&m) = self.modules().get(module as usize) else {
+        let Some(m) = self.module(module) else {
             return;
         };
         for part in ["Module ", m.name] {
@@ -1229,7 +1268,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
     /// functions and constants of the bridge.
     fn print_help(&mut self) {
         self.out.write_str(
-            "Built-in:\n  print(...)\n  help()\n  abs(x), min(a, b, ...), max(a, b, ...)\n  len(s), str(x), repr(x), int(x, [base]), ord(c), chr(n)\n",
+            "Built-in:\n  print(...)\n  help()\n  abs(x), min(a, b, ...), max(a, b, ...)\n  len(s), str(x), repr(x), int(x, [base]), ord(c), chr(n), bytes(x)\n",
         );
 
         let mut funcs = self.funcs.iter().flatten().peekable();
@@ -1249,19 +1288,20 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
             self.out.write_str(")\n");
         }
 
-        let Some(hw) = self.hw.as_ref() else {
-            return;
-        };
-        let (functions, constants, modules) = (hw.functions(), hw.constants(), hw.modules());
-        if !modules.is_empty() {
-            self.out
-                .write_str("Modules (import them, then help(module)):\n ");
-            for m in modules {
+        self.out
+            .write_str("Modules (import them, then help(module)):\n ");
+        for i in 0..self.module_count() as u8 {
+            if let Some(m) = self.module(i) {
                 self.out.write_str(" ");
                 self.out.write_str(m.name);
             }
-            self.out.write_str("\n");
         }
+        self.out.write_str("\n");
+
+        let Some(hw) = self.hw.as_ref() else {
+            return;
+        };
+        let (functions, constants) = (hw.functions(), hw.constants());
         if !functions.is_empty() {
             self.out.write_str("Hardware:\n");
         }
@@ -1283,6 +1323,18 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
             }
             self.out.write_str("\n");
         }
+    }
+}
+
+/// Modules built into the interpreter, numbered before the bridge's modules.
+const CORE_MODULES: &[Module] = &[bytes::BINASCII];
+
+/// Module number `i` among the core modules and then `hw` (the bridge's).
+fn lookup_module(hw: &[Module], i: u8) -> Option<Module> {
+    let i = i as usize;
+    match CORE_MODULES.get(i) {
+        Some(m) => Some(*m),
+        None => hw.get(i - CORE_MODULES.len()).copied(),
     }
 }
 
@@ -2262,19 +2314,21 @@ print(fact(7), fib(7))
         assert_eq!(vm.eval("help(1)"), Err(Error::TypeError));
         assert_eq!(
             out.as_str(),
-            "Built-in:\n  print(...)\n  help()\n  abs(x), min(a, b, ...), max(a, b, ...)\n  len(s), str(x), repr(x), int(x, [base]), ord(c), chr(n)\n\
+            "Built-in:\n  print(...)\n  help()\n  abs(x), min(a, b, ...), max(a, b, ...)\n  len(s), str(x), repr(x), int(x, [base]), ord(c), chr(n), bytes(x)\n\
              Script functions:\n  blink(times, ms)\n\
+             Modules (import them, then help(module)):\n  binascii\n\
              Hardware:\n  pin_write(pin, value) - Set an output pin\n  pin_read(pin) - Read a pin\n  \
              text(s, [x, y]) - Show text\n  ticks_ms()\n\
              Constants:\n  HIGH LOW LED\n"
         );
 
-        // Without hardware, only built-ins are listed
+        // Without hardware: built-ins and the core modules
         let mut out = MockOut::new();
         Interpreter::new(&mut out).eval("help()").unwrap();
         assert_eq!(
             out.as_str(),
-            "Built-in:\n  print(...)\n  help()\n  abs(x), min(a, b, ...), max(a, b, ...)\n  len(s), str(x), repr(x), int(x, [base]), ord(c), chr(n)\n"
+            "Built-in:\n  print(...)\n  help()\n  abs(x), min(a, b, ...), max(a, b, ...)\n  len(s), str(x), repr(x), int(x, [base]), ord(c), chr(n), bytes(x)\n\
+             Modules (import them, then help(module)):\n  binascii\n"
         );
     }
 
@@ -2517,7 +2571,7 @@ print(gfx == g, gfx == clock, f == gfx.pixel)
             .unwrap();
         assert!(out
             .as_str()
-            .ends_with("Modules (import them, then help(module)):\n  gfx clock\n"));
+            .ends_with("Modules (import them, then help(module)):\n  binascii gfx clock\n"));
     }
 
     #[test]
@@ -2720,6 +2774,77 @@ print(outer(), count)
         let result = vm.eval(src);
         let collections = vm.heap_stats().3;
         (out.as_str().into(), result, collections)
+    }
+
+    // ---- 5.2 bytes and binascii (expected output checked with CPython) ----
+
+    #[test]
+    fn test_bytes_literals_operators_methods() {
+        assert_output(
+            "b = b'hello'\nprint(b, len(b), b[0], b[-1], b[1:3], b[:0], b[-3:])\n\
+             print(repr(b), str(b), b + b' world', b * 2, 2 * b'ab', b * 0)\n\
+             print(b'\\x00\\xff\\n\\t\\\\', b\"it's\", b'say \"hi\"', b'both \\' and \"')\n\
+             print(b'\\101\\x41', len(b'\\x00\\x01\\x02'), b'\\q', len(b'\\u263a'))\n\
+             print(b == b'hello', b == 'hello', b < b'help', 104 in b, b'ell' in b, b'' in b)\n\
+             print(b.hex(), b.decode(), 'za\u{17c}'.encode(), 'abc'.encode() == b'abc')\n\
+             print(bytes(), bytes(3), bytes('\u{105}b', 'utf-8'), b.startswith(b'he'), b.find(b'l'))\n\
+             x = b''\nx += bytes(1) + b'\\x41'\nprint(x, str(b'a' + b'\\x00'), repr(b'\\x7f\\x80'))\n\
+             if b'':\n    print('no')\nif b:\n    print('yes')",
+            "b'hello' 5 104 111 b'el' b'' b'llo'\n\
+             b'hello' b'hello' b'hello world' b'hellohello' b'abab' b''\n\
+             b'\\x00\\xff\\n\\t\\\\' b\"it's\" b'say \"hi\"' b'both \\' and \"'\n\
+             b'AA' 3 b'\\\\q' 6\n\
+             True False True True True True\n\
+             68656c6c6f hello b'za\\xc5\\xbc' True\n\
+             b'' b'\\x00\\x00\\x00' b'\\xc4\\x85b' True 2\n\
+             b'\\x00A' b'a\\x00' b'\\x7f\\x80'\n\
+             yes\n",
+        );
+    }
+
+    #[test]
+    fn test_binascii_module() {
+        assert_output(
+            "import binascii\nprint(binascii.hexlify(b'\\x00\\x10\\xfe'), binascii.unhexlify(b'48656c6c6f'))\n\
+             print(binascii.unhexlify('00ff'), binascii.unhexlify(binascii.hexlify(b'round trip')))\n\
+             print(binascii)",
+            "b'0010fe' b'Hello'\nb'\\x00\\xff' b'round trip'\n<module 'binascii'>\n",
+        );
+        for (src, err) in [
+            (
+                "import binascii\nbinascii.unhexlify('abc')",
+                Error::ValueError,
+            ),
+            (
+                "import binascii\nbinascii.unhexlify('zz')",
+                Error::ValueError,
+            ),
+            ("import binascii\nbinascii.hexlify('ab')", Error::TypeError),
+            ("import binascii\nbinascii.hexlify()", Error::TypeError),
+            ("b'a' + 'a'", Error::TypeError),
+            ("b'a' < 'a'", Error::TypeError),
+            ("b'a'[5]", Error::IndexError),
+            ("300 in b'a'", Error::ValueError),
+            ("'a' in b'a'", Error::TypeError),
+            ("b'\\xff'.decode()", Error::ValueError),
+            ("bytes(-1)", Error::ValueError),
+            ("bytes('a')", Error::TypeError),
+            ("b'\\x4'", Error::InvalidSyntax),
+            ("b'\u{e9}'", Error::InvalidSyntax),
+        ] {
+            assert_eq!(run_err(src).0, err, "{}", src);
+        }
+    }
+
+    #[test]
+    fn test_gc_with_bytes() {
+        // hexlify/unhexlify round trips in a small heap: the inputs must
+        // survive the collections that the outputs cause
+        let src = "import binascii\nkeep = b'\\x01' * 8\ni = 0\nok = 0\nwhile i < 100:\n    h = binascii.hexlify(keep + bytes(1))\n    if binascii.unhexlify(h.decode()) == keep + b'\\x00':\n        ok += 1\n    i += 1\nprint(ok, h, keep.hex())";
+        let (out, result, collections) = run_with_heap(src, 192);
+        assert_eq!(result, Ok(()));
+        assert_eq!(out, "100 b'010101010101010100' 0101010101010101\n");
+        assert!(collections > 5, "only {} collections", collections);
     }
 
     #[test]

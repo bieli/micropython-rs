@@ -16,6 +16,9 @@ use super::{Interpreter, Value};
 use crate::heap::{Kind, ObjRef};
 use crate::{Error, HardwareBridge, Module, Output};
 
+/// Looks up a module by index (core modules first, then the bridge's).
+pub(crate) type ModuleLookup<'m> = &'m dyn Fn(u8) -> Option<Module>;
+
 impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
     /// The text of a string value.
     pub(super) fn str_of(&self, v: Value<'a>) -> Option<&str> {
@@ -43,12 +46,12 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
     pub(super) fn collect(&mut self) {
         self.heap.begin_mark();
         for &(_, v) in &self.vars[..self.nvars] {
-            if let Value::HStr(r) = v {
+            if let Value::HStr(r) | Value::HBytes(r) = v {
                 self.heap.mark(r);
             }
         }
         for &v in &self.stack[..self.sp] {
-            if let Value::HStr(r) = v {
+            if let Value::HStr(r) | Value::HBytes(r) = v {
                 self.heap.mark(r);
             }
         }
@@ -73,22 +76,34 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
     }
 
     /// A new heap string with the bytes of `parts` (strings) one after another.
-    fn concat_values(&mut self, parts: &[Value<'a>]) -> Result<Value<'a>, Error> {
+    /// The bytes of a string or bytes value.
+    fn raw_bytes(&self, v: Value<'a>) -> Option<&[u8]> {
+        self.str_of(v)
+            .map(str::as_bytes)
+            .or_else(|| self.bytes_of(v))
+    }
+
+    /// A new heap string (or bytes, if `kind` says so) of `parts` one after another.
+    fn concat_values(&mut self, kind: Kind, parts: &[Value<'a>]) -> Result<Value<'a>, Error> {
         let mut len = 0;
         for &p in parts {
-            len += self.str_of(p).ok_or(Error::TypeError)?.len();
+            len += self.raw_bytes(p).ok_or(Error::TypeError)?.len();
         }
-        let dst = self.alloc_obj(Kind::Str, len)?;
+        let dst = self.alloc_obj(kind, len)?;
         let mut at = 0;
         for &p in parts {
             at += self.copy_into(p, 0, usize::MAX, dst, at);
         }
-        Ok(Value::HStr(dst))
+        Ok(if kind == Kind::Bytes {
+            Value::HBytes(dst)
+        } else {
+            Value::HStr(dst)
+        })
     }
 
     /// Copies bytes `from..to` (clamped) of string `src` into `dst` at `at`;
     /// returns the number of bytes copied.
-    fn copy_into(
+    pub(super) fn copy_into(
         &mut self,
         src: Value<'a>,
         from: usize,
@@ -97,12 +112,17 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
         at: usize,
     ) -> usize {
         match src {
-            Value::Str(s) => {
-                let part = &s.as_bytes()[from..to.min(s.len())];
+            Value::Str(_) | Value::Bytes(_) => {
+                let data: &[u8] = match src {
+                    Value::Str(s) => s.as_bytes(),
+                    Value::Bytes(b) => b,
+                    _ => &[],
+                };
+                let part = &data[from..to.min(data.len())];
                 self.heap.bytes_mut(dst)[at..at + part.len()].copy_from_slice(part);
                 part.len()
             }
-            Value::HStr(r) => {
+            Value::HStr(r) | Value::HBytes(r) => {
                 let len = to.min(self.heap.bytes(r).len()) - from;
                 self.heap.copy_obj(r, from, dst, at, len);
                 len
@@ -133,24 +153,42 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
     ) -> Result<Value<'a>, Error> {
         use crate::ast_parser::BinOp;
         match op {
-            BinOp::Add if Self::is_str(lhs) && Self::is_str(rhs) => {
-                if self.str_of(rhs).is_some_and(str::is_empty) {
+            BinOp::Add
+                if (Self::is_str(lhs) && Self::is_str(rhs))
+                    || (Self::is_bytes(lhs) && Self::is_bytes(rhs)) =>
+            {
+                if self.raw_bytes(rhs).is_some_and(<[u8]>::is_empty) {
                     return Ok(lhs);
                 }
-                if self.str_of(lhs).is_some_and(str::is_empty) {
+                if self.raw_bytes(lhs).is_some_and(<[u8]>::is_empty) {
                     return Ok(rhs);
                 }
-                self.concat_values(&[lhs, rhs])
+                let kind = if Self::is_bytes(lhs) {
+                    Kind::Bytes
+                } else {
+                    Kind::Str
+                };
+                self.concat_values(kind, &[lhs, rhs])
             }
             BinOp::Mul => {
+                let seq = |v: Value<'a>| Self::is_str(v) || Self::is_bytes(v);
                 let (s, n) = match (lhs.as_int(), rhs.as_int()) {
-                    (None, Some(n)) if Self::is_str(lhs) => (lhs, n),
-                    (Some(n), None) if Self::is_str(rhs) => (rhs, n),
+                    (None, Some(n)) if seq(lhs) => (lhs, n),
+                    (Some(n), None) if seq(rhs) => (rhs, n),
                     _ => return Err(Error::TypeError),
                 };
-                let unit = self.str_of(s).map_or(0, str::len);
+                let unit = self.raw_bytes(s).map_or(0, <[u8]>::len);
+                let kind = if Self::is_bytes(s) {
+                    Kind::Bytes
+                } else {
+                    Kind::Str
+                };
                 if n <= 0 || unit == 0 {
-                    return Ok(Value::Str(""));
+                    return Ok(if kind == Kind::Bytes {
+                        Value::Bytes(b"")
+                    } else {
+                        Value::Str("")
+                    });
                 }
                 if n == 1 {
                     return Ok(s);
@@ -158,11 +196,15 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
                 let total = unit
                     .checked_mul(n as usize)
                     .filter(|&t| t <= self.heap.capacity());
-                let dst = self.alloc_obj(Kind::Str, total.ok_or(Error::OutOfMemory)?)?;
+                let dst = self.alloc_obj(kind, total.ok_or(Error::OutOfMemory)?)?;
                 for k in 0..n as usize {
                     self.copy_into(s, 0, usize::MAX, dst, k * unit);
                 }
-                Ok(Value::HStr(dst))
+                Ok(if kind == Kind::Bytes {
+                    Value::HBytes(dst)
+                } else {
+                    Value::HStr(dst)
+                })
             }
             _ => Err(Error::TypeError),
         }
@@ -174,6 +216,9 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
         obj: Value<'a>,
         index: Value<'a>,
     ) -> Result<Value<'a>, Error> {
+        if Self::is_bytes(obj) {
+            return self.bytes_index(obj, index);
+        }
         let i = index.as_int().ok_or(Error::TypeError)?;
         let text = self.str_of(obj).ok_or(Error::TypeError)?;
         let n = text.chars().count() as i64;
@@ -201,6 +246,9 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
             other => other.as_int().map(Some).ok_or(Error::TypeError),
         };
         let (start, end) = (bound(start)?, bound(end)?);
+        if Self::is_bytes(obj) {
+            return self.bytes_slice(obj, start, end);
+        }
         let text = self.str_of(obj).ok_or(Error::TypeError)?;
         let n = text.chars().count() as i64;
         let clamp = |i: i64| (if i < 0 { i + n } else { i }).clamp(0, n);
@@ -219,6 +267,19 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
         if Self::is_str(v) && !repr {
             return Ok(v); // strings are immutable: str(s) is s
         }
+        if let Value::HBytes(src) = v {
+            // str(b) and repr(b) are both the literal form b'...'
+            let mut len = 0;
+            super::bytes::write_bytes_repr(self.heap.bytes(src), &mut |p| len += p.len());
+            let dst = self.alloc_obj(Kind::Str, len)?;
+            let (data, out) = self.heap.src_dst(src, dst);
+            let mut at = 0;
+            super::bytes::write_bytes_repr(data, &mut |p| {
+                out[at..at + p.len()].copy_from_slice(p.as_bytes());
+                at += p.len();
+            });
+            return Ok(Value::HStr(dst));
+        }
         if let Value::HStr(r) = v {
             let mut len = 0;
             write_str_repr(self.heap.str(r), &mut |p| len += p.len());
@@ -234,26 +295,27 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
         }
         // Everything else is rendered without reading the heap
         let mut len = 0;
-        write_plain(v, self.module_list(), repr, &mut |p| len += p.len());
+        {
+            let hw_modules: &[Module] = match &self.hw {
+                Some(hw) => hw.modules(),
+                None => &[],
+            };
+            let lookup = |i: u8| super::lookup_module(hw_modules, i);
+            write_plain(v, &lookup, repr, &mut |p| len += p.len());
+        }
         let dst = self.alloc_obj(Kind::Str, len)?;
-        let modules: &[Module] = match &self.hw {
+        let hw_modules: &[Module] = match &self.hw {
             Some(hw) => hw.modules(),
             None => &[],
         };
+        let lookup = |i: u8| super::lookup_module(hw_modules, i);
         let out = self.heap.bytes_mut(dst);
         let mut at = 0;
-        write_plain(v, modules, repr, &mut |p| {
+        write_plain(v, &lookup, repr, &mut |p| {
             out[at..at + p.len()].copy_from_slice(p.as_bytes());
             at += p.len();
         });
         Ok(Value::HStr(dst))
-    }
-
-    fn module_list(&self) -> &[Module] {
-        match &self.hw {
-            Some(hw) => hw.modules(),
-            None => &[],
-        }
     }
 
     /// Writes `v` as `print()` shows it (`repr == false`) or as the REPL does.
@@ -268,12 +330,17 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
                     out.write_str(s);
                 }
             }
+            Value::HBytes(r) => {
+                // print(b) shows the literal form too, like Python
+                super::bytes::write_bytes_repr(self.heap.bytes(r), &mut |p| out.write_str(p));
+            }
             other => {
-                let modules: &[Module] = match &self.hw {
+                let hw_modules: &[Module] = match &self.hw {
                     Some(hw) => hw.modules(),
                     None => &[],
                 };
-                write_plain(other, modules, repr, &mut |p| out.write_str(p));
+                let lookup = |i: u8| super::lookup_module(hw_modules, i);
+                write_plain(other, &lookup, repr, &mut |p| out.write_str(p));
             }
         }
     }
@@ -284,7 +351,10 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
         name: &str,
         args: &[Value<'a>],
     ) -> Option<Result<Value<'a>, Error>> {
-        if !matches!(name, "len" | "str" | "repr" | "int" | "ord" | "chr") {
+        if !matches!(
+            name,
+            "len" | "str" | "repr" | "int" | "ord" | "chr" | "bytes"
+        ) {
             return None;
         }
         Some(self.str_builtin_call(name, args))
@@ -292,10 +362,12 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
 
     fn str_builtin_call(&mut self, name: &str, args: &[Value<'a>]) -> Result<Value<'a>, Error> {
         match (name, args) {
-            ("len", [v]) => match self.str_of(*v) {
-                Some(s) => Ok(Value::Int(s.chars().count() as i64)),
-                None => Err(Error::TypeError),
+            ("len", [v]) => match (self.str_of(*v), self.bytes_of(*v)) {
+                (Some(s), _) => Ok(Value::Int(s.chars().count() as i64)),
+                (_, Some(b)) => Ok(Value::Int(b.len() as i64)),
+                _ => Err(Error::TypeError),
             },
+            ("bytes", _) => self.bytes_builtin(args),
             ("str", []) => Ok(Value::Str("")),
             ("str", [v]) => self.stringify(*v, false),
             ("repr", [v]) => self.stringify(*v, true),
@@ -351,6 +423,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
     ) -> Result<Value<'a>, Error> {
         let text = self.str_of(s).ok_or(Error::TypeError)?;
         match (name, args.len()) {
+            ("encode", 0 | 1) => self.encode(s),
             ("startswith", 1) => Ok(Value::Bool(text.starts_with(self.arg_str(args, 0)?))),
             ("endswith", 1) => Ok(Value::Bool(text.ends_with(self.arg_str(args, 0)?))),
             ("find", 1) => {
@@ -621,7 +694,7 @@ pub(crate) fn write_str_repr(s: &str, sink: &mut dyn FnMut(&str)) {
 /// Writes a value that isn't a heap string; `repr` quotes source strings.
 pub(crate) fn write_plain(
     v: Value<'_>,
-    modules: &[Module],
+    modules: ModuleLookup<'_>,
     repr: bool,
     sink: &mut dyn FnMut(&str),
 ) {
@@ -640,15 +713,16 @@ pub(crate) fn write_plain(
                 sink(s)
             }
         }
-        Value::HStr(_) => sink("?"),
+        Value::Bytes(b) => super::bytes::write_bytes_repr(b, sink),
+        Value::HStr(_) | Value::HBytes(_) => sink("?"),
         Value::Module(m) => {
-            let name = modules.get(m as usize).map_or("?", |m| m.name);
+            let name = modules(m).map_or("?", |m| m.name);
             for part in ["<module '", name, "'>"] {
                 sink(part);
             }
         }
         Value::NativeFn { module, func } => {
-            let (m, f) = modules.get(module as usize).map_or(("?", "?"), |m| {
+            let (m, f) = modules(module).map_or(("?", "?"), |m| {
                 (
                     m.name,
                     m.functions.get(func as usize).map_or("?", |f| f.name),

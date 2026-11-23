@@ -9,6 +9,8 @@ use crate::Error;
 pub enum Token<'a> {
     Ident(&'a str),
     Str(&'a str),
+    /// `b'...'`: the text between the quotes, escapes not yet decoded.
+    Bytes(&'a str),
     Int(i64),
     // Keywords
     If,
@@ -195,6 +197,13 @@ impl<'a> Lexer<'a> {
             '>' => self.op_or_eq(Token::Gt, Token::Ge),
             '\'' | '"' => return self.lex_string(ch),
             '0'..='9' => return self.lex_int(ch),
+            'b' | 'B' if matches!(self.peek(), Some('\'' | '"')) => {
+                let quote = self.advance().unwrap_or('\'');
+                return match self.lex_string(quote)? {
+                    Token::Str(raw) => Ok(Token::Bytes(raw)),
+                    other => Ok(other),
+                };
+            }
             c if c.is_ascii_alphabetic() || c == '_' => return Ok(self.lex_ident(c)),
             '#' => {
                 while let Some(c) = self.peek() {
@@ -514,6 +523,22 @@ mod tests {
         assert_eq!(
             &tokens[..count],
             &[Token::Ident("d"), Token::Dot, Token::Ident("line")]
+        );
+    }
+
+    #[test]
+    fn test_bytes_literals() {
+        let (tokens, count) = collect_tokens::<6>("b'ab' B\"\\x00\" b bx'' b'it\\'s'");
+        assert_eq!(
+            &tokens[..count],
+            &[
+                Token::Bytes("ab"),
+                Token::Bytes("\\x00"),
+                Token::Ident("b"),
+                Token::Ident("bx"),
+                Token::Str(""),
+                Token::Bytes("it\\'s"),
+            ]
         );
     }
 
