@@ -18,12 +18,16 @@
 // with a garbage collector; there is no system allocator. Native recursion
 // is bounded by `MAX_NESTING` (nested blocks) and `MAX_CALL_DEPTH` (calls).
 
+#[path = "builtins.rs"]
+mod builtins;
 #[path = "bytes.rs"]
 mod bytes;
 #[path = "containers.rs"]
 mod containers;
 #[path = "exceptions.rs"]
 mod exceptions;
+#[path = "format.rs"]
+mod format;
 #[path = "strings.rs"]
 mod strings;
 
@@ -75,6 +79,12 @@ pub enum Value<'a> {
     },
     /// A built-in exception class, e.g. `ValueError` (see `exceptions.rs`).
     ExcClass(u8),
+    /// A `def` function or a lambda (index into the function table).
+    Func(u8),
+    /// A built-in function or type used as a value (`key=len`, `int`).
+    Builtin(u8),
+    /// `globals()`: a live view of the global variables.
+    Globals,
 }
 
 impl Value<'_> {
@@ -107,13 +117,22 @@ struct Ctx {
 /// A `def` function: its signature and a parser positioned at its body.
 #[derive(Debug, Clone, Copy)]
 struct FuncDef<'a> {
+    /// The name, or for a lambda its source text (which identifies it).
     name: &'a str,
     params: [&'a str; MAX_PARAMS],
     count: usize,
     /// Indentation of the `def` line; the body is indented deeper.
     indent: u32,
     body: Parser<'a>,
+    /// A tuple of the default values of the last parameters, or `None`.
+    defaults: Value<'a>,
+    /// A lambda: `body` is at the start of its text, and the body is an
+    /// expression.
+    lambda: bool,
 }
+
+/// Keyword arguments of a call: `(name, value)` pairs.
+type Kwargs<'k, 'a> = &'k [(&'a str, Value<'a>)];
 
 pub struct Interpreter<'a, O: Output, H: HardwareBridge = NoHardware> {
     /// Top of `stack`.
@@ -222,7 +241,12 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
             Value::Bytes(b) => !b.is_empty(),
             Value::HBytes(r) => !self.heap.bytes(r).is_empty(),
             Value::Obj(_) => self.container_len(v) != Some(0),
-            Value::Module(_) | Value::NativeFn { .. } | Value::ExcClass(_) => true,
+            Value::Module(_)
+            | Value::NativeFn { .. }
+            | Value::ExcClass(_)
+            | Value::Func(_)
+            | Value::Builtin(_)
+            | Value::Globals => true,
         }
     }
 
@@ -658,17 +682,25 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
                 name,
                 params,
                 count,
+                defaults,
             } => {
                 // Nested functions would need closures; keep functions top-level
                 if ctx.in_func {
                     return Err(Error::InvalidSyntax);
                 }
+                // Default values are evaluated once, when `def` runs (like Python)
+                let defaults = match (run, defaults) {
+                    (true, Some(expr)) => self.eval_expr(code, expr)?,
+                    _ => Value::None,
+                };
                 let func = FuncDef {
                     name,
                     params,
                     count,
                     indent,
                     body: *parser,
+                    defaults,
+                    lambda: false,
                 };
                 // Parse (but don't run) the body to find where it ends
                 let body_ctx = Ctx {
@@ -1012,6 +1044,8 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
             // The iterable stays on the value stack (rooted) during the loop
             let base = self.sp;
             self.push(it)?;
+            let it = self.iterable(it)?;
+            self.push(it)?;
             let result = self.run_for(&targets, it, body, parser, indent, loop_ctx, code);
             self.sp = base;
             if let Some(flow) = result? {
@@ -1164,9 +1198,36 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
             .ok_or(Error::UnknownIdentifier)
     }
 
-    /// Looks a name up in the current scope, then in the globals.
+    /// `print(*args, sep=' ', end='\n')` (`flush=` is accepted and ignored).
+    fn print(&mut self, args: &[Value<'a>], kwargs: Kwargs<'_, 'a>) -> Result<Value<'a>, Error> {
+        let (mut sep, mut end) = (Value::Str(" "), Value::Str("\n"));
+        for &(name, v) in kwargs {
+            let v = match v {
+                Value::None if name != "flush" => {
+                    Value::Str(if name == "sep" { " " } else { "\n" })
+                }
+                v => v,
+            };
+            match name {
+                "sep" if Self::is_str(v) => sep = v,
+                "end" if Self::is_str(v) => end = v,
+                "flush" => {}
+                _ => return Err(Error::TypeError),
+            }
+        }
+        for (i, val) in args.iter().enumerate() {
+            if i > 0 {
+                self.write_value(sep, false);
+            }
+            self.write_value(*val, false);
+        }
+        self.write_value(end, false);
+        Ok(Value::None)
+    }
+
     /// Looks a name up in the current scope, then in the globals, then in
-    /// the hardware constants (`OUT`, `IN`, ...).
+    /// the functions, the hardware constants (`OUT`, `IN`, ...) and the
+    /// built-in exception classes.
     fn get_var(&self, name: &str) -> Result<Value<'a>, Error> {
         self.get_scope_var(name)
             .or_else(|err| {
@@ -1185,8 +1246,17 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
                     .ok_or(err)
             })
             .or_else(|err| {
+                self.funcs
+                    .iter()
+                    .position(|f| f.is_some_and(|f| !f.lambda && f.name == name))
+                    .map(|i| Value::Func(i as u8))
+                    .ok_or(err)
+            })
+            .or_else(|err| {
                 exceptions::class_by_name(name)
                     .map(Value::ExcClass)
+                    .or_else(|| builtins::builtin_by_name(name).map(Value::Builtin))
+                    .or((name == "__name__").then_some(Value::Str("__main__")))
                     .ok_or(err)
             })
     }
@@ -1208,23 +1278,15 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
         Ok(())
     }
 
-    fn find_func(&self, name: &str) -> Option<FuncDef<'a>> {
-        self.funcs
-            .iter()
-            .flatten()
-            .find(|f| f.name == name)
-            .copied()
-    }
-
     /// Calls a `def` function: binds the arguments as new locals and runs the body.
     fn call_user_func(
         &mut self,
         func: FuncDef<'a>,
         args: &[Value<'a>],
+        kwargs: Kwargs<'_, 'a>,
     ) -> Result<Value<'a>, Error> {
-        if args.len() != func.count {
-            return Err(Error::TypeError);
-        }
+        let args = self.bind_args(&func, args, kwargs)?;
+        let args = &args[..func.count];
         if self.call_depth >= MAX_CALL_DEPTH {
             return Err(Error::RecursionLimit);
         }
@@ -1252,7 +1314,15 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
             in_loop: false,
             in_func: true,
         };
-        let result = self.exec_body(&mut parser, func.indent, true, body_ctx, &mut code);
+        let result = if func.lambda {
+            // The body of a lambda is one expression: its value is returned
+            parser
+                .parse_lambda_parts(&mut code)
+                .and_then(|(_, _, body)| self.eval_expr(&code, body))
+                .map(Flow::Return)
+        } else {
+            self.exec_body(&mut parser, func.indent, true, body_ctx, &mut code)
+        };
 
         // Drop the locals and `global` declarations, back to the caller's scope
         self.call_depth -= 1;
@@ -1264,6 +1334,51 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
             Flow::Return(val) => val,
             _ => Value::None,
         })
+    }
+
+    /// The values of the parameters of `func` for a call: positional
+    /// arguments, then keyword arguments, then default values.
+    fn bind_args(
+        &self,
+        func: &FuncDef<'a>,
+        args: &[Value<'a>],
+        kwargs: Kwargs<'_, 'a>,
+    ) -> Result<[Value<'a>; MAX_PARAMS], Error> {
+        if args.len() > func.count {
+            return Err(Error::TypeError); // too many arguments
+        }
+        let mut values = [Value::None; MAX_PARAMS];
+        let mut set = [false; MAX_PARAMS];
+        values[..args.len()].copy_from_slice(args);
+        set[..args.len()].fill(true);
+        for &(name, v) in kwargs {
+            let i = func.params[..func.count]
+                .iter()
+                .position(|&p| p == name)
+                .ok_or(Error::TypeError)?; // unexpected keyword argument
+            if set[i] {
+                return Err(Error::TypeError); // multiple values for an argument
+            }
+            values[i] = v;
+            set[i] = true;
+        }
+        let ndefaults = match func.defaults {
+            Value::Obj(r) => self.count(r),
+            _ => 0,
+        };
+        let first_default = func.count - ndefaults;
+        for i in 0..func.count {
+            if !set[i] {
+                let Value::Obj(r) = func.defaults else {
+                    return Err(Error::TypeError); // missing argument
+                };
+                if i < first_default {
+                    return Err(Error::TypeError);
+                }
+                values[i] = self.slot(r, i - first_default);
+            }
+        }
+        Ok(values)
     }
 
     // ------------------------------------------------------------------
@@ -1352,28 +1467,66 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
                         self.sp -= 1;
                     }
                 }
-                Item::Call { name, argc } => {
+                Item::Call { name, argc, kw } => {
                     // The arguments stay on the stack (rooted) during the call
                     let start = self.sp - argc as usize;
-                    let mut args = [Value::None; MAX_CALL_ARGS];
-                    args[..argc as usize].copy_from_slice(&self.stack[start..self.sp]);
-                    let val = self.call_function(name, &args[..argc as usize])?;
+                    let (args, kwargs) = self.call_args(start, argc, &items[i..i + kw as usize]);
+                    i += kw as usize;
+                    let npos = (argc - kw) as usize;
+                    let val = self.call_function(name, &args[..npos], &kwargs[..kw as usize])?;
                     self.sp = start;
                     self.push(val)?;
                 }
+                Item::CallValue { argc, kw } => {
+                    let start = self.sp - argc as usize;
+                    let callee = self.stack[start - 1];
+                    let (args, kwargs) = self.call_args(start, argc, &items[i..i + kw as usize]);
+                    i += kw as usize;
+                    let npos = (argc - kw) as usize;
+                    let val = self.call_value(callee, &args[..npos], &kwargs[..kw as usize])?;
+                    self.sp = start - 1;
+                    self.push(val)?;
+                }
+                Item::KwName(_) => {}
+                Item::FormatValue { conv, spec } => {
+                    // f-string field: the value (and its spec) are on the stack
+                    let n = 1 + spec as usize;
+                    let v = self.stack[self.sp - n];
+                    let parsed = if spec {
+                        let text = self.str_of(self.stack[self.sp - 1]).unwrap_or("");
+                        format::Spec::parse(text)?
+                    } else {
+                        format::Spec::default()
+                    };
+                    let piece = self.format_one(v, conv as char, &parsed, 0)?;
+                    self.sp -= n;
+                    self.push(piece)?;
+                }
+                Item::BuildStr(n) => {
+                    let base = self.sp - n as usize;
+                    let s = self.join_pieces(base)?;
+                    self.push(s)?;
+                }
+                Item::Lambda(src) => {
+                    let f = self.make_lambda(src)?;
+                    self.push(f)?;
+                }
                 Item::GetAttr(attr) => {
                     let target = self.stack[self.sp - 1];
-                    self.stack[self.sp - 1] = match target {
-                        Value::Obj(_) => self.exc_attr(target, attr)?,
-                        _ => self.module_attr(as_module(target)?, attr)?,
-                    };
+                    self.stack[self.sp - 1] =
+                        self.get_attr(target, attr)?.ok_or(Error::AttributeError)?;
                 }
-                Item::CallAttr { attr, argc } => {
+                Item::CallAttr { attr, argc, kw } => {
                     let start = self.sp - argc as usize;
                     let receiver = self.stack[start - 1];
-                    let mut args = [Value::None; MAX_CALL_ARGS];
-                    args[..argc as usize].copy_from_slice(&self.stack[start..self.sp]);
-                    let val = self.call_method(receiver, attr, &args[..argc as usize])?;
+                    let (args, kwargs) = self.call_args(start, argc, &items[i..i + kw as usize]);
+                    i += kw as usize;
+                    let npos = (argc - kw) as usize;
+                    let val = if kw == 0 {
+                        self.call_method(receiver, attr, &args[..npos])?
+                    } else {
+                        self.call_method_kw(receiver, attr, &args[..npos], &kwargs[..kw as usize])?
+                    };
                     self.sp = start - 1;
                     self.push(val)?;
                 }
@@ -1435,6 +1588,105 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
         Ok(())
     }
 
+    /// The positional and keyword arguments of a call, from the stack
+    /// (`stack[start..]`, keyword values last) and the `KwName` items.
+    #[allow(clippy::type_complexity)]
+    fn call_args(
+        &self,
+        start: usize,
+        argc: u8,
+        names: &[Item<'a>],
+    ) -> (
+        [Value<'a>; MAX_CALL_ARGS],
+        [(&'a str, Value<'a>); MAX_CALL_ARGS],
+    ) {
+        let mut args = [Value::None; MAX_CALL_ARGS];
+        let mut kwargs = [("", Value::None); MAX_CALL_ARGS];
+        let npos = argc as usize - names.len();
+        args[..npos].copy_from_slice(&self.stack[start..start + npos]);
+        for (k, item) in names.iter().enumerate() {
+            if let Item::KwName(name) = item {
+                kwargs[k] = (name, self.stack[start + npos + k]);
+            }
+        }
+        (args, kwargs)
+    }
+
+    /// A method call with keyword arguments: only `list.sort(key=, reverse=)`.
+    fn call_method_kw(
+        &mut self,
+        receiver: Value<'a>,
+        attr: &str,
+        args: &[Value<'a>],
+        kwargs: Kwargs<'_, 'a>,
+    ) -> Result<Value<'a>, Error> {
+        match (receiver, attr, args) {
+            (Value::Module(m), _, _) if self.is_builtins_module(m) => {
+                self.call_function(attr, args, kwargs)
+            }
+            (Value::Str(_) | Value::HStr(_), "format", _) => {
+                self.str_format(receiver, args, kwargs)
+            }
+            (Value::Obj(r), "sort", []) if self.obj_kind(receiver) == Some(Kind::List) => {
+                let (key, reverse) = self.sort_options(kwargs)?;
+                self.sort_list(r, key, reverse).map(|()| Value::None)
+            }
+            _ => Err(Error::TypeError),
+        }
+    }
+
+    /// The function value of a lambda (its text identifies it, so running
+    /// the same `lambda` again reuses its slot in the function table).
+    fn make_lambda(&mut self, src: &'a str) -> Result<Value<'a>, Error> {
+        let same = |f: &FuncDef<'a>| {
+            f.lambda && f.name.as_ptr() == src.as_ptr() && f.name.len() == src.len()
+        };
+        if let Some(i) = self.funcs.iter().position(|f| f.as_ref().is_some_and(same)) {
+            return Ok(Value::Func(i as u8));
+        }
+        let mut parser = Parser::new(src)?;
+        let (params, count, _) = parser.parse_lambda_parts(&mut Code::new())?;
+        let slot = self
+            .funcs
+            .iter()
+            .position(Option::is_none)
+            .ok_or(Error::OutOfMemory)?;
+        self.funcs[slot] = Some(FuncDef {
+            name: src,
+            params,
+            count,
+            indent: 0,
+            body: Parser::new(src)?,
+            defaults: Value::None,
+            lambda: true,
+        });
+        Ok(Value::Func(slot as u8))
+    }
+
+    /// Calls a function value: a `def` function or lambda, a native module
+    /// function, or an exception class.
+    pub(super) fn call_value(
+        &mut self,
+        f: Value<'a>,
+        args: &[Value<'a>],
+        kwargs: Kwargs<'_, 'a>,
+    ) -> Result<Value<'a>, Error> {
+        match f {
+            Value::Func(slot) => {
+                let func = self.funcs[slot as usize].ok_or(Error::UnknownIdentifier)?;
+                self.call_user_func(func, args, kwargs)
+            }
+            Value::NativeFn { module, func } if kwargs.is_empty() => {
+                self.call_native(module, func, args)
+            }
+            Value::Builtin(b) if builtins::builtin_name(b) != "NoneType" => {
+                self.call_function(builtins::builtin_name(b), args, kwargs)
+            }
+            Value::ExcClass(class) if kwargs.is_empty() => self.new_exception(class, args),
+            _ => Err(Error::TypeError), // not callable, or no keyword arguments
+        }
+    }
+
     /// Runs a comprehension (see `Item::Comp`) and pushes the new list/dict.
     fn comprehension(
         &mut self,
@@ -1460,6 +1712,8 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
         }
         let base = self.sp;
         let it = self.eval_items(iter_items)?;
+        let it = self.iterable(it)?;
+        self.push(it)?;
         let result = self.new_container(if dict { Kind::Dict } else { Kind::List }, 0)?;
         self.push(Value::Obj(result))?;
         // Like Python 3, the loop variables don't leak: save what they were
@@ -1524,7 +1778,9 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
     /// Replaces the top two stack values with `lhs op rhs`.
     fn apply_bin(&mut self, op: BinOp) -> Result<(), Error> {
         let (lhs, rhs) = (self.stack[self.sp - 2], self.stack[self.sp - 1]);
-        let val = if matches!(lhs, Value::Obj(_)) || matches!(rhs, Value::Obj(_)) {
+        let val = if op == BinOp::Mod && Self::is_str(lhs) {
+            self.percent_format(lhs, rhs)?
+        } else if matches!(lhs, Value::Obj(_)) || matches!(rhs, Value::Obj(_)) {
             self.container_binop(op, lhs, rhs)?
         } else if Self::is_str(lhs)
             || Self::is_str(rhs)
@@ -1548,12 +1804,16 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
         args: &[Value<'a>],
     ) -> Result<Value<'a>, Error> {
         match receiver {
+            Value::Module(module) if self.is_builtins_module(module) => {
+                self.call_function(attr, args, &[])
+            }
             Value::Module(module) => {
                 let func = self
                     .module_func(module, attr)
                     .ok_or(Error::AttributeError)?;
                 self.call_native(module, func, args)
             }
+            Value::Globals => self.globals_view(attr, args),
             Value::Str(_) | Value::HStr(_) => self.str_method(receiver, attr, args),
             Value::Bytes(_) | Value::HBytes(_) => self.bytes_method(receiver, attr, args),
             Value::Obj(_) => self
@@ -1621,10 +1881,8 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
             _ => match (lhs.as_int(), rhs.as_int()) {
                 (Some(a), Some(b)) => a.cmp(&b),
                 _ => {
-                    // None == None, and a module or function equals itself
-                    let equal = matches!((lhs, rhs), (Value::None, Value::None))
-                        || matches!((lhs, rhs), (Value::Module(_) | Value::NativeFn { .. }, _))
-                            && lhs == rhs;
+                    // None == None, and a module, class or function equals itself
+                    let equal = self.equal(lhs, rhs);
                     return match op {
                         CmpOp::Eq => Ok(equal),
                         CmpOp::Ne => Ok(!equal),
@@ -1647,28 +1905,45 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
     /// Calls a `def` function, the built-in `print`, or a hardware function.
     /// Arguments are already evaluated, so a failing argument means nothing is
     /// printed or sent to hardware (like Python).
-    fn call_function(&mut self, name: &str, args: &[Value<'a>]) -> Result<Value<'a>, Error> {
-        // A variable holding a module function (`from display import line`)
-        if let Ok(Value::NativeFn { module, func }) = self.get_var(name) {
-            return self.call_native(module, func, args);
+    fn call_function(
+        &mut self,
+        name: &str,
+        args: &[Value<'a>],
+        kwargs: Kwargs<'_, 'a>,
+    ) -> Result<Value<'a>, Error> {
+        // A variable holding a function: a module function (`from display
+        // import line`), a `def` function or lambda, or an exception class
+        // (`ValueError('bad')` creates an exception object)
+        match self.get_var(name) {
+            Ok(f @ (Value::NativeFn { .. } | Value::Func(_) | Value::ExcClass(_))) => {
+                return self.call_value(f, args, kwargs);
+            }
+            // `op = abs; op(-3)` (but `abs(-3)` itself is handled below)
+            Ok(Value::Builtin(b)) if builtins::builtin_name(b) != name => {
+                return self.call_function(builtins::builtin_name(b), args, kwargs);
+            }
+            _ => {}
         }
-        if let Some(func) = self.find_func(name) {
-            return self.call_user_func(func, args);
+        if name == "print" {
+            return self.print(args, kwargs);
         }
-        // `ValueError('bad')` creates an exception object
-        if let Ok(Value::ExcClass(class)) = self.get_var(name) {
-            return self.new_exception(class, args);
+        if name == "sorted" && !kwargs.is_empty() {
+            let [it] = args else {
+                return Err(Error::TypeError);
+            };
+            return self.sorted(*it, kwargs);
+        }
+        if !kwargs.is_empty() {
+            return Err(Error::TypeError); // the other built-ins have no keyword arguments
+        }
+        match (name, args) {
+            ("format", [v]) => return self.stringify(*v, false),
+            ("format", [v, spec]) => return self.format_builtin(*v, *spec),
+            _ => {}
         }
 
-        if name == "print" {
-            for (i, val) in args.iter().enumerate() {
-                if i > 0 {
-                    self.out.write_str(" ");
-                }
-                self.write_value(*val, false);
-            }
-            self.out.write_str("\n");
-            return Ok(Value::None);
+        if let Some(result) = self.value_builtin(name, args) {
+            return result;
         }
         if let Some(result) = self.str_builtin(name, args) {
             return result;
@@ -1704,6 +1979,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
             match args {
                 [] => self.print_help(),
                 [Value::Module(module)] => self.print_module_help(*module),
+                [v] if self.str_of(*v) == Some("modules") => self.print_modules(),
                 _ => return Err(Error::TypeError),
             }
             return Ok(Value::None);
@@ -1768,7 +2044,14 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
     }
 
     /// `module.name`: a constant, or a function value.
+    fn is_builtins_module(&self, module: u8) -> bool {
+        self.module(module).is_some_and(|m| m.name == "builtins")
+    }
+
     fn module_attr(&self, module: u8, name: &str) -> Result<Value<'a>, Error> {
+        if self.is_builtins_module(module) {
+            return Self::builtins_attr(name).ok_or(Error::AttributeError);
+        }
         if let Some(func) = self.module_func(module, name) {
             return Ok(Value::NativeFn { module, func });
         }
@@ -1847,7 +2130,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
     /// functions and constants of the bridge.
     fn print_help(&mut self) {
         self.out.write_str(
-            "Built-in:\n  print(...)\n  help()\n  abs(x), min(a, b, ...), max(a, b, ...)\n  len(s), str(x), repr(x), int(x, [base]), ord(c), chr(n), bytes(x), bool(x)\n  list(x), tuple(x), dict(x), range(...), sorted(x), reversed(x), sum(x),\n  any(x), all(x), enumerate(x), zip(a, b)\n",
+            "Built-in:\n  print(...)\n  help()\n  abs(x), min(a, b, ...), max(a, b, ...)\n  len(s), str(x), repr(x), int(x, [base]), ord(c), chr(n), bytes(x), bool(x)\n  list(x), tuple(x), dict(x), range(...), sorted(x), reversed(x), sum(x),\n  any(x), all(x), enumerate(x), zip(a, b), format(x, spec)\n  isinstance(x, t), type(x), hasattr(x, name), getattr(x, name, [default]),\n  callable(x), id(x), dir([x]), globals(), help('modules')\n",
         );
 
         let mut funcs = self.funcs.iter().flatten().peekable();
@@ -1906,7 +2189,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
 }
 
 /// Modules built into the interpreter, numbered before the bridge's modules.
-const CORE_MODULES: &[Module] = &[bytes::BINASCII];
+const CORE_MODULES: &[Module] = &[bytes::BINASCII, builtins::BUILTINS_MODULE];
 
 /// Module number `i` among the core modules and then `hw` (the bridge's).
 fn lookup_module(hw: &[Module], i: u8) -> Option<Module> {
@@ -1918,13 +2201,6 @@ fn lookup_module(hw: &[Module], i: u8) -> Option<Module> {
 }
 
 /// The module in `val`, for `val.attr`; other values have no attributes.
-fn as_module(val: Value<'_>) -> Result<u8, Error> {
-    match val {
-        Value::Module(module) => Ok(module),
-        _ => Err(Error::AttributeError),
-    }
-}
-
 /// Binary operator on values. Ints and bools mix like in Python (`True + 1 == 2`);
 /// `&`, `|`, `^` on two bools give a bool.
 fn binop<'a>(op: BinOp, lhs: Value<'a>, rhs: Value<'a>) -> Result<Value<'a>, Error> {
@@ -2894,9 +3170,9 @@ print(fact(7), fib(7))
         assert_eq!(vm.eval("help(1)"), Err(Error::TypeError));
         assert_eq!(
             out.as_str(),
-            "Built-in:\n  print(...)\n  help()\n  abs(x), min(a, b, ...), max(a, b, ...)\n  len(s), str(x), repr(x), int(x, [base]), ord(c), chr(n), bytes(x), bool(x)\n  list(x), tuple(x), dict(x), range(...), sorted(x), reversed(x), sum(x),\n  any(x), all(x), enumerate(x), zip(a, b)\n\
+            "Built-in:\n  print(...)\n  help()\n  abs(x), min(a, b, ...), max(a, b, ...)\n  len(s), str(x), repr(x), int(x, [base]), ord(c), chr(n), bytes(x), bool(x)\n  list(x), tuple(x), dict(x), range(...), sorted(x), reversed(x), sum(x),\n  any(x), all(x), enumerate(x), zip(a, b), format(x, spec)\n  isinstance(x, t), type(x), hasattr(x, name), getattr(x, name, [default]),\n  callable(x), id(x), dir([x]), globals(), help('modules')\n\
              Script functions:\n  blink(times, ms)\n\
-             Modules (import them, then help(module)):\n  binascii\n\
+             Modules (import them, then help(module)):\n  binascii builtins\n\
              Hardware:\n  pin_write(pin, value) - Set an output pin\n  pin_read(pin) - Read a pin\n  \
              text(s, [x, y]) - Show text\n  ticks_ms()\n\
              Constants:\n  HIGH LOW LED\n"
@@ -2907,8 +3183,8 @@ print(fact(7), fib(7))
         Interpreter::new(&mut out).eval("help()").unwrap();
         assert_eq!(
             out.as_str(),
-            "Built-in:\n  print(...)\n  help()\n  abs(x), min(a, b, ...), max(a, b, ...)\n  len(s), str(x), repr(x), int(x, [base]), ord(c), chr(n), bytes(x), bool(x)\n  list(x), tuple(x), dict(x), range(...), sorted(x), reversed(x), sum(x),\n  any(x), all(x), enumerate(x), zip(a, b)\n\
-             Modules (import them, then help(module)):\n  binascii\n"
+            "Built-in:\n  print(...)\n  help()\n  abs(x), min(a, b, ...), max(a, b, ...)\n  len(s), str(x), repr(x), int(x, [base]), ord(c), chr(n), bytes(x), bool(x)\n  list(x), tuple(x), dict(x), range(...), sorted(x), reversed(x), sum(x),\n  any(x), all(x), enumerate(x), zip(a, b), format(x, spec)\n  isinstance(x, t), type(x), hasattr(x, name), getattr(x, name, [default]),\n  callable(x), id(x), dir([x]), globals(), help('modules')\n\
+             Modules (import them, then help(module)):\n  binascii builtins\n"
         );
     }
 
@@ -3149,9 +3425,9 @@ print(gfx == g, gfx == clock, f == gfx.pixel)
         Interpreter::with_hardware(&mut out, &mut hw)
             .eval("help()")
             .unwrap();
-        assert!(out
-            .as_str()
-            .ends_with("Modules (import them, then help(module)):\n  binascii gfx clock\n"));
+        assert!(out.as_str().ends_with(
+            "Modules (import them, then help(module)):\n  binascii builtins gfx clock\n"
+        ));
     }
 
     #[test]
@@ -3430,9 +3706,12 @@ print(outer(), count)
             };
         }
         for (name, src, expected) in [
+            case!("builtins_values"),
             case!("bytes"),
             case!("containers"),
             case!("exceptions"),
+            case!("formatting"),
+            case!("functions"),
             case!("readme_examples"),
         ] {
             let (out, result, _) = run_with_heap(src, 64 * 1024);

@@ -41,6 +41,9 @@ const T_NATIVE: u8 = 8;
 const T_EMPTY_STR: u8 = 9;
 const T_EMPTY_BYTES: u8 = 10;
 const T_EXC_CLASS: u8 = 11;
+const T_FUNC: u8 = 12;
+const T_BUILTIN: u8 = 13;
+const T_GLOBALS: u8 = 14;
 
 /// Encodes a value for a slot. Source strings must be copied to the heap
 /// first (`Interpreter::stored`); only empty ones are encoded directly.
@@ -57,6 +60,9 @@ fn encode(v: Value<'_>) -> [u8; SLOT] {
         Value::Module(m) => (T_MODULE, m as u64),
         Value::NativeFn { module, func } => (T_NATIVE, (module as u64) << 8 | func as u64),
         Value::ExcClass(c) => (T_EXC_CLASS, c as u64),
+        Value::Func(f) => (T_FUNC, f as u64),
+        Value::Builtin(b) => (T_BUILTIN, b as u64),
+        Value::Globals => (T_GLOBALS, 0),
         Value::Str(_) => (T_EMPTY_STR, 0),
         Value::Bytes(_) => (T_EMPTY_BYTES, 0),
     };
@@ -85,6 +91,9 @@ fn decode<'a>(slot: &[u8]) -> Value<'a> {
         T_EMPTY_STR => Value::Str(""),
         T_EMPTY_BYTES => Value::Bytes(b""),
         T_EXC_CLASS => Value::ExcClass(n as u8),
+        T_FUNC => Value::Func(n as u8),
+        T_BUILTIN => Value::Builtin(n as u8),
+        T_GLOBALS => Value::Globals,
         _ => Value::None,
     }
 }
@@ -508,7 +517,15 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
                 }
             }
             (Value::None, Value::None) => true,
-            (Value::Module(_) | Value::NativeFn { .. } | Value::ExcClass(_), _) => a == b,
+            (
+                Value::Module(_)
+                | Value::NativeFn { .. }
+                | Value::ExcClass(_)
+                | Value::Func(_)
+                | Value::Builtin(_)
+                | Value::Globals,
+                _,
+            ) => a == b,
             _ => false,
         }
     }
@@ -552,6 +569,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
     ) -> Option<Result<bool, Error>> {
         let r = match container {
             Value::Obj(r) => r,
+            Value::Globals => return Some(Ok(self.globals_contains(x))),
             _ => return None,
         };
         Some(match self.heap.kind(r) {
@@ -575,6 +593,15 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
 
     /// `len(v)` of a container.
     pub(super) fn container_len(&self, v: Value<'a>) -> Option<usize> {
+        if v == Value::Globals {
+            let n = if self.call_depth == 0 {
+                self.nvars
+            } else {
+                self.globals_len
+            };
+            let funcs = self.funcs.iter().flatten().filter(|f| !f.lambda).count();
+            return Some(n + funcs);
+        }
         let Value::Obj(r) = v else {
             return None;
         };
@@ -643,6 +670,9 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
         key: Value<'a>,
         v: Value<'a>,
     ) -> Result<(), Error> {
+        if container == Value::Globals {
+            return self.globals_set(key, v);
+        }
         let Value::Obj(r) = container else {
             return Err(Error::TypeError);
         };
@@ -661,6 +691,9 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
 
     /// `del container[key]`.
     pub(super) fn del_item(&mut self, container: Value<'a>, key: Value<'a>) -> Result<(), Error> {
+        if container == Value::Globals {
+            return self.globals_del(key);
+        }
         let Value::Obj(r) = container else {
             return Err(Error::TypeError);
         };
@@ -783,8 +816,26 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
         }
     }
 
+    /// `it`, ready for `iter_next`: `globals()` becomes a snapshot dict
+    /// (which the caller must root).
+    pub(super) fn iterable(&mut self, it: Value<'a>) -> Result<Value<'a>, Error> {
+        match it {
+            Value::Globals => self.globals_dict(),
+            other => Ok(other),
+        }
+    }
+
     /// A new list with the elements of the iterable `it` (rooted).
     pub(super) fn collect_list(&mut self, it: Value<'a>, kind: Kind) -> Result<Value<'a>, Error> {
+        let it = self.iterable(it)?;
+        let base = self.sp;
+        self.push(it)?;
+        let result = self.collect_list_from(it, kind);
+        self.sp = base;
+        result
+    }
+
+    fn collect_list_from(&mut self, it: Value<'a>, kind: Kind) -> Result<Value<'a>, Error> {
         let cap = self.container_len(it).unwrap_or(0);
         let r = self.new_container(Kind::List, cap)?;
         let base = self.sp;
@@ -910,28 +961,96 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
                 }
                 Ok(Value::None)
             }
-            ("sort", []) => self.sort_list(r).map(|()| Value::None),
+            ("sort", []) => self.sort_list(r, None, false).map(|()| Value::None),
             ("copy", []) => self.container_slice(r, None, None),
             _ => Err(Error::AttributeError),
         }
     }
 
-    /// Stable insertion sort with `<` (fine for the list sizes of an MCU).
-    pub(super) fn sort_list(&mut self, r: ObjRef) -> Result<(), Error> {
+    /// Stable insertion sort with `<` (fine for the list sizes of an MCU),
+    /// optionally by `key(element)` and/or in reverse order. `r` is rooted.
+    pub(super) fn sort_list(
+        &mut self,
+        r: ObjRef,
+        key: Option<Value<'a>>,
+        reverse: bool,
+    ) -> Result<(), Error> {
         let n = self.count(r);
-        for i in 1..n {
-            let mut j = i;
-            while j > 0 {
-                let (a, b) = (self.slot(r, j - 1), self.slot(r, j));
-                if !self.compare(CmpOp::Lt, b, a)? {
-                    break;
+        let base = self.sp;
+        let result = (|| {
+            // The keys, in a list of their own (rooted), moved along with the elements
+            let keys = match key {
+                Some(f) => {
+                    let k = self.new_container(Kind::List, n)?;
+                    self.push(Value::Obj(k))?;
+                    for i in 0..n {
+                        let kv = self.call_value(f, &[self.slot(r, i)], &[])?;
+                        let kv = self.stored(kv)?;
+                        self.set_slot(k, i, kv);
+                        self.set_count(k, i + 1);
+                    }
+                    Some(k)
                 }
-                self.set_slot(r, j - 1, b);
-                self.set_slot(r, j, a);
-                j -= 1;
+                None => None,
+            };
+            let by = keys.unwrap_or(r);
+            for i in 1..n {
+                let mut j = i;
+                while j > 0 {
+                    let (a, b) = (self.slot(by, j - 1), self.slot(by, j));
+                    let move_left = if reverse {
+                        self.compare(CmpOp::Lt, a, b)?
+                    } else {
+                        self.compare(CmpOp::Lt, b, a)?
+                    };
+                    if !move_left {
+                        break;
+                    }
+                    for list in [Some(r), keys].into_iter().flatten() {
+                        let (a, b) = (self.slot(list, j - 1), self.slot(list, j));
+                        self.set_slot(list, j - 1, b);
+                        self.set_slot(list, j, a);
+                    }
+                    j -= 1;
+                }
+            }
+            Ok(())
+        })();
+        self.sp = base;
+        result
+    }
+
+    /// `key=` and `reverse=` of `sorted()` and `list.sort()`.
+    pub(super) fn sort_options(
+        &self,
+        kwargs: &[(&str, Value<'a>)],
+    ) -> Result<(Option<Value<'a>>, bool), Error> {
+        let mut options = (None, false);
+        for &(name, v) in kwargs {
+            match name {
+                "key" if v != Value::None => options.0 = Some(v),
+                "key" => {}
+                "reverse" => options.1 = self.truthy(v),
+                _ => return Err(Error::TypeError),
             }
         }
-        Ok(())
+        Ok(options)
+    }
+
+    /// `sorted(it, key=..., reverse=...)`.
+    pub(super) fn sorted(
+        &mut self,
+        it: Value<'a>,
+        kwargs: &[(&str, Value<'a>)],
+    ) -> Result<Value<'a>, Error> {
+        let (key, reverse) = self.sort_options(kwargs)?;
+        let v = self.collect_list(it, Kind::List)?;
+        let r = self.seq(v).ok_or(Error::TypeError)?;
+        let base = self.sp;
+        self.push(v)?;
+        let result = self.sort_list(r, key, reverse);
+        self.sp = base;
+        result.map(|()| v)
     }
 
     fn dict_method(
@@ -1040,14 +1159,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
                 None => Err(Error::TypeError),
             },
             ("range", [_] | [_, _] | [_, _, _]) => self.range(args),
-            ("sorted", [it]) => self.collect_list(*it, Kind::List).and_then(|v| {
-                let r = self.seq(v).ok_or(Error::TypeError)?;
-                let base = self.sp;
-                self.push(v)?;
-                let result = self.sort_list(r);
-                self.sp = base;
-                result.map(|()| v)
-            }),
+            ("sorted", [it]) => self.sorted(*it, &[]),
             ("reversed", [it]) => self.collect_list(*it, Kind::List).inspect(|&v| {
                 if let Some(r) = self.seq(v) {
                     let _ = self.seq_method(r, Kind::List, "reverse", &[]);

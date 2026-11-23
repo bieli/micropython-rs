@@ -11,6 +11,8 @@ pub enum Token<'a> {
     Str(&'a str),
     /// `b'...'`: the text between the quotes, escapes not yet decoded.
     Bytes(&'a str),
+    /// `f'...'`: the text between the quotes (the parser splits out the fields).
+    FStr(&'a str),
     Int(i64),
     // Keywords
     If,
@@ -105,6 +107,8 @@ pub struct Lexer<'a> {
     token_indent: u32,
     /// Open brackets: inside `()`, `[]` and `{}` newlines don't end statements.
     depth: u16,
+    /// Byte offset where the most recently lexed token starts.
+    token_start: usize,
 }
 
 impl<'a> Lexer<'a> {
@@ -118,6 +122,7 @@ impl<'a> Lexer<'a> {
             line_indent: 0,
             token_indent: 0,
             depth: 0,
+            token_start: 0,
         }
     }
 
@@ -129,6 +134,16 @@ impl<'a> Lexer<'a> {
 
     /// Indentation (in columns, tabs to multiples of 8) of the line that the
     /// last token returned by `next_token` is on.
+    /// Byte offset of the most recently lexed token in the source.
+    pub const fn token_start(&self) -> usize {
+        self.token_start
+    }
+
+    /// The source text between two byte offsets.
+    pub fn slice(&self, from: usize, to: usize) -> &'a str {
+        &self.src[from..to]
+    }
+
     pub const fn token_indent(&self) -> u32 {
         self.token_indent
     }
@@ -194,6 +209,7 @@ impl<'a> Lexer<'a> {
         }
 
         self.token_line = self.line;
+        self.token_start = self.pos;
         self.token_indent = self.line_indent;
         let Some(ch) = self.advance() else {
             return Ok(Token::Eof);
@@ -243,10 +259,11 @@ impl<'a> Lexer<'a> {
             '>' => self.op_or_eq(Token::Gt, Token::Ge),
             '\'' | '"' => return self.lex_string(ch),
             '0'..='9' => return self.lex_int(ch),
-            'b' | 'B' if matches!(self.peek(), Some('\'' | '"')) => {
+            'b' | 'B' | 'f' | 'F' if matches!(self.peek(), Some('\'' | '"')) => {
                 let quote = self.advance().unwrap_or('\'');
                 return match self.lex_string(quote)? {
-                    Token::Str(raw) => Ok(Token::Bytes(raw)),
+                    Token::Str(raw) if matches!(ch, 'b' | 'B') => Ok(Token::Bytes(raw)),
+                    Token::Str(raw) => Ok(Token::FStr(raw)),
                     other => Ok(other),
                 };
             }

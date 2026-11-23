@@ -1,0 +1,21 @@
+1234 mV    42| 42   | -0042 +5 -5  7
+ff FF 10 0xff 0o10 0000BEEF
+ADC='ADC' [1, 'a'] None         hi| hi        | he
+Hi 100%% x and 3 005   3.0|
+a b b a 1-2 {literal}
+    ab|cd    |  ef  | ***mid*** 7.00
+   42|42   |-0042|+7 ff FF 10 101 0xff 0b101
+1,234,567 1_000_000 -9,876,543 
+'q' q    right A 100%
+0042   x ff 7 [1, 2]
+v=3 6 9 'ADC'   ADC| 1,234 mV {braces} 3
+ab 2 items nested 003 3 0x00ff 
+adc_3 [0, 2, 4] 1 3
+  pad 3   | True None b'x'
+TT aTbTc x2
+abcdab True 1 True 1
+d needs number
+not enough
+not all converted
+bad spec for str
+missing positional

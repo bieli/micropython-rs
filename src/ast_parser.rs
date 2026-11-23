@@ -39,9 +39,9 @@
 use crate::lexer::{Lexer, Token};
 use crate::Error;
 
-pub const MAX_CALL_ARGS: usize = 8;
+pub const MAX_CALL_ARGS: usize = 16;
 /// Maximum number of parameters of a `def` function.
-pub const MAX_PARAMS: usize = MAX_CALL_ARGS;
+pub const MAX_PARAMS: usize = 8;
 /// Maximum number of names in one `import` / `from ... import` statement.
 pub const MAX_IMPORTS: usize = 8;
 /// Maximum number of RPN items (operands + operators) in one statement.
@@ -127,10 +127,13 @@ pub enum Item<'a> {
     OrJump {
         skip: u8,
     },
-    /// Function call: pops `argc` arguments, pushes the return value.
+    /// Function call: pops `argc` arguments, pushes the return value. The
+    /// last `kw` arguments are keyword arguments; their names are in the
+    /// `kw` `KwName` items right after this one.
     Call {
         name: &'a str,
         argc: u8,
+        kw: u8,
     },
     /// `.attr`: pops a module, pushes its attribute (`[Ident(d), GetAttr(WIDTH)]`).
     GetAttr(&'a str),
@@ -148,7 +151,26 @@ pub enum Item<'a> {
     CallAttr {
         attr: &'a str,
         argc: u8,
+        kw: u8,
     },
+    /// `value(args)`: calls the value below the arguments
+    /// (`(lambda: 1)()`, `handlers[key]()`); keyword names follow, as for `Call`.
+    CallValue {
+        argc: u8,
+        kw: u8,
+    },
+    /// The name of a keyword argument (see `Call`); does nothing by itself.
+    KwName(&'a str),
+    /// An f-string field: pops the value (and, with `spec`, the format spec
+    /// string above it), pushes the formatted text. `conv` is `r`, `s` or 0.
+    FormatValue {
+        conv: u8,
+        spec: bool,
+    },
+    /// Pops `n` strings, pushes them joined (the parts of an f-string).
+    BuildStr(u8),
+    /// `lambda params: expr`: the source text of the whole lambda.
+    Lambda(&'a str),
     /// `[a, b]`, `(a, b)`: pops `n` values, pushes a new list / tuple.
     BuildList(u8),
     BuildTuple(u8),
@@ -262,6 +284,23 @@ impl Default for Code<'_> {
     }
 }
 
+/// The arguments of a call, as parsed: how many, and the keyword names.
+#[derive(Debug, Clone, Copy, Default)]
+struct Args<'a> {
+    argc: u8,
+    kw: u8,
+    names: [&'a str; MAX_CALL_ARGS],
+}
+
+impl<'a> Args<'a> {
+    fn push_names(&self, code: &mut Code<'a>) -> Result<(), Error> {
+        for &name in &self.names[..self.kw as usize] {
+            code.push(Item::KwName(name))?;
+        }
+        Ok(())
+    }
+}
+
 /// Names assigned by `a, b = ...`, `a = b = ...` or `for a, b in ...`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Targets<'a> {
@@ -346,11 +385,13 @@ pub enum Stmt<'a> {
     Else,
     /// Header `while <cond>:`
     While(Expr),
-    /// Header `def name(params...):`
+    /// Header `def name(params...):`; `defaults` builds a tuple of the
+    /// default values of the last parameters (`def f(a, b=1)`).
     Def {
         name: &'a str,
         params: [&'a str; MAX_PARAMS],
         count: usize,
+        defaults: Option<Expr>,
     },
     /// `import a, b as c`: `(module, bound name)` pairs.
     Import {
@@ -396,6 +437,8 @@ pub struct Parser<'a> {
     current: Token<'a>,
     /// Line where `current` starts.
     current_line: u32,
+    /// Byte offset where `current` starts.
+    current_start: usize,
     /// Indentation of the line `current` is on.
     current_indent: u32,
     /// Line where the most recently parsed statement starts.
@@ -415,6 +458,7 @@ impl<'a> Parser<'a> {
             lexer,
             current,
             current_line,
+            current_start: lexer.token_start(),
             current_indent: lexer.token_indent(),
             stmt_line: current_line,
             after_semicolon: false,
@@ -476,6 +520,7 @@ impl<'a> Parser<'a> {
     fn advance(&mut self) -> Result<(), Error> {
         let result = self.lexer.next_token();
         self.current_line = self.lexer.token_line();
+        self.current_start = self.lexer.token_start();
         self.current_indent = self.lexer.token_indent();
         self.current = result?;
         Ok(())
@@ -542,7 +587,7 @@ impl<'a> Parser<'a> {
                 self.expect(Token::Colon)?;
                 return Ok(Some(Stmt::Else));
             }
-            Token::Def => return self.parse_def().map(Some),
+            Token::Def => return self.parse_def(code).map(Some),
             Token::Try | Token::Finally => {
                 let stmt = if self.current == Token::Try {
                     Stmt::Try
@@ -866,8 +911,11 @@ impl<'a> Parser<'a> {
         Ok(name)
     }
 
-    /// def := 'def' IDENT '(' [IDENT (',' IDENT)* [',']] ')' ':'
-    fn parse_def(&mut self) -> Result<Stmt<'a>, Error> {
+    /// def := 'def' IDENT '(' [param (',' param)* [',']] ')' ':'
+    /// with param := IDENT ['=' expr]
+    fn parse_def(&mut self, code: &mut Code<'a>) -> Result<Stmt<'a>, Error> {
+        let defaults_start = code.len;
+        let mut ndefaults = 0u8;
         self.advance()?; // 'def'
         let Token::Ident(name) = self.current else {
             return Err(Error::InvalidSyntax);
@@ -891,6 +939,14 @@ impl<'a> Parser<'a> {
             params[count] = param;
             count += 1;
             self.advance()?;
+            if self.current == Token::Assign {
+                self.advance()?;
+                self.parse_test(code)?;
+                ndefaults += 1;
+            } else if ndefaults > 0 {
+                // A parameter without a default after one with a default
+                return Err(Error::InvalidSyntax);
+            }
 
             match self.current {
                 Token::Comma => self.advance()?,
@@ -901,10 +957,20 @@ impl<'a> Parser<'a> {
 
         self.advance()?; // ')'
         self.expect(Token::Colon)?;
+        let defaults = if ndefaults > 0 {
+            code.push(Item::BuildTuple(ndefaults))?;
+            Some(Expr {
+                start: defaults_start as u8,
+                len: (code.len - defaults_start) as u8,
+            })
+        } else {
+            None
+        };
         Ok(Stmt::Def {
             name,
             params,
             count,
+            defaults,
         })
     }
 
@@ -958,8 +1024,11 @@ impl<'a> Parser<'a> {
         Ok(n)
     }
 
-    /// test := or ['if' or 'else' test]
+    /// test := or ['if' or 'else' test] | lambda
     fn parse_test(&mut self, code: &mut Code<'a>) -> Result<(), Error> {
+        if self.current == Token::Lambda {
+            return self.parse_lambda(code);
+        }
         let start = code.len;
         self.parse_or(code)?;
         if self.current != Token::If {
@@ -1274,15 +1343,32 @@ impl<'a> Parser<'a> {
                     self.advance()?;
                     let attr = self.expect_ident()?;
                     if self.current == Token::LParen {
-                        let mut argc = 0;
+                        let mut args = Args::default();
                         self.nested(|p| {
-                            argc = p.parse_args(code)?;
+                            args = p.parse_args(code)?;
                             Ok(())
                         })?;
-                        code.push(Item::CallAttr { attr, argc })?;
+                        code.push(Item::CallAttr {
+                            attr,
+                            argc: args.argc,
+                            kw: args.kw,
+                        })?;
+                        args.push_names(code)?;
                     } else {
                         code.push(Item::GetAttr(attr))?;
                     }
+                }
+                Token::LParen => {
+                    let mut args = Args::default();
+                    self.nested(|p| {
+                        args = p.parse_args(code)?;
+                        Ok(())
+                    })?;
+                    code.push(Item::CallValue {
+                        argc: args.argc,
+                        kw: args.kw,
+                    })?;
+                    args.push_names(code)?;
                 }
                 Token::LBracket => {
                     self.advance()?;
@@ -1313,6 +1399,10 @@ impl<'a> Parser<'a> {
             Token::Int(n) => Item::Int(n),
             Token::Str(s) => Item::Str(s),
             Token::Bytes(s) => Item::Bytes(s),
+            Token::FStr(s) => {
+                self.parse_fstring(s, code)?;
+                return self.advance();
+            }
             Token::True => Item::Bool(true),
             Token::False => Item::Bool(false),
             Token::None => Item::None,
@@ -1334,21 +1424,50 @@ impl<'a> Parser<'a> {
 
     /// call := IDENT '(' [expr (',' expr)* [',']] ')'
     ///
-    /// Arguments are emitted first, then `Call { name, argc }`.
+    /// Arguments are emitted first, then `Call { name, argc, kw }`.
     fn parse_call(&mut self, name: &'a str, code: &mut Code<'a>) -> Result<(), Error> {
-        let argc = self.parse_args(code)?;
-        code.push(Item::Call { name, argc })
+        let args = self.parse_args(code)?;
+        code.push(Item::Call {
+            name,
+            argc: args.argc,
+            kw: args.kw,
+        })?;
+        args.push_names(code)
     }
 
-    /// '(' [expr (',' expr)* [',']] ')': emits the arguments, returns their count.
-    fn parse_args(&mut self, code: &mut Code<'a>) -> Result<u8, Error> {
+    /// '(' [arg (',' arg)* [',']] ')' with arg := expr | IDENT '=' expr:
+    /// emits the argument values; keyword arguments come last.
+    fn parse_args(&mut self, code: &mut Code<'a>) -> Result<Args<'a>, Error> {
         // Consume '('
         self.advance()?;
 
+        let mut args = Args::default();
         let mut argc = 0;
         while self.current != Token::RParen {
             if argc >= MAX_CALL_ARGS {
                 return Err(Error::TooManyArguments);
+            }
+            if let (Token::Ident(name), Token::Assign) = (self.current, self.peek()?) {
+                // `name=value`
+                if args.names[..args.kw as usize].contains(&name) {
+                    return Err(Error::InvalidSyntax); // repeated keyword
+                }
+                self.advance()?;
+                self.advance()?;
+                self.parse_test(code)?;
+                args.names[args.kw as usize] = name;
+                args.kw += 1;
+                argc += 1;
+                match self.current {
+                    Token::Comma => self.advance()?,
+                    Token::RParen => break,
+                    _ => return Err(Error::UnexpectedToken),
+                }
+                continue;
+            }
+            if args.kw > 0 {
+                // A positional argument after a keyword argument
+                return Err(Error::InvalidSyntax);
             }
             let start = code.len;
             self.parse_test(code)?;
@@ -1369,7 +1488,158 @@ impl<'a> Parser<'a> {
 
         // Consume ')'
         self.advance()?;
-        Ok(argc as u8)
+        args.argc = argc as u8;
+        Ok(args)
+    }
+
+    /// lambda := 'lambda' [IDENT (',' IDENT)*] ':' test
+    ///
+    /// The body is parsed (to check it and to find its end) into a scratch
+    /// buffer; the interpreter parses the lambda's text again when it's called.
+    fn parse_lambda(&mut self, code: &mut Code<'a>) -> Result<(), Error> {
+        let start = self.lexer_token_start();
+        self.advance()?; // 'lambda'
+        while self.current != Token::Colon {
+            self.expect_ident()?;
+            match self.current {
+                Token::Comma => self.advance()?,
+                Token::Colon => break,
+                _ => return Err(Error::UnexpectedToken),
+            }
+        }
+        self.advance()?; // ':'
+        let mut scratch = Code::new();
+        self.nested(|p| p.parse_test(&mut scratch))?;
+        let end = self.lexer_token_start();
+        code.push(Item::Lambda(self.lexer.slice(start, end).trim_end()))
+    }
+
+    /// Start of the token the parser is looking at (`current`).
+    fn lexer_token_start(&self) -> usize {
+        self.current_start
+    }
+
+    /// Parses `lambda params: body` from the text of a lambda: returns the
+    /// parameter names and the body as an expression in `code`.
+    #[allow(clippy::type_complexity)]
+    pub fn parse_lambda_parts(
+        &mut self,
+        code: &mut Code<'a>,
+    ) -> Result<([&'a str; MAX_PARAMS], usize, Expr), Error> {
+        self.expect(Token::Lambda)?;
+        let mut params = [""; MAX_PARAMS];
+        let mut count = 0;
+        while self.current != Token::Colon {
+            if count >= MAX_PARAMS {
+                return Err(Error::TooManyArguments);
+            }
+            params[count] = self.expect_ident()?;
+            count += 1;
+            if self.current == Token::Comma {
+                self.advance()?;
+            }
+        }
+        self.advance()?;
+        let body = self.parse_expr(code)?;
+        Ok((params, count, body))
+    }
+
+    /// The parts of an f-string: literal text (as zero-copy `Str` items, so
+    /// escapes work as usual) and `{expr!conv:spec}` fields, whose
+    /// expressions are parsed from the source in place. Then `BuildStr`.
+    fn parse_fstring(&mut self, raw: &'a str, code: &mut Code<'a>) -> Result<(), Error> {
+        let bytes = raw.as_bytes();
+        let (mut i, mut lit, mut parts) = (0, 0, 0u8);
+        let part = |code: &mut Code<'a>, item: Item<'a>, parts: &mut u8| -> Result<(), Error> {
+            *parts = parts.checked_add(1).ok_or(Error::TooManyArguments)?;
+            code.push(item)
+        };
+        while i < bytes.len() {
+            match (bytes[i], bytes.get(i + 1)) {
+                // `{{` and `}}`: the text so far plus one brace
+                (b'{', Some(b'{')) | (b'}', Some(b'}')) => {
+                    part(code, Item::Str(&raw[lit..i + 1]), &mut parts)?;
+                    i += 2;
+                    lit = i;
+                }
+                (b'}', _) => return Err(Error::InvalidSyntax), // single '}'
+                (b'{', _) => {
+                    if i > lit {
+                        part(code, Item::Str(&raw[lit..i]), &mut parts)?;
+                    }
+                    // The expression ends at a `!` or `:` outside brackets, or `}`
+                    let start = i + 1;
+                    let (mut depth, mut j, mut quote) = (0i32, start, 0u8);
+                    while j < bytes.len() {
+                        let c = bytes[j];
+                        match c {
+                            _ if quote != 0 => {
+                                if c == quote {
+                                    quote = 0;
+                                }
+                            }
+                            b'\'' | b'"' => quote = c,
+                            b'(' | b'[' | b'{' => depth += 1,
+                            b')' | b']' => depth -= 1,
+                            b'}' if depth > 0 => depth -= 1,
+                            b'}' => break,
+                            b'!' if depth == 0 && bytes.get(j + 1) != Some(&b'=') => break,
+                            b':' if depth == 0 => break,
+                            _ => {}
+                        }
+                        j += 1;
+                    }
+                    let expr = &raw[start..j];
+                    let mut sub = Parser::new(expr)?;
+                    self.nested(|_| sub.parse_test(code))?;
+                    if sub.current != Token::Eof || expr.trim().is_empty() {
+                        return Err(Error::InvalidSyntax);
+                    }
+                    let mut conv = 0u8;
+                    if bytes.get(j) == Some(&b'!') {
+                        conv = *bytes.get(j + 1).ok_or(Error::InvalidSyntax)?;
+                        if !matches!(conv, b'r' | b's' | b'a') {
+                            return Err(Error::InvalidSyntax);
+                        }
+                        j += 2;
+                    }
+                    let mut spec = false;
+                    if bytes.get(j) == Some(&b':') {
+                        // The spec may contain fields itself: `{x:>{width}}`
+                        let mut close = j + 1;
+                        let mut nesting = 0;
+                        while close < bytes.len() {
+                            match bytes[close] {
+                                b'{' => nesting += 1,
+                                b'}' if nesting == 0 => break,
+                                b'}' => nesting -= 1,
+                                _ => {}
+                            }
+                            close += 1;
+                        }
+                        let text = &raw[j + 1..close.min(raw.len())];
+                        if text.contains('{') {
+                            self.nested(|p| p.parse_fstring(text, code))?;
+                        } else {
+                            code.push(Item::Str(text))?;
+                        }
+                        spec = true;
+                        j = close;
+                    }
+                    if bytes.get(j) != Some(&b'}') {
+                        return Err(Error::InvalidSyntax); // f-string: expecting '}'
+                    }
+                    part(code, Item::FormatValue { conv, spec }, &mut parts)?;
+                    i = j + 1;
+                    lit = i;
+                }
+                _ => i += 1,
+            }
+        }
+        if lit < bytes.len() || parts == 0 {
+            part(code, Item::Str(&raw[lit..]), &mut parts)?;
+        }
+        code.push(Item::BuildStr(parts))
     }
 
     /// Runs `f` one nesting level deeper, failing instead of overflowing the
@@ -1474,7 +1744,8 @@ mod tests {
             items[0],
             Call {
                 name: "led_on",
-                argc: 0
+                argc: 0,
+                kw: 0
             }
         );
 
@@ -1485,7 +1756,8 @@ mod tests {
                 Int(500),
                 Call {
                     name: "delay_ms",
-                    argc: 1
+                    argc: 1,
+                    kw: 0
                 }
             ]
         );
@@ -1508,7 +1780,8 @@ mod tests {
                 Int(10),
                 Call {
                     name: "print",
-                    argc: 3
+                    argc: 3,
+                    kw: 0
                 }
             ]
         );
@@ -1531,7 +1804,8 @@ mod tests {
                 Neg,
                 Call {
                     name: "delay_ms",
-                    argc: 2
+                    argc: 2,
+                    kw: 0
                 },
             ]
         );
@@ -1550,6 +1824,7 @@ mod tests {
                 Call {
                     name: "adc_read",
                     argc: 1,
+                    kw: 0,
                 },
                 Int(3),
                 Bin(Mul),
@@ -1561,11 +1836,23 @@ mod tests {
             "x = f(g(a), 2 + h())",
             &[
                 Ident("a"),
-                Call { name: "g", argc: 1 },
+                Call {
+                    name: "g",
+                    argc: 1,
+                    kw: 0,
+                },
                 Int(2),
-                Call { name: "h", argc: 0 },
+                Call {
+                    name: "h",
+                    argc: 0,
+                    kw: 0,
+                },
                 Bin(Add),
-                Call { name: "f", argc: 2 },
+                Call {
+                    name: "f",
+                    argc: 2,
+                    kw: 0,
+                },
             ],
         );
         // A bare name stays a variable read
@@ -1742,6 +2029,7 @@ mod tests {
             name,
             params,
             count,
+            ..
         } = next()
         else {
             panic!("expected def");
@@ -1825,6 +2113,7 @@ mod tests {
                 CallAttr {
                     attr: "line",
                     argc: 2,
+                    kw: 0,
                 },
             ],
         );
@@ -1867,7 +2156,7 @@ mod tests {
         let mut p5 = Parser::new("'a' = 1").unwrap();
         assert_eq!(p5.parse_next_stmt(&mut code), Err(Error::InvalidSyntax));
 
-        for src in ["f(,)", "f(1,,)", "f(1", "x = 1 y", "f()()"] {
+        for src in ["f(,)", "f(1,,)", "f(1", "x = 1 y", "f()(1 2)"] {
             let mut parser = Parser::new(src).unwrap();
             assert_eq!(
                 parser.parse_next_stmt(&mut code),
@@ -1877,7 +2166,8 @@ mod tests {
             );
         }
 
-        let mut p4 = Parser::new("f(1, 2, 3, 4, 5, 6, 7, 8, 9)").unwrap();
+        let mut p4 =
+            Parser::new("f(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17)").unwrap();
         assert_eq!(p4.parse_next_stmt(&mut code), Err(Error::TooManyArguments));
     }
 

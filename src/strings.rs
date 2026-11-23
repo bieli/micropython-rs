@@ -61,6 +61,13 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
             self.mark_value(v, &mut work, &mut n);
             self.trace(&mut work, &mut n);
         }
+        // Default values of functions
+        for i in 0..self.funcs.len() {
+            if let Some(f) = self.funcs[i] {
+                self.mark_value(f.defaults, &mut work, &mut n);
+                self.trace(&mut work, &mut n);
+            }
+        }
         self.heap.sweep();
     }
 
@@ -90,7 +97,11 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
     }
 
     /// A new heap string (or bytes, if `kind` says so) of `parts` one after another.
-    fn concat_values(&mut self, kind: Kind, parts: &[Value<'a>]) -> Result<Value<'a>, Error> {
+    pub(super) fn concat_values(
+        &mut self,
+        kind: Kind,
+        parts: &[Value<'a>],
+    ) -> Result<Value<'a>, Error> {
         let mut len = 0;
         for &p in parts {
             len += self.raw_bytes(p).ok_or(Error::TypeError)?.len();
@@ -230,6 +241,9 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
         if let Value::Obj(r) = obj {
             return self.container_index(r, index);
         }
+        if obj == Value::Globals {
+            return self.globals_get(index);
+        }
         if Self::is_bytes(obj) {
             return self.bytes_index(obj, index);
         }
@@ -284,6 +298,17 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
         if Self::is_str(v) && !repr {
             return Ok(v); // strings are immutable: str(s) is s
         }
+        if let Value::Func(f) = v {
+            return self.function_repr(f);
+        }
+        if v == Value::Globals {
+            let d = self.globals_dict()?;
+            let base = self.sp;
+            self.push(d)?;
+            let result = self.stringify(d, repr);
+            self.sp = base;
+            return result;
+        }
         let hw_modules: &[Module] = match &self.hw {
             Some(hw) => hw.modules(),
             None => &[],
@@ -309,8 +334,48 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
         Ok(Value::HStr(dst))
     }
 
+    /// `<function name>` (Python adds an address, which means nothing here).
+    fn function_repr(&mut self, f: u8) -> Result<Value<'a>, Error> {
+        let name = match self.funcs[f as usize] {
+            Some(func) if !func.lambda => func.name,
+            _ => "<lambda>",
+        };
+        let base = self.sp;
+        let result = (|| {
+            for part in ["<function ", name, ">"] {
+                self.push(Value::Str(part))?;
+            }
+            self.concat_values(
+                Kind::Str,
+                &[Value::Str("<function "), Value::Str(name), Value::Str(">")],
+            )
+        })();
+        self.sp = base;
+        result
+    }
+
     /// Writes `v` as `print()` shows it (`repr == false`) or as the REPL does.
-    pub(super) fn write_value(&mut self, v: Value<'_>, repr: bool) {
+    pub(super) fn write_value(&mut self, v: Value<'a>, repr: bool) {
+        if let Value::Func(f) = v {
+            let name = match self.funcs[f as usize] {
+                Some(func) if !func.lambda => func.name,
+                _ => "<lambda>",
+            };
+            for part in ["<function ", name, ">"] {
+                self.out.write_str(part);
+            }
+            return;
+        }
+        if v == Value::Globals {
+            let base = self.sp;
+            if let Ok(d) = self.globals_dict() {
+                if self.push(d).is_ok() {
+                    self.write_value(d, repr);
+                }
+            }
+            self.sp = base;
+            return;
+        }
         let hw_modules: &[Module] = match &self.hw {
             Some(hw) => hw.modules(),
             None => &[],
@@ -501,6 +566,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
         match (name, args.len()) {
             ("encode", 0 | 1) => self.encode(s),
             ("split", 0..=2) => self.split(s, args),
+            ("format", _) => self.str_format(s, args, &[]),
             ("join", 1) => self.join(s, args[0]),
             ("startswith", 1) => Ok(Value::Bool(text.starts_with(self.arg_str(args, 0)?))),
             ("endswith", 1) => Ok(Value::Bool(text.ends_with(self.arg_str(args, 0)?))),
@@ -793,6 +859,9 @@ pub(crate) fn write_plain(
         }
         Value::Bytes(b) => super::bytes::write_bytes_repr(b, sink),
         Value::HStr(_) | Value::HBytes(_) | Value::Obj(_) => sink("?"),
+        Value::Func(_) => sink("<function>"),
+        Value::Builtin(b) => super::builtins::write_builtin(b, sink),
+        Value::Globals => sink("{...}"),
         Value::ExcClass(c) => {
             for part in ["<class '", super::exceptions::class_name(c), "'>"] {
                 sink(part);

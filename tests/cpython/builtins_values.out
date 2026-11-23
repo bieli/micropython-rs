@@ -1,0 +1,21 @@
+True True True True False
+False True True True True
+True True True <class 'NoneType'> <class 'int'> <class 'str'> <class 'builtin_function_or_method'> <class 'int'> <class 'str'> <built-in function len>
+int list int ValueError len
+<class 'KeyError'> KeyError True False True
+True True True False False True True
+f <lambda>
+True False True True False
+skip ValueError default
+__main__
+main module
+True why False 2
+['x_global', 'y_global']
+{'x_global': 10, 'y_global': 'why'}
+3
+False
+['x_global', 'y_global']
+2 7 6 True
+True False
+['A', 'b', 'c'] ['1', '2']
+3 a 4 [1, 2, 3]

@@ -86,12 +86,14 @@ flags |= 1 << 3                   # bitwise & | ^ ~ << >> and augmented assignme
 | Assignment | `x = ...`, `a, b = b, a`, `(a, b) = ...`, `a = b = 0`, `x[k] = v`, `+= -= *= /= //= %= **= &= \|= ^= <<= >>=` (also `x[k] += v`), `del a, b`, `del x[k]` |
 | Statements | `if`/`elif`/`else`, `while`, `for x in ...` (also `for k, v in d.items()`), `break`, `continue`, `pass`, `def`, `return`; `;` between statements (`x = 1; y = 2`) |
 | Exceptions | `try`/`except`/`else`/`finally`, `except (A, B) as e`, `raise`, `raise X('msg')`, bare `raise`, `assert`; built-in classes such as `ValueError`, `KeyError`, `OSError`, `Exception` with CPython's hierarchy; `e.args`, `e.errno` |
-| Calls | `print(...)`, `abs`, `min`, `max`, `bool`, `len`, `list`, `tuple`, `dict`, `range`, `sorted`, `reversed`, `sum`, `any`, `all`, `enumerate`, `zip`, your own `def` functions, and hardware functions from `HardwareBridge` |
+| Functions | `def f(a, b=1):` with default values, keyword arguments `f(1, b=2)`, `lambda x: x * 2`, functions as values (`key=len`, `handlers['up']()`) |
+| Calls | `print(..., sep=, end=)`, `abs`, `min`, `max`, `bool`, `len`, `list`, `tuple`, `dict`, `range`, `sorted(key=, reverse=)`, `reversed`, `sum`, `any`, `all`, `enumerate`, `zip`, `format`, `isinstance`, `type`, `hasattr`, `getattr`, `callable`, `id`, `dir`, `globals()`, your own `def` functions, and hardware functions from `HardwareBridge` |
+| Formatting | `'%5d mV' % v`, `'%s=%r' % (k, v)`, `'{:>8}'.format(s)`, `'{name}'.format(name=x)`, f-strings `f'{v:04x}'`, with fill, alignment, sign, width, `,` separators and `d x X o b c s r f %` |
 | Scope | `global a, b` in a function, to assign globals (also creates them) |
 | Modules | `import m`, `import m as x, n`, `from m import f, C as K`; `m.f(...)`, `m.CONST` for native modules written in Rust |
 
-Not supported yet: floats, sets, `format`/`%`/f-strings, keyword arguments, classes (also your own exception
-classes), importing `.py` files.
+Not supported yet: floats, sets, `*args`/`**kwargs`, closures (a lambda or `def` can't see the local variables of the
+function it's in), classes (also your own exception classes), importing `.py` files.
 See [ROADMAP.md](ROADMAP.md) for what's planned.
 
 ### Arithmetic operators
@@ -139,7 +141,8 @@ The limits are in `src/ast_parser.rs`:
 | `MAX_EXPR_ITEMS` | 64 | Operands and operators per statement, all call arguments and list elements included |
 | `MAX_TARGETS` | 6 | Names in `a, b = ...` and `for a, b in ...` |
 | `MAX_EXPR_DEPTH` | 16 | Nesting of parentheses and unary operators |
-| `MAX_CALL_ARGS` | 8 | Arguments per function call (and parameters per `def`) |
+| `MAX_CALL_ARGS` | 16 | Arguments per function call (positional and keyword) |
+| `MAX_PARAMS` | 8 | Parameters per `def` or `lambda` |
 
 Going over a limit raises `Error::OutOfMemory`.
 
@@ -173,7 +176,17 @@ blink(3, 250)
 
   Without `global`, `count += 1` inside the function raises `Error::UnknownIdentifier` (Python: `UnboundLocalError`).
 * Functions are defined at the top level (or inside `if`/`while` at the top level). A `def` inside a `def` raises `Error::InvalidSyntax`.
-* Calling with the wrong number of arguments raises `Error::TypeError`.
+* Parameters can have default values (`def blink(times, ms=250):`), evaluated once when `def` runs, as in Python.
+  Calls can name arguments: `blink(3, ms=100)`. A missing, unknown or repeated argument raises `Error::TypeError`.
+* Functions are values: `on_press = blink`, `sorted(names, key=len)`, `actions = {'up': up, 'down': down}`, and
+  `lambda` makes small ones: `sorted(points, key=lambda p: p[1])`. Up to 16 `def` functions and lambdas exist at a
+  time (`MAX_FUNCS`); a lambda takes one slot however often it runs.
+
+```python
+v = 1234
+print('%5d mV' % v, '{:>8}|'.format('right'), f'{v:,} mV', f'0x{v:04X}')   #  1234 mV    right| 1,234 mV 0x04D2
+print('a', 'b', sep='-', end='!\n')                                         # a-b!
+```
 * `break`/`continue` outside a loop and `return` outside a function raise `Error::InvalidSyntax`,
   even in code that never runs, as Python does at compile time.
 * Bad indentation raises `Error::IndentationError`.
@@ -615,8 +628,8 @@ myapp.py:2: syntax error: unexpected EOF while parsing - not uploaded
 ```
 
 Thonny's own MicroPython mode (file browser, "Save to device") doesn't work yet: Thonny runs helper code on the board
-that needs keyword arguments, `globals()`, the `os` module and file objects (and, for Thonny 4/5, classes), which are
-being added in Phase 5 of the [ROADMAP](ROADMAP.md).
+that needs the `os` module and file objects (and, for Thonny 4/5, classes), which are being added in Phase 5 of the
+[ROADMAP](ROADMAP.md).
 
 `tools/mpy.py` needs `pyserial` and takes `--port` (default `/dev/ttyACM0`, or `$MPY_PORT`). It exits with status 1
 when the script raises an error. `mpremote`'s file commands (`cp`, `ls`, `fs`) don't work yet, because they run Python

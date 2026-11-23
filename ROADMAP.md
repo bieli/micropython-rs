@@ -86,7 +86,7 @@ Thonny reads and saves device files by running Python helper code on the board (
 | 5.2 | **`bytes`**: `b'...'` literals, `binascii.hexlify`/`unhexlify`, `encode()`/`decode()`, `hex()` | Thonny 3.2.7+ (file transfer) | ✅ |
 | 5.3 | **Containers**: list, tuple, dict, `for` with `range()`, list/dict comprehensions, `split`/`join`, `del`, `is`, `x if c else y` | Thonny 3.2.7+ | ✅ |
 | 5.4 | **Exceptions**: `try`/`except`/`else`/`finally`, `OSError`/`ImportError`, `except X as e`, `raise`, `assert`, Python tracebacks | Thonny 3.2.7+ | ✅ |
-| 5.5 | **Built-ins**: keyword arguments (`print(..., sep=, end=)`), `hasattr`, `globals()`, `del`, `id`, `isinstance` | Thonny 3.2.7+ | ⬜ |
+| 5.5 | **Built-ins**: keyword arguments (`print(..., sep=, end=)`), default parameters, `lambda`, functions as values, `hasattr`/`getattr`, `globals()`, `id`, `isinstance`/`type`, `dir`, `builtins`, `%`/`format()`/f-strings | Thonny 3.2.7+ | ✅ |
 | 5.6 | **`os` and `open()`** on the flash file system | Thonny 3.2.7+, `mpremote cp/ls` | ⬜ |
 | 5.7 | **Thonny 3.2.7 end to end**: connect, file list, open `main.py`, save, Run/Stop | milestone | ⬜ |
 | 5.8 | **Classes, `@classmethod`, `builtins` module** | Thonny 4.x/5.x | ⬜ |
