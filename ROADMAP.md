@@ -76,6 +76,28 @@ Phase 4 follow-ups found while building it:
 * 🚧 A file system: done as a flat file system in a `vfs` partition (`src/flatfs.rs`, `tools/mpy.py ls/put/get/rm`). Still open: `open()` / `os` for scripts, so `mpremote cp`/`ls` and Thonny's file browser work.
 * Raw-paste mode for faster uploads (plain raw mode works).
 
+## Phase 5: Python features for Thonny (and for scripts)
+
+Thonny reads and saves device files by running Python helper code on the board (see README, "Files on the board").
+
+| # | Feature | Needed by | Status |
+|---|---------|-----------|--------|
+| 5.1 | **Real strings** on a fixed-size heap with a garbage collector: escapes, `+`/`*`, `len`, indexing/slicing, `in`, `str()`/`repr()`, `int()`/`ord()`/`chr()`, string methods | Thonny 3.2.7+ | ✅ |
+| 5.2 | **`bytes`**: `b'...'` literals, `binascii.hexlify`/`unhexlify` | Thonny 3.2.7+ (file transfer) | ⬜ |
+| 5.3 | **Containers**: list, tuple, dict, `for` with `range()`, list/dict comprehensions, `split`/`join` | Thonny 3.2.7+ | ⬜ |
+| 5.4 | **Exceptions**: `try`/`except`/`else`/`finally`, `OSError`/`ImportError`, `except X as e`, `raise` | Thonny 3.2.7+ | ⬜ |
+| 5.5 | **Built-ins**: keyword arguments (`print(..., sep=, end=)`), `hasattr`, `globals()`, `del`, `id`, `isinstance` | Thonny 3.2.7+ | ⬜ |
+| 5.6 | **`os` and `open()`** on the flash file system | Thonny 3.2.7+, `mpremote cp/ls` | ⬜ |
+| 5.7 | **Thonny 3.2.7 end to end**: connect, file list, open `main.py`, save, Run/Stop | milestone | ⬜ |
+| 5.8 | **Classes, `@classmethod`, `builtins` module** | Thonny 4.x/5.x | ⬜ |
+
+Found while building 5.1:
+
+* **Speed on the ESP32:** with the heap and the shared value stack, tight loops got ~20% slower on the ESP32
+  (5000 empty `while` passes: 829 ms before, 1005 ms after) although the host is unchanged. Changing only the struct
+  layout moved the result between 1.0 and 1.5 s, which points at the flash instruction cache. Proper fix: put the
+  interpreter's hot loop (lexer, parser, evaluator) into IRAM, behind a feature of the core library.
+
 **Later:** once loops and functions exist and profiling shows the evaluator is a bottleneck, add the
 bytecode compiler and VM, plus a `const` folding pass.
 

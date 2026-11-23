@@ -2,6 +2,7 @@
 
 pub mod ast_parser;
 pub mod flatfs;
+pub mod heap;
 pub mod interpreter;
 pub mod lexer;
 
@@ -41,6 +42,8 @@ pub enum Error {
     /// `module.name` for a name the module doesn't have, or `.` on a value
     /// that isn't a module.
     AttributeError,
+    /// An index outside a string (or, later, a list).
+    IndexError,
 }
 
 pub trait Output {

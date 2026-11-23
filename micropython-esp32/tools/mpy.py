@@ -23,6 +23,7 @@ Needs pyserial (`pip install pyserial`). Exit code 1 if the script raised an err
 """
 
 import argparse
+import codecs
 import os
 import sys
 import time
@@ -110,9 +111,13 @@ class Board:
         """Runs `code` in the raw REPL. Returns (output, error) bytes."""
         self.send_code(code)
 
+        # Output arrives byte by byte: decode incrementally, so multi-byte
+        # UTF-8 characters (e.g. "°", "ł", "☺") aren't split
+        decoder = codecs.getincrementaldecoder("utf-8")("replace")
+
         def show(chunk):
             if stream and chunk != b"\x04":
-                sys.stdout.write(chunk.decode("utf-8", "replace"))
+                sys.stdout.write(decoder.decode(chunk))
                 sys.stdout.flush()
 
         output = self.read_until(b"\x04", timeout=3600, echo=show)[:-1]
@@ -135,6 +140,7 @@ class Watcher:
         self.running = False
         self.section = 0  # 0 = program output, 1 = error text, 2 = waiting for ">"
         self.error = b""
+        self.decoder = codecs.getincrementaldecoder("utf-8")("replace")
 
     def run_forever(self):
         last_mtime = None
@@ -201,7 +207,7 @@ class Watcher:
             if byte == 4:
                 self.section = 1
             else:
-                sys.stdout.write(chr(byte) if byte < 128 else "?")
+                sys.stdout.write(self.decoder.decode(bytes([byte])))
                 sys.stdout.flush()
         elif self.section == 1:
             if byte == 4:

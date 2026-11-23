@@ -77,6 +77,10 @@ pub enum CmpOp {
     Le,
     Gt,
     Ge,
+    /// `x in y`
+    In,
+    /// `x not in y`
+    NotIn,
 }
 
 /// One RPN instruction.
@@ -120,6 +124,14 @@ pub enum Item<'a> {
     },
     /// `.attr`: pops a module, pushes its attribute (`[Ident(d), GetAttr(WIDTH)]`).
     GetAttr(&'a str),
+    /// `[i]`: pops the index and the value below it, pushes the element.
+    Index,
+    /// `[a:b]`: pops the bounds that are present and the value below them,
+    /// pushes the slice.
+    Slice {
+        has_start: bool,
+        has_end: bool,
+    },
     /// `.attr(args)`: pops `argc` arguments and the module below them, calls
     /// the module function (`[Ident(d), args..., CallAttr { line, argc }]`).
     /// One string per item keeps `Item` at 24 bytes.
@@ -613,16 +625,15 @@ impl<'a> Parser<'a> {
     /// `b` is evaluated only once and `c` is skipped if `a < b` is false.
     fn parse_comparison(&mut self, code: &mut Code<'a>) -> Result<(), Error> {
         self.parse_bitor(code)?;
-        let Some(mut op) = cmp_op(self.current) else {
+        let Some(mut op) = self.take_cmp_op()? else {
             return Ok(());
         };
 
         let mut chain_jumps = [0usize; MAX_EXPR_ITEMS];
         let mut links = 0;
         loop {
-            self.advance()?;
             self.parse_bitor(code)?;
-            match cmp_op(self.current) {
+            match self.take_cmp_op()? {
                 Some(next) => {
                     chain_jumps[links] = code.push_jump(Item::CmpChain { op, skip: 0 })?;
                     links += 1;
@@ -638,6 +649,23 @@ impl<'a> Parser<'a> {
             code.patch_skip(jump);
         }
         Ok(())
+    }
+
+    /// Consumes a comparison operator (`not in` is two tokens), if any.
+    fn take_cmp_op(&mut self) -> Result<Option<CmpOp>, Error> {
+        let op = match self.current {
+            Token::Not if self.peek()? == Token::In => {
+                self.advance()?;
+                CmpOp::NotIn
+            }
+            Token::In => CmpOp::In,
+            other => match cmp_op(other) {
+                Some(op) => op,
+                None => return Ok(None),
+            },
+        };
+        self.advance()?;
+        Ok(Some(op))
     }
 
     /// bitor := bitxor ('|' bitxor)*
@@ -728,13 +756,58 @@ impl<'a> Parser<'a> {
 
     /// power := atom ('**' unary)?
     fn parse_power(&mut self, code: &mut Code<'a>) -> Result<(), Error> {
-        self.parse_atom(code)?;
+        self.parse_postfix(code)?;
         if self.current == Token::DoubleStar {
             self.advance()?;
             self.nested(|p| p.parse_unary(code))?;
             code.push(Item::Bin(BinOp::Pow))?;
         }
         Ok(())
+    }
+
+    /// postfix := atom ('.' IDENT ['(' args ')'] | '[' index_or_slice ']')*
+    ///
+    /// `s.strip().upper()`, `d.line(1, 2)`, `s[i]`, `s[a:b]`: the value is
+    /// already on the stack when a trailer is applied.
+    fn parse_postfix(&mut self, code: &mut Code<'a>) -> Result<(), Error> {
+        self.parse_atom(code)?;
+        loop {
+            match self.current {
+                Token::Dot => {
+                    self.advance()?;
+                    let attr = self.expect_ident()?;
+                    if self.current == Token::LParen {
+                        let mut argc = 0;
+                        self.nested(|p| {
+                            argc = p.parse_args(code)?;
+                            Ok(())
+                        })?;
+                        code.push(Item::CallAttr { attr, argc })?;
+                    } else {
+                        code.push(Item::GetAttr(attr))?;
+                    }
+                }
+                Token::LBracket => {
+                    self.advance()?;
+                    let has_start = self.current != Token::Colon;
+                    if has_start {
+                        self.nested(|p| p.parse_or(code))?;
+                    }
+                    if self.current == Token::Colon {
+                        self.advance()?;
+                        let has_end = self.current != Token::RBracket;
+                        if has_end {
+                            self.nested(|p| p.parse_or(code))?;
+                        }
+                        code.push(Item::Slice { has_start, has_end })?;
+                    } else {
+                        code.push(Item::Index)?;
+                    }
+                    self.expect(Token::RBracket)?;
+                }
+                _ => return Ok(()),
+            }
+        }
     }
 
     /// atom := INT | STR | True | False | None | IDENT | call | '(' expr ')'
@@ -749,19 +822,6 @@ impl<'a> Parser<'a> {
                 self.advance()?;
                 if self.current == Token::LParen {
                     return self.nested(|p| p.parse_call(name, code));
-                }
-                if self.current == Token::Dot {
-                    // `module.attr` or `module.function(args)`
-                    self.advance()?;
-                    let attr = self.expect_ident()?;
-                    code.push(Item::Ident(name))?;
-                    if self.current == Token::LParen {
-                        return self.nested(|p| {
-                            let argc = p.parse_args(code)?;
-                            code.push(Item::CallAttr { attr, argc })
-                        });
-                    }
-                    return code.push(Item::GetAttr(attr));
                 }
                 return code.push(Item::Ident(name));
             }
@@ -1275,7 +1335,6 @@ mod tests {
             ("from a b", Error::UnexpectedToken),
             ("from a import *", Error::InvalidSyntax),
             ("x = a.", Error::InvalidSyntax),
-            ("x = a.b.c", Error::UnexpectedToken),
             ("a.b = 1", Error::UnexpectedToken),
             ("import a, b, c, d, e, f, g, h, i", Error::TooManyArguments),
         ] {

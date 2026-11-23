@@ -30,6 +30,13 @@ use crate::ABORT;
 
 /// Bytes of REPL input (and the boot script) kept per session.
 pub const ARENA_SIZE: usize = 32 * 1024;
+/// Interpreter heap for objects created at runtime (strings built by scripts).
+pub const HEAP_SIZE: usize = 32 * 1024;
+
+/// Both buffers are static memory rather than locals, so they don't take
+/// 64 KB of the main task's stack.
+static ARENA_MEMORY: static_cell::StaticCell<[u8; ARENA_SIZE]> = static_cell::StaticCell::new();
+static HEAP_MEMORY: static_cell::StaticCell<[u8; HEAP_SIZE]> = static_cell::StaticCell::new();
 
 const CTRL_A: u8 = 0x01;
 const CTRL_B: u8 = 0x02;
@@ -60,14 +67,15 @@ pub fn run<O: Output, H: HardwareBridge>(
     boot: &BootScript,
     files: &mut Option<Files>,
 ) -> ! {
-    let mut memory = [0u8; ARENA_SIZE];
+    let memory = ARENA_MEMORY.init([0; ARENA_SIZE]);
+    let heap = HEAP_MEMORY.init([0; HEAP_SIZE]);
     let mut mode = Mode::Normal;
     let mut run_boot_script = true;
 
     loop {
         let mut repl = Repl {
-            vm: Interpreter::with_hardware(&mut *out, &mut *hw),
-            arena: Arena::new(&mut memory),
+            vm: Interpreter::with_hardware(&mut *out, &mut *hw).with_heap(&mut heap[..]),
+            arena: Arena::new(&mut memory[..]),
             history: None,
         };
         repl.vm.set_abort_flag(&ABORT);

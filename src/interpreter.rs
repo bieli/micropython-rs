@@ -13,8 +13,13 @@
 // * A `def` stores a parser copy pointing at the function body; a call runs
 //   the body from there with its own local variables.
 //
-// Memory use is fixed: no heap, and native recursion is bounded by
-// `MAX_NESTING` (nested blocks) and `MAX_CALL_DEPTH` (nested calls).
+// Memory use is fixed: objects created at runtime (strings built by the
+// script) live in a fixed-size heap given by the application (`with_heap`),
+// with a garbage collector; there is no system allocator. Native recursion
+// is bounded by `MAX_NESTING` (nested blocks) and `MAX_CALL_DEPTH` (calls).
+
+#[path = "strings.rs"]
+mod strings;
 
 use core::cmp::Ordering as CmpOrdering;
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -22,6 +27,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use crate::ast_parser::{
     BinOp, CmpOp, Code, Expr, Item, Parser, Stmt, MAX_CALL_ARGS, MAX_EXPR_ITEMS, MAX_PARAMS,
 };
+use crate::heap::{Heap, ObjRef};
 use crate::{Arg, Error, HardwareBridge, Module, NoHardware, Output};
 
 /// Variable slots, shared by globals and the locals of active function calls.
@@ -34,16 +40,20 @@ pub const MAX_CALL_DEPTH: usize = 8;
 pub const MAX_GLOBAL_DECLS: usize = 16;
 /// Maximum nesting of blocks (`if`/`while`/function bodies) being run at once.
 pub const MAX_NESTING: usize = 24;
-/// RPN evaluation stack depth. With calls, every item of an expression can be
-/// an operand waiting on the stack (`f(1, 2, 3, ...)`), so it matches the item limit.
-const MAX_EVAL_STACK: usize = MAX_EXPR_ITEMS;
+/// Values in flight: the operands of every expression being evaluated,
+/// including those of the calling functions. They are roots for the garbage
+/// collector, which is why there is one shared stack instead of one per call.
+pub const VALUE_STACK: usize = 4 * MAX_EXPR_ITEMS;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Value<'a> {
     None,
     Bool(bool),
     Int(i64),
+    /// A string in the script source (literals, and slices of them).
     Str(&'a str),
+    /// A string created at runtime, on the heap.
+    HStr(ObjRef),
     /// An imported native module (index into `HardwareBridge::modules()`).
     Module(u8),
     /// A function of a native module, e.g. after `from display import line`.
@@ -54,17 +64,6 @@ pub enum Value<'a> {
 }
 
 impl Value<'_> {
-    /// Python truth value: `None`, `False`, `0` and `''` are false.
-    fn is_truthy(self) -> bool {
-        match self {
-            Value::None => false,
-            Value::Bool(b) => b,
-            Value::Int(n) => n != 0,
-            Value::Str(s) => !s.is_empty(),
-            Value::Module(_) | Value::NativeFn { .. } => true,
-        }
-    }
-
     /// Integer value of ints and bools (`True` is 1, as in Python).
     fn as_int(self) -> Option<i64> {
         match self {
@@ -103,12 +102,9 @@ struct FuncDef<'a> {
 }
 
 pub struct Interpreter<'a, O: Output, H: HardwareBridge = NoHardware> {
-    out: &'a mut O,
-    hw: Option<&'a mut H>,
-    /// Globals first, then one frame of locals per active function call.
-    vars: [(&'a str, Value<'a>); MAX_VARS],
+    /// Top of `stack`.
+    sp: usize,
     nvars: usize,
-    /// First variable slot of the innermost function call.
     /// First local of the innermost call, counted from `globals_len`, so new
     /// globals can be inserted below running calls (`global x; x = 1`).
     frame_off: usize,
@@ -116,21 +112,29 @@ pub struct Interpreter<'a, O: Output, H: HardwareBridge = NoHardware> {
     globals_len: usize,
     call_depth: usize,
     nesting: usize,
+    global_count: usize,
+    frame_globals: usize,
+    steps: u32,
+    /// Maximum statements one `eval` call may execute (`None` = unlimited).
+    step_limit: Option<u32>,
+    /// Line of the last error returned by `eval`, if any.
+    error_line: Option<u32>,
+    /// REPL mode: top-level expression statements print their value.
+    interactive: bool,
+    out: &'a mut O,
+    hw: Option<&'a mut H>,
+    /// Set from outside (e.g. a UART Ctrl-C handler) to stop a running script.
+    abort: Option<&'a AtomicBool>,
+    /// Globals first, then one frame of locals per active function call.
+    vars: [(&'a str, Value<'a>); MAX_VARS],
+    /// Values in flight (see `VALUE_STACK`).
+    stack: [Value<'a>; VALUE_STACK],
     /// Names declared `global` by the active calls; the innermost call's
     /// declarations start at `frame_globals`.
     global_decls: [&'a str; MAX_GLOBAL_DECLS],
-    global_count: usize,
-    frame_globals: usize,
     funcs: [Option<FuncDef<'a>>; MAX_FUNCS],
-    /// Line of the last error returned by `eval`, if any.
-    error_line: Option<u32>,
-    /// Maximum statements one `eval` call may execute (`None` = unlimited).
-    step_limit: Option<u32>,
-    steps: u32,
-    /// Set from outside (e.g. a UART Ctrl-C handler) to stop a running script.
-    abort: Option<&'a AtomicBool>,
-    /// REPL mode: top-level expression statements print their value.
-    interactive: bool,
+    /// Objects created at runtime (empty unless `with_heap` is used).
+    heap: Heap<'a>,
 }
 
 impl<'a, O: Output> Interpreter<'a, O, NoHardware> {
@@ -163,7 +167,49 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
             steps: 0,
             abort: None,
             interactive: false,
+            heap: Heap::new(&mut []),
+            stack: [Value::None; VALUE_STACK],
+            sp: 0,
         }
+    }
+
+    /// Gives the interpreter a heap for objects created at runtime, such as
+    /// strings built with `+`, `str()` or escape sequences. Without one, those
+    /// operations raise `Error::OutOfMemory`.
+    pub fn with_heap(mut self, memory: &'a mut [u8]) -> Self {
+        self.heap = Heap::new(memory);
+        self
+    }
+
+    /// `(used bytes, capacity, live objects, collections)` of the heap.
+    pub fn heap_stats(&self) -> (usize, usize, usize, u32) {
+        (
+            self.heap.used(),
+            self.heap.capacity(),
+            self.heap.objects(),
+            self.heap.collections,
+        )
+    }
+
+    /// Python truth value: `None`, `False`, `0` and `''` are false.
+    fn truthy(&self, v: Value<'a>) -> bool {
+        match v {
+            Value::None => false,
+            Value::Bool(b) => b,
+            Value::Int(n) => n != 0,
+            Value::Str(s) => !s.is_empty(),
+            Value::HStr(r) => !self.heap.str(r).is_empty(),
+            Value::Module(_) | Value::NativeFn { .. } => true,
+        }
+    }
+
+    fn push(&mut self, v: Value<'a>) -> Result<(), Error> {
+        if self.sp >= VALUE_STACK {
+            return Err(Error::OutOfMemory);
+        }
+        self.stack[self.sp] = v;
+        self.sp += 1;
+        Ok(())
     }
 
     /// Limits how many statements (and loop iterations) a single `eval` call
@@ -408,16 +454,23 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
                     // Like Python, `x += 1` needs `x` in the current scope
                     // (a global can't be updated from inside a function).
                     let current = self.get_scope_var(name)?;
-                    let rhs = self.eval_expr(code, expr)?;
-                    let val = binop(op, current, rhs)?;
-                    self.set_var(name, val)?;
+                    // Both operands stay on the value stack while `op` may allocate
+                    let base = self.sp;
+                    let result = self.push(current).and_then(|()| {
+                        let rhs = self.eval_expr(code, expr)?;
+                        self.push(rhs)?;
+                        self.apply_bin(op)?;
+                        Ok(self.stack[self.sp - 1])
+                    });
+                    self.sp = base;
+                    self.set_var(name, result?)?;
                 }
             }
             Stmt::Expr(expr) => {
                 if run {
                     let val = self.eval_expr(code, expr)?;
                     if self.interactive && self.call_depth == 0 && val != Value::None {
-                        self.print_repr(val);
+                        self.write_value(val, true);
                         self.out.write_str("\n");
                     }
                 }
@@ -521,7 +574,10 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
         code: &mut Code<'a>,
     ) -> Result<Flow<'a>, Error> {
         // `taken`: one of the branches has run, so the rest are only parsed
-        let mut taken = run && self.eval_expr(code, cond)?.is_truthy();
+        let mut taken = run && {
+            let val = self.eval_expr(code, cond)?;
+            self.truthy(val)
+        };
         let mut flow = self.exec_body(parser, indent, taken, ctx, code)?;
 
         while self.next_indent(parser)? == Some(indent) {
@@ -535,7 +591,8 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
                     if val.is_err() {
                         self.note_error(line);
                     }
-                    val?.is_truthy()
+                    let val = val?;
+                    self.truthy(val)
                 };
                 let result = self.exec_body(parser, indent, this, ctx, code)?;
                 if this {
@@ -573,7 +630,10 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
             ..ctx
         };
         loop {
-            let go = run && self.eval_expr(code, cond)?.is_truthy();
+            let go = run && {
+                let val = self.eval_expr(code, cond)?;
+                self.truthy(val)
+            };
             let flow = self.exec_body(parser, indent, go, loop_ctx, code)?;
             if !go {
                 // The body was only parsed: the parser is now after the loop
@@ -789,99 +849,195 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
     // Expressions
     // ------------------------------------------------------------------
 
-    /// Evaluates one RPN expression with a fixed-size value stack.
+    /// Evaluates one RPN expression on the shared value stack.
     fn eval_expr(&mut self, code: &Code<'a>, expr: Expr) -> Result<Value<'a>, Error> {
-        let items = code.items(expr);
-        let mut stack = [Value::None; MAX_EVAL_STACK];
-        let mut sp = 0;
-        let mut i = 0;
+        let base = self.sp;
+        let result = self.eval_items(code.items(expr), base);
+        self.sp = base;
+        result
+    }
 
+    /// Runs RPN items. Operands are replaced by their result only after the
+    /// result exists, so anything that allocates keeps its inputs rooted.
+    fn eval_items(&mut self, items: &[Item<'a>], base: usize) -> Result<Value<'a>, Error> {
+        let mut i = 0;
         while i < items.len() {
             let item = items[i];
             i += 1;
-            let val = match item {
-                Item::Int(n) => Value::Int(n),
-                Item::Str(s) => Value::Str(s),
-                Item::Bool(b) => Value::Bool(b),
-                Item::None => Value::None,
-                Item::Ident(name) => self.get_var(name)?,
+            match item {
+                Item::Int(n) => self.push(Value::Int(n))?,
+                Item::Str(s) => {
+                    let val = self.literal(s)?;
+                    self.push(val)?;
+                }
+                Item::Bool(b) => self.push(Value::Bool(b))?,
+                Item::None => self.push(Value::None)?,
+                Item::Ident(name) => {
+                    let val = self.get_var(name)?;
+                    self.push(val)?;
+                }
                 Item::Neg | Item::Invert => {
-                    sp -= 1;
-                    let n = stack[sp].as_int().ok_or(Error::TypeError)?;
-                    Value::Int(if item == Item::Neg {
+                    let n = self.stack[self.sp - 1].as_int().ok_or(Error::TypeError)?;
+                    self.stack[self.sp - 1] = Value::Int(if item == Item::Neg {
                         n.checked_neg().ok_or(Error::Overflow)?
                     } else {
                         !n // `~n` == `-n - 1`, never overflows
-                    })
+                    });
                 }
                 Item::Not => {
-                    sp -= 1;
-                    Value::Bool(!stack[sp].is_truthy())
+                    let truthy = self.truthy(self.stack[self.sp - 1]);
+                    self.stack[self.sp - 1] = Value::Bool(!truthy);
                 }
-                Item::Bin(op) => {
-                    sp -= 2;
-                    binop(op, stack[sp], stack[sp + 1])?
-                }
+                Item::Bin(op) => self.apply_bin(op)?,
                 Item::Cmp(op) => {
-                    sp -= 2;
-                    Value::Bool(compare(op, stack[sp], stack[sp + 1])?)
+                    let (lhs, rhs) = (self.stack[self.sp - 2], self.stack[self.sp - 1]);
+                    let result = self.compare(op, lhs, rhs)?;
+                    self.sp -= 1;
+                    self.stack[self.sp - 1] = Value::Bool(result);
                 }
                 Item::CmpChain { op, skip } => {
-                    sp -= 2;
-                    let rhs = stack[sp + 1];
-                    if compare(op, stack[sp], rhs)? {
-                        rhs // left operand of the next comparison
+                    let (lhs, rhs) = (self.stack[self.sp - 2], self.stack[self.sp - 1]);
+                    let result = self.compare(op, lhs, rhs)?;
+                    self.sp -= 1;
+                    if result {
+                        self.stack[self.sp - 1] = rhs; // left operand of the next link
                     } else {
+                        self.stack[self.sp - 1] = Value::Bool(false);
                         i += skip as usize;
-                        Value::Bool(false)
                     }
                 }
                 Item::AndJump { skip } | Item::OrJump { skip } => {
-                    let truthy = stack[sp - 1].is_truthy();
+                    let truthy = self.truthy(self.stack[self.sp - 1]);
                     let is_and = matches!(item, Item::AndJump { .. });
                     if truthy != is_and {
                         // Result decided: keep this operand, skip the right side
                         i += skip as usize;
                     } else {
-                        sp -= 1;
+                        self.sp -= 1;
                     }
-                    continue;
                 }
                 Item::Call { name, argc } => {
-                    sp -= argc as usize;
+                    // The arguments stay on the stack (rooted) during the call
+                    let start = self.sp - argc as usize;
                     let mut args = [Value::None; MAX_CALL_ARGS];
-                    args[..argc as usize].copy_from_slice(&stack[sp..sp + argc as usize]);
-                    self.call_function(name, &args[..argc as usize])?
+                    args[..argc as usize].copy_from_slice(&self.stack[start..self.sp]);
+                    let val = self.call_function(name, &args[..argc as usize])?;
+                    self.sp = start;
+                    self.push(val)?;
                 }
                 Item::GetAttr(attr) => {
-                    sp -= 1;
-                    let module = as_module(stack[sp])?;
-                    self.module_attr(module, attr)?
+                    let module = as_module(self.stack[self.sp - 1])?;
+                    self.stack[self.sp - 1] = self.module_attr(module, attr)?;
                 }
                 Item::CallAttr { attr, argc } => {
-                    sp -= argc as usize;
+                    let start = self.sp - argc as usize;
+                    let receiver = self.stack[start - 1];
                     let mut args = [Value::None; MAX_CALL_ARGS];
-                    args[..argc as usize].copy_from_slice(&stack[sp..sp + argc as usize]);
-                    sp -= 1;
-                    let module = as_module(stack[sp])?;
-                    let func = self
-                        .module_func(module, attr)
-                        .ok_or(Error::AttributeError)?;
-                    self.call_native(module, func, &args[..argc as usize])?
+                    args[..argc as usize].copy_from_slice(&self.stack[start..self.sp]);
+                    let val = self.call_method(receiver, attr, &args[..argc as usize])?;
+                    self.sp = start - 1;
+                    self.push(val)?;
                 }
-            };
-            if sp >= MAX_EVAL_STACK {
-                return Err(Error::OutOfMemory);
+                Item::Index => {
+                    let (obj, index) = (self.stack[self.sp - 2], self.stack[self.sp - 1]);
+                    let val = self.index_value(obj, index)?;
+                    self.sp -= 1;
+                    self.stack[self.sp - 1] = val;
+                }
+                Item::Slice { has_start, has_end } => {
+                    let bounds = has_start as usize + has_end as usize;
+                    let obj = self.stack[self.sp - bounds - 1];
+                    let mut next = self.sp - bounds;
+                    let mut bound = |present: bool| {
+                        if present {
+                            next += 1;
+                            self.stack[next - 1]
+                        } else {
+                            Value::None
+                        }
+                    };
+                    let (start, end) = (bound(has_start), bound(has_end));
+                    let val = self.slice_value(obj, start, end)?;
+                    self.sp -= bounds;
+                    self.stack[self.sp - 1] = val;
+                }
             }
-            stack[sp] = val;
-            sp += 1;
         }
 
         // The parser only emits well-formed expressions, which leave exactly one value.
-        if sp != 1 {
+        if self.sp != base + 1 {
             return Err(Error::InvalidSyntax);
         }
-        Ok(stack[0])
+        Ok(self.stack[base])
+    }
+
+    /// Replaces the top two stack values with `lhs op rhs`.
+    fn apply_bin(&mut self, op: BinOp) -> Result<(), Error> {
+        let (lhs, rhs) = (self.stack[self.sp - 2], self.stack[self.sp - 1]);
+        let val = if Self::is_str(lhs) || Self::is_str(rhs) {
+            self.str_binop(op, lhs, rhs)?
+        } else {
+            binop(op, lhs, rhs)?
+        };
+        self.sp -= 1;
+        self.stack[self.sp - 1] = val;
+        Ok(())
+    }
+
+    /// `receiver.attr(args)`: a module function or a string method.
+    fn call_method(
+        &mut self,
+        receiver: Value<'a>,
+        attr: &str,
+        args: &[Value<'a>],
+    ) -> Result<Value<'a>, Error> {
+        match receiver {
+            Value::Module(module) => {
+                let func = self
+                    .module_func(module, attr)
+                    .ok_or(Error::AttributeError)?;
+                self.call_native(module, func, args)
+            }
+            Value::Str(_) | Value::HStr(_) => self.str_method(receiver, attr, args),
+            _ => Err(Error::AttributeError),
+        }
+    }
+
+    /// Comparison with Python semantics: numbers (ints/bools) and strings
+    /// compare among themselves; `==`/`!=` between other types are simply
+    /// false/true; ordering between other types is a `TypeError`.
+    fn compare(&self, op: CmpOp, lhs: Value<'a>, rhs: Value<'a>) -> Result<bool, Error> {
+        if matches!(op, CmpOp::In | CmpOp::NotIn) {
+            let hay = self.str_of(rhs).ok_or(Error::TypeError)?;
+            let needle = self.str_of(lhs).ok_or(Error::TypeError)?;
+            return Ok(hay.contains(needle) == (op == CmpOp::In));
+        }
+        let ordering = match (self.str_of(lhs), self.str_of(rhs)) {
+            (Some(a), Some(b)) => a.cmp(b),
+            _ => match (lhs.as_int(), rhs.as_int()) {
+                (Some(a), Some(b)) => a.cmp(&b),
+                _ => {
+                    // None == None, and a module or function equals itself
+                    let equal = matches!((lhs, rhs), (Value::None, Value::None))
+                        || matches!((lhs, rhs), (Value::Module(_) | Value::NativeFn { .. }, _))
+                            && lhs == rhs;
+                    return match op {
+                        CmpOp::Eq => Ok(equal),
+                        CmpOp::Ne => Ok(!equal),
+                        _ => Err(Error::TypeError),
+                    };
+                }
+            },
+        };
+        Ok(match op {
+            CmpOp::Eq => ordering == CmpOrdering::Equal,
+            CmpOp::Ne => ordering != CmpOrdering::Equal,
+            CmpOp::Lt => ordering == CmpOrdering::Less,
+            CmpOp::Le => ordering != CmpOrdering::Greater,
+            CmpOp::Gt => ordering == CmpOrdering::Greater,
+            CmpOp::Ge => ordering != CmpOrdering::Less,
+            CmpOp::In | CmpOp::NotIn => unreachable!("handled above"),
+        })
     }
 
     /// Calls a `def` function, the built-in `print`, or a hardware function.
@@ -901,10 +1057,13 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
                 if i > 0 {
                     self.out.write_str(" ");
                 }
-                self.print_value(*val);
+                self.write_value(*val, false);
             }
             self.out.write_str("\n");
             return Ok(Value::None);
+        }
+        if let Some(result) = self.str_builtin(name, args) {
+            return result;
         }
 
         match (name, args) {
@@ -917,7 +1076,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
                 let want = if name == "min" { CmpOp::Lt } else { CmpOp::Gt };
                 let mut best = *first;
                 for &val in rest {
-                    if compare(want, val, best)? {
+                    if self.compare(want, val, best)? {
                         best = val;
                     }
                 }
@@ -955,6 +1114,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
         for (slot, val) in hw_args.iter_mut().zip(args) {
             *slot = match *val {
                 Value::Str(s) => Arg::Str(s),
+                Value::HStr(r) => Arg::Str(self.heap.str(r)),
                 other => Arg::Int(other.as_int().ok_or(Error::TypeError)?),
             };
         }
@@ -1019,6 +1179,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
         for (slot, val) in hw_args.iter_mut().zip(args) {
             *slot = match *val {
                 Value::Str(s) => Arg::Str(s),
+                Value::HStr(r) => Arg::Str(self.heap.str(r)),
                 other => Arg::Int(other.as_int().ok_or(Error::TypeError)?),
             };
         }
@@ -1068,7 +1229,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
     /// functions and constants of the bridge.
     fn print_help(&mut self) {
         self.out.write_str(
-            "Built-in:\n  print(...)\n  help()\n  abs(x), min(a, b, ...), max(a, b, ...)\n",
+            "Built-in:\n  print(...)\n  help()\n  abs(x), min(a, b, ...), max(a, b, ...)\n  len(s), str(x), repr(x), int(x, [base]), ord(c), chr(n)\n",
         );
 
         let mut funcs = self.funcs.iter().flatten().peekable();
@@ -1123,75 +1284,6 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
             self.out.write_str("\n");
         }
     }
-
-    fn print_value(&mut self, val: Value<'_>) {
-        match val {
-            Value::None => self.out.write_str("None"),
-            Value::Bool(true) => self.out.write_str("True"),
-            Value::Bool(false) => self.out.write_str("False"),
-            Value::Str(s) => self.out.write_str(s),
-            Value::Int(n) => self.write_i64(n),
-            Value::Module(module) => {
-                let name = self.modules().get(module as usize).map_or("?", |m| m.name);
-                for part in ["<module '", name, "'>"] {
-                    self.out.write_str(part);
-                }
-            }
-            Value::NativeFn { module, func } => {
-                let (m, f) = self.modules().get(module as usize).map_or(("?", "?"), |m| {
-                    (
-                        m.name,
-                        m.functions.get(func as usize).map_or("?", |f| f.name),
-                    )
-                });
-                for part in ["<function ", m, ".", f, ">"] {
-                    self.out.write_str(part);
-                }
-            }
-        }
-    }
-
-    /// Prints a value the way the Python REPL shows it: strings in quotes.
-    fn print_repr(&mut self, val: Value<'_>) {
-        match val {
-            Value::Str(s) => {
-                // Like Python: single quotes, unless the text contains them
-                let quote = if s.contains('\'') && !s.contains('"') {
-                    "\""
-                } else {
-                    "'"
-                };
-                self.out.write_str(quote);
-                self.out.write_str(s);
-                self.out.write_str(quote);
-            }
-            other => self.print_value(other),
-        }
-    }
-
-    fn write_i64(&mut self, value: i64) {
-        if value == 0 {
-            self.out.write_str("0");
-            return;
-        }
-        let mut buf = [0u8; 20];
-        let mut idx = buf.len();
-        let negative = value < 0;
-        // `unsigned_abs` also handles i64::MIN, whose negation does not fit in i64
-        let mut n = value.unsigned_abs();
-        while n > 0 {
-            idx -= 1;
-            buf[idx] = b'0' + (n % 10) as u8;
-            n /= 10;
-        }
-        if negative {
-            idx -= 1;
-            buf[idx] = b'-';
-        }
-        if let Ok(s) = core::str::from_utf8(&buf[idx..]) {
-            self.out.write_str(s);
-        }
-    }
 }
 
 /// The module in `val`, for `val.attr`; other values have no attributes.
@@ -1213,37 +1305,6 @@ fn binop<'a>(op: BinOp, lhs: Value<'a>, rhs: Value<'a>) -> Result<Value<'a>, Err
     Ok(match op {
         BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor if both_bool => Value::Bool(result != 0),
         _ => Value::Int(result),
-    })
-}
-
-/// Comparison with Python semantics: numbers (ints/bools) and strings compare
-/// among themselves; `==`/`!=` between other types are simply false/true;
-/// ordering between other types is a `TypeError`.
-fn compare(op: CmpOp, lhs: Value<'_>, rhs: Value<'_>) -> Result<bool, Error> {
-    let ordering = match (lhs, rhs) {
-        (Value::Str(a), Value::Str(b)) => a.cmp(b),
-        _ => match (lhs.as_int(), rhs.as_int()) {
-            (Some(a), Some(b)) => a.cmp(&b),
-            _ => {
-                // None == None, and a module or function equals itself
-                let equal = matches!((lhs, rhs), (Value::None, Value::None))
-                    || matches!((lhs, rhs), (Value::Module(_) | Value::NativeFn { .. }, _))
-                        && lhs == rhs;
-                return match op {
-                    CmpOp::Eq => Ok(equal),
-                    CmpOp::Ne => Ok(!equal),
-                    _ => Err(Error::TypeError),
-                };
-            }
-        },
-    };
-    Ok(match op {
-        CmpOp::Eq => ordering == CmpOrdering::Equal,
-        CmpOp::Ne => ordering != CmpOrdering::Equal,
-        CmpOp::Lt => ordering == CmpOrdering::Less,
-        CmpOp::Le => ordering != CmpOrdering::Greater,
-        CmpOp::Gt => ordering == CmpOrdering::Greater,
-        CmpOp::Ge => ordering != CmpOrdering::Less,
     })
 }
 
@@ -1317,6 +1378,7 @@ fn int_binop(op: BinOp, a: i64, b: i64) -> Result<i64, Error> {
 
 #[cfg(test)]
 mod tests {
+    extern crate std;
     use super::*;
 
     struct MockOut {
@@ -1432,7 +1494,8 @@ print('LED ok')
         }
         let src = core::str::from_utf8(&buf[..len]).unwrap();
 
-        let mut vm = Interpreter::new(out);
+        let mut heap = [0u8; 2048];
+        let mut vm = Interpreter::new(out).with_heap(&mut heap);
         vm.eval(src)?;
         Ok(out.as_str().trim_end_matches('\n'))
     }
@@ -1505,7 +1568,7 @@ print('LED ok')
         assert_eval_err("-(-9223372036854775807 - 1)", Error::Overflow);
         assert_eval_err("2 ** -1", Error::TypeError);
         assert_eval_err("'a' + 1", Error::TypeError);
-        assert_eval_err("'a' * 3", Error::TypeError);
+        assert_eval_err("'a' - 'b'", Error::TypeError);
         assert_eval_err("-'a'", Error::TypeError);
         // i64::MIN is reachable and prints correctly
         assert_eval("-9223372036854775807 - 1", "-9223372036854775808");
@@ -1661,7 +1724,8 @@ print(nothing)
 
     /// Runs a script and returns its output, panicking on errors.
     fn run_ok<'b>(src: &str, out: &'b mut MockOut) -> &'b str {
-        let mut vm = Interpreter::new(out);
+        let mut heap = [0u8; 4096];
+        let mut vm = Interpreter::new(out).with_heap(&mut heap);
         if let Err(err) = vm.eval(src) {
             panic!("error {:?} at line {:?} in:\n{}", err, vm.error_line(), src);
         }
@@ -1676,7 +1740,8 @@ print(nothing)
     /// Runs a script that must fail, returning the error and its line.
     fn run_err(src: &str) -> (Error, Option<u32>) {
         let mut out = MockOut::new();
-        let mut vm = Interpreter::new(&mut out);
+        let mut heap = [0u8; 4096];
+        let mut vm = Interpreter::new(&mut out).with_heap(&mut heap);
         let err = vm.eval(src).expect_err("script should fail");
         (err, vm.error_line())
     }
@@ -1794,7 +1859,8 @@ print(nothing)
         );
         let (err, line) = run_err("a = 1\nmissing += 1");
         assert_eq!((err, line), (Error::UnknownIdentifier, Some(2)));
-        assert_eq!(run_err("s = 'a'\ns += 'b'").0, Error::TypeError);
+        assert_output("s = 'a'\ns += 'b'\ns *= 2\nprint(s)", "abab\n");
+        assert_eq!(run_err("s = 'a'\ns -= 'b'").0, Error::TypeError);
         assert_eq!(run_err("1 += 2").0, Error::InvalidSyntax);
     }
 
@@ -2026,7 +2092,7 @@ print(fact(7), fib(7))
         let interp = core::mem::size_of::<Interpreter<'_, MockOut, MockHardware>>();
         let code = core::mem::size_of::<Code<'_>>();
         let parser = core::mem::size_of::<Parser<'_>>();
-        assert!(interp <= 8192, "Interpreter is {} bytes", interp);
+        assert!(interp <= 16384, "Interpreter is {} bytes", interp);
         assert!(code <= 1024, "Code is {} bytes", code);
         assert!(parser <= 128, "Parser is {} bytes", parser);
     }
@@ -2196,7 +2262,7 @@ print(fact(7), fib(7))
         assert_eq!(vm.eval("help(1)"), Err(Error::TypeError));
         assert_eq!(
             out.as_str(),
-            "Built-in:\n  print(...)\n  help()\n  abs(x), min(a, b, ...), max(a, b, ...)\n\
+            "Built-in:\n  print(...)\n  help()\n  abs(x), min(a, b, ...), max(a, b, ...)\n  len(s), str(x), repr(x), int(x, [base]), ord(c), chr(n)\n\
              Script functions:\n  blink(times, ms)\n\
              Hardware:\n  pin_write(pin, value) - Set an output pin\n  pin_read(pin) - Read a pin\n  \
              text(s, [x, y]) - Show text\n  ticks_ms()\n\
@@ -2208,7 +2274,7 @@ print(fact(7), fib(7))
         Interpreter::new(&mut out).eval("help()").unwrap();
         assert_eq!(
             out.as_str(),
-            "Built-in:\n  print(...)\n  help()\n  abs(x), min(a, b, ...), max(a, b, ...)\n"
+            "Built-in:\n  print(...)\n  help()\n  abs(x), min(a, b, ...), max(a, b, ...)\n  len(s), str(x), repr(x), int(x, [base]), ord(c), chr(n)\n"
         );
     }
 
@@ -2526,6 +2592,194 @@ print(outer(), count)
         assert_eval_err("max()", Error::TypeError);
         assert_eval_err("max(1, 'a')", Error::TypeError);
         assert_eval_err("abs(-9223372036854775807 - 1)", Error::Overflow);
+    }
+
+    // ---- 5.1 strings ---------------------------------------------------
+
+    #[test]
+    fn test_string_operators_indexing_slicing() {
+        assert_eval("'a' + 'b'", "ab");
+        assert_eval("'ab' * 3", "ababab");
+        assert_eval("3 * 'ab'", "ababab");
+        assert_eval("'ab' * 0 + '|'", "|");
+        assert_eval("'x' * -1 + '|'", "|");
+        assert_eval("len('héllo')", "5");
+        assert_eval("len('')", "0");
+        assert_eval("'hello'[1]", "e");
+        assert_eval("'hello'[-1]", "o");
+        assert_eval("'hello'[1:3]", "el");
+        assert_eval("'hello'[:2]", "he");
+        assert_eval("'hello'[3:]", "lo");
+        assert_eval("'hello'[-3:-1]", "ll");
+        assert_eval("'hello'[4:1] + '|'", "|");
+        assert_eval("'hello'[:]", "hello");
+        assert_eval("'hello'[-100:100]", "hello");
+        assert_eval("'héllo'[1]", "é");
+        assert_eval("('ab' + 'cd')[1:3]", "bc");
+        assert_eval("'ell' in 'hello'", "True");
+        assert_eval("'z' not in 'hello'", "True");
+        assert_eval("'' in 'abc'", "True");
+        assert_eval("'a' < 'b' < 'c'", "True");
+        assert_eval("'ab' == 'a' + 'b'", "True");
+        assert_eval("'abc'[1] == 'b'", "True");
+        assert_eval("not ''", "True");
+        assert_eval("not ('a' + '')", "False");
+    }
+
+    #[test]
+    fn test_string_escapes_str_repr() {
+        assert_eval("'\\x41\\u00e9\\101'", "AéA");
+        assert_eval("len('\\x00\\n')", "2");
+        assert_eval("len('a\\\\b')", "3");
+        assert_eval("'it\\'s'", "it's");
+        assert_eval("\"say \\\"hi\\\"\"", "say \"hi\"");
+        assert_eval("'\\q'", "\\q");
+        assert_eval("repr('it\\'s')", "\"it's\"");
+        assert_eval("repr('a\\nb')", "'a\\nb'");
+        assert_eval("repr('tab\\there')", "'tab\\there'");
+        assert_eval("repr('\\x01\\x7f')", "'\\x01\\x7f'");
+        assert_eval("repr('q\"')", "'q\"'");
+        assert_eval("repr(\"both ' and \\\"\")", "'both \\' and \"'");
+        assert_eval("repr('back\\\\slash')", "'back\\\\slash'");
+        assert_eval("repr('')", "''");
+        assert_eval("str(42) + '!'", "42!");
+        assert_eval("str(True)", "True");
+        assert_eval("str(None) + str(-7)", "None-7");
+        assert_eval("str('same')", "same");
+        assert_eval("str()", "");
+        assert_eval("repr(5)", "5");
+        assert_eval("repr(None)", "None");
+        assert_eval("repr('x') == \"'x'\"", "True");
+        assert_eval("repr('a' + 'b')", "'ab'");
+    }
+
+    #[test]
+    fn test_string_builtins_and_methods() {
+        assert_eval("int('42') + int(' -7 ')", "35");
+        assert_eval("int('0x1F', 16)", "31");
+        assert_eval("int('ff', 16)", "255");
+        assert_eval("int('0b101', 0)", "5");
+        assert_eval("int('1_000')", "1000");
+        assert_eval("int(True) + int(5)", "6");
+        assert_eval("ord('A')", "65");
+        assert_eval("chr(97) + chr(9786)", "a☺");
+        assert_eval("'Hello'.upper()", "HELLO");
+        assert_eval("'MiXeD'.lower()", "mixed");
+        assert_eval("'straße'.upper()", "STRASSE");
+        assert_eval("'  pad  '.strip() + '|'", "pad|");
+        assert_eval("'xxhixx'.strip('x')", "hi");
+        assert_eval("'  a '.lstrip() + '|'", "a |");
+        assert_eval("' a  '.rstrip() + '|'", " a|");
+        assert_eval("'   '.strip() + '|'", "|");
+        assert_eval("'hello'.startswith('he')", "True");
+        assert_eval("'hello'.endswith('lo')", "True");
+        assert_eval("'hello'.find('l')", "2");
+        assert_eval("'hello'.find('z')", "-1");
+        assert_eval("'héllo'.find('l')", "2");
+        assert_eval("'banana'.count('an')", "2");
+        assert_eval("'abc'.count('')", "4");
+        assert_eval("'a-b-c'.replace('-', '+')", "a+b+c");
+        assert_eval("'aaa'.replace('a', 'bb')", "bbbbbb");
+        assert_eval("'ab'.replace('', '-')", "-a-b-");
+        assert_eval("'abc'.replace('x', 'y')", "abc");
+        assert_eval("('a' + 'b').upper().lower().strip()", "ab");
+        assert_eval("'123'.isdigit()", "True");
+        assert_eval("''.isdigit()", "False");
+        assert_eval("'abc'.isalpha()", "True");
+        assert_eval("'A1'.isupper()", "True");
+        assert_eval("'a1'.islower()", "True");
+        assert_eval("' \\t'.isspace()", "True");
+        assert_eval("'ab1'.isalnum()", "True");
+    }
+
+    #[test]
+    fn test_string_errors() {
+        assert_eval_err("'abc'[3]", Error::IndexError);
+        assert_eval_err("'abc'[-4]", Error::IndexError);
+        assert_eval_err("'abc'['x']", Error::TypeError);
+        assert_eval_err("5[0]", Error::TypeError);
+        assert_eval_err("len(5)", Error::TypeError);
+        assert_eval_err("int('12x')", Error::ValueError);
+        assert_eval_err("int('')", Error::ValueError);
+        assert_eval_err("int('9223372036854775808')", Error::Overflow);
+        assert_eval_err("chr(-1)", Error::ValueError);
+        assert_eval_err("ord('ab')", Error::TypeError);
+        assert_eval_err("'abc'.nope()", Error::AttributeError);
+        assert_eval_err("'abc'.upper", Error::AttributeError);
+        assert_eval_err("'a' + 1", Error::TypeError);
+        assert_eval_err("1 in 'abc'", Error::TypeError);
+        assert_eval_err("'\\xZZ'", Error::InvalidSyntax);
+        assert_eval_err("'a' < 1", Error::TypeError);
+    }
+
+    /// Runs `src` with a heap of `size` bytes; returns output and heap stats.
+    fn run_with_heap(src: &str, size: usize) -> (std::string::String, Result<(), Error>, u32) {
+        let mut out = MockOut::new();
+        let mut mem = std::vec![0u8; size];
+        let mut vm = Interpreter::new(&mut out).with_heap(&mut mem);
+        let result = vm.eval(src);
+        let collections = vm.heap_stats().3;
+        (out.as_str().into(), result, collections)
+    }
+
+    #[test]
+    fn test_gc_reclaims_garbage_and_keeps_live_strings() {
+        // 200 strings of 23 bytes in a 256-byte heap: only works with collection
+        let src = "keep = 'k' + 'eep'\ni = 0\nwhile i < 200:\n    tmp = 'x' * 20 + str(i)\n    i += 1\nprint(keep, tmp[-3:], len(tmp))";
+        let (out, result, collections) = run_with_heap(src, 256);
+        assert_eq!(result, Ok(()));
+        assert_eq!(out, "keep 199 23\n");
+        assert!(collections > 5, "only {} collections", collections);
+
+        // A string only on the value stack survives a collection caused by a call
+        let src = "def junk(n):\n    i = 0\n    while i < n:\n        t = 'y' * 30\n        i += 1\n    return 'r'\ns = 'a' * 10 + junk(50) + 'b' * 10\nprint(s)";
+        let (out, result, collections) = run_with_heap(src, 256);
+        assert_eq!(result, Ok(()));
+        assert_eq!(out, "aaaaaaaaaarbbbbbbbbbb\n");
+        assert!(collections > 0);
+
+        // Growing a string with += in a loop
+        let src = "s = ''\ni = 0\nwhile i < 50:\n    s += 'ab'\n    i += 1\nprint(len(s), s[:6])";
+        let (out, result, _) = run_with_heap(src, 512);
+        assert_eq!(result, Ok(()));
+        assert_eq!(out, "100 ababab\n");
+    }
+
+    #[test]
+    fn test_heap_limits() {
+        // Live data larger than the heap
+        let (_, result, _) = run_with_heap("a = 'x' * 50\nb = 'y' * 50", 64);
+        assert_eq!(result, Err(Error::OutOfMemory));
+        // Without a heap, source strings (and slices of them) still work
+        let mut out = MockOut::new();
+        let mut vm = Interpreter::new(&mut out);
+        assert_eq!(
+            vm.eval("print('hello'[1:3], len('abc'), 'b' in 'abc')"),
+            Ok(())
+        );
+        assert_eq!(vm.eval("x = 'a' + 'b'"), Err(Error::OutOfMemory));
+        assert_eq!(vm.eval("x = '\\n'"), Err(Error::OutOfMemory));
+        let (used, capacity, objects, _) = vm.heap_stats();
+        assert_eq!((used, capacity, objects), (0, 0, 0));
+        assert_eq!(out.as_str(), "el 3 True\n");
+    }
+
+    #[test]
+    fn test_heap_strings_with_hardware_and_repl() {
+        let mut out = MockOut::new();
+        let mut hw = TableHardware {
+            last_text: [0; 16],
+            text_len: 0,
+            pins: [0; 4],
+        };
+        let mut mem = [0u8; 256];
+        let mut vm = Interpreter::with_hardware(&mut out, &mut hw).with_heap(&mut mem);
+        vm.eval("text('val=' + str(4 * 10))").unwrap();
+        vm.set_interactive(true);
+        vm.eval("'a\\tb' + '!'").unwrap();
+        vm.eval("str(7)").unwrap();
+        assert_eq!(&hw.last_text[..hw.text_len], b"val=40");
+        assert_eq!(out.as_str(), "'a\\tb!'\n'7'\n");
     }
 
     #[test]

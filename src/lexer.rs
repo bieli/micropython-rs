@@ -24,6 +24,7 @@ pub enum Token<'a> {
     From,
     As,
     Global,
+    In,
     And,
     Or,
     Not,
@@ -58,6 +59,8 @@ pub enum Token<'a> {
     // Punctuation
     LParen,
     RParen,
+    LBracket,
+    RBracket,
     Comma,
     Colon,
     /// `.` in `module.name`
@@ -166,6 +169,8 @@ impl<'a> Lexer<'a> {
         let token = match ch {
             '(' => Token::LParen,
             ')' => Token::RParen,
+            '[' => Token::LBracket,
+            ']' => Token::RBracket,
             ',' => Token::Comma,
             ':' => Token::Colon,
             ';' => Token::Semicolon,
@@ -223,6 +228,8 @@ impl<'a> Lexer<'a> {
         }
     }
 
+    /// A string literal, returned as written (escape sequences such as `\n`
+    /// are decoded by the interpreter, so plain literals stay zero-copy).
     fn lex_string(&mut self, quote: char) -> Result<Token<'a>, Error> {
         let start = self.pos;
         while let Some(ch) = self.peek() {
@@ -231,7 +238,16 @@ impl<'a> Lexer<'a> {
                 self.advance();
                 return Ok(Token::Str(&self.src[start..end]));
             }
+            if ch == '\n' {
+                break; // a quoted string can't span lines
+            }
             self.advance();
+            if ch == '\\' {
+                // Skip the escaped character, so `\'` doesn't end the string
+                if self.peek().is_some_and(|c| c != '\n') {
+                    self.advance();
+                }
+            }
         }
         Err(Error::UnterminatedString)
     }
@@ -314,6 +330,7 @@ impl<'a> Lexer<'a> {
             "from" => Token::From,
             "as" => Token::As,
             "global" => Token::Global,
+            "in" => Token::In,
             "and" => Token::And,
             "or" => Token::Or,
             "not" => Token::Not,
@@ -628,7 +645,7 @@ mod tests {
 
     #[test]
     fn test_token_lines() {
-        let mut lexer = Lexer::new("a\n\n  # comment\nb 'multi\nline' c");
+        let mut lexer = Lexer::new("a\n\n  # comment\nb 'one line'\nc");
         let mut lines = [0u32; 8];
         let mut count = 0;
         loop {

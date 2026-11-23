@@ -13,7 +13,7 @@ MicroPython virtual machine written in RUST language for embedded systems
 
 A minimal, zero-dependency, `#![no_std]` Python interpreter written in Rust.
 
-Designed from scratch to run on bare-metal microcontrollers (like ARM Cortex-M) **without** needing the Rust standard library (`std`) or dynamic heap allocations.
+Designed from scratch to run on bare-metal microcontrollers (like ARM Cortex-M) **without** needing the Rust standard library (`std`) or a system allocator: all memory is fixed-size and given by your firmware.
 
 ---
 
@@ -21,9 +21,11 @@ Designed from scratch to run on bare-metal microcontrollers (like ARM Cortex-M) 
 
 If you are new to Rust or embedded development, this codebase is a clean, readable starting point to learn how interpreters work under the hood:
 
-* **Zero Heap Allocations:** Uses stack arrays and string slices (`&str`) instead of `Vec` or `String`.
+* **No system allocator:** Fixed-size arrays, string slices (`&str`) of the script source, and one fixed-size heap
+  (a byte buffer you provide) with a garbage collector for strings built at runtime. No `Vec`, `String` or `alloc`.
 * **Hardware Agnostic (`#![no_std]`):** Connects to any display, UART serial port, or terminal via a simple 1-method `Output` trait.
-* **Modular & Easy to Read:** Split into four small, self-contained files (`lexer.rs`, `ast_parser.rs`, `interpreter.rs`, and `lib.rs`).
+* **Modular & Easy to Read:** Split into small, self-contained files (`lexer.rs`, `ast_parser.rs`, `interpreter.rs`,
+  `strings.rs`, `heap.rs`, `flatfs.rs` and `lib.rs`).
 
 ---
 
@@ -74,7 +76,8 @@ flags |= 1 << 3                   # bitwise & | ^ ~ << >> and augmented assignme
 
 | Area | Supported |
 |------|-----------|
-| Values | `int` (64-bit), `str` (literals only), `bool` (`True`/`False`), `None` |
+| Values | `int` (64-bit), `str`, `bool` (`True`/`False`), `None` |
+| Strings | Escapes (`'\n'`, `'\x41'`, `'\u263a'`), `+`, `*`, `len()`, `s[i]`, `s[a:b]`, `in` / `not in`, `str()`, `repr()`, `int(s, base)`, `ord()`, `chr()`, and methods `upper lower strip lstrip rstrip startswith endswith find count replace isdigit isalpha isalnum isspace isupper islower` |
 | Literals | `42`, `1_000`, `0x1F`, `0o17`, `0b1010`, `'single'`, `"double"` |
 | Operators | `+ - * / // % **`, `& \| ^ ~ << >>`, `== != < <= > >=` (chainable), `and or not` |
 | Assignment | `x = ...`, and `+= -= *= /= //= %= **= &= \|= ^= <<= >>=` |
@@ -83,7 +86,7 @@ flags |= 1 << 3                   # bitwise & | ^ ~ << >> and augmented assignme
 | Scope | `global a, b` in a function, to assign globals (also creates them) |
 | Modules | `import m`, `import m as x, n`, `from m import f, C as K`; `m.f(...)`, `m.CONST` for native modules written in Rust |
 
-Not supported yet: `for`, lists/dicts/tuples, floats, string operations, classes, importing `.py` files.
+Not supported yet: `for`, lists/dicts/tuples, floats, `split`/`join`/`format`/f-strings, classes, importing `.py` files.
 See [ROADMAP.md](ROADMAP.md) for what's planned.
 
 ### Arithmetic operators
@@ -112,8 +115,8 @@ Rules (they match CPython unless marked *differs*):
 * *Differs:* `/` is integer (floor) division (`7 / 2` → `3`), because floats aren't supported yet.
 * *Differs:* results that don't fit in `i64` raise `Error::Overflow`. CPython has unlimited-size integers.
 * `x / 0`, `x // 0` and `x % 0` raise `Error::ZeroDivision`.
-* Negative exponents (`2 ** -1`) and arithmetic on strings (`'a' + 'b'`) raise `Error::TypeError`.
-  String concatenation would need heap memory.
+* Negative exponents (`2 ** -1`) raise `Error::TypeError`. Strings support `+` and `*` (see [Strings](#strings));
+  other operators on strings, and mixing strings with numbers (`'a' + 1`), raise `Error::TypeError`.
 * `bool` behaves as an integer (`True + 1` → `2`); `&`, `|`, `^` of two bools give a bool.
 * `and`/`or` return one of their operands and skip the right side when the result is known,
   so `0 and f()` never calls `f`.
@@ -185,7 +188,43 @@ Limits (in `src/interpreter.rs`):
 | `MAX_NESTING` | 24 | Nested blocks (`if`/`while`/function bodies) running at once | `OutOfMemory` |
 
 Native stack use grows with each nested call (an RPN buffer and value stack per call), which is why
-`MAX_CALL_DEPTH` is small. On a 64-bit host the `Interpreter` struct is about 7 KB; on 32-bit MCUs it's smaller.
+`MAX_CALL_DEPTH` is small. On a 64-bit host the `Interpreter` struct is about 13 KB (including the 128-value stack
+and the 256-entry object table of the heap); on 32-bit MCUs it's smaller.
+
+### Strings
+
+```python
+name = 'TTGO'
+msg = 'Hello, ' + name + '!\t\x41'           # escapes are decoded
+print(msg, len(msg), repr(msg))              # Hello, TTGO!	A 14 'Hello, TTGO!\tA'
+print(msg.upper(), msg[7:11], msg[-3:], 'GO' in msg, msg.find('!'))
+print('v=' + str(adc_vref()) + ' mV', int('0x1F', 16), chr(9786), ord('A'))
+```
+
+* Indices and lengths count characters (Unicode code points), like Python: `len('héllo')` is 5.
+* `repr()` returns a valid Python literal (quotes and escapes chosen like CPython), which is also what the REPL echoes.
+* `str(s)` returns `s` itself (strings never change); a missing index raises `Error::IndexError`, `int('x')` raises
+  `Error::ValueError`.
+* All test expressions are checked against CPython. Not supported yet: `split`, `join`, `format`, `%` and f-strings
+  (they need lists or formatting), and bound methods (`f = s.upper` without calling it).
+
+**Memory.** A literal without escapes, and any slice of it, points into the script source and costs no memory.
+Strings created at runtime (`+`, `*`, `str()`, escapes, `upper()`, ...) live in a fixed-size **heap**: a byte buffer
+the application passes to `Interpreter::with_heap`. When it's full, a **mark-and-sweep garbage collector** keeps
+everything reachable from variables and from the value stack (the operands of every expression being evaluated,
+including those of calling functions), frees the rest and moves the survivors together. Values refer to heap objects
+through handles, so moving them is safe. Limits: the buffer size and 256 live objects (`heap::MAX_OBJECTS`); beyond
+that, `Error::OutOfMemory`. Without a heap, building strings raises `Error::OutOfMemory`; everything else works.
+
+```rust
+let mut heap = [0u8; 16 * 1024];
+let mut vm = Interpreter::new(&mut uart).with_heap(&mut heap);
+vm.eval("print('a' + 'b' * 3)")?;                     // abbb
+let (used, capacity, objects, collections) = vm.heap_stats();
+```
+
+The ESP32 firmware gives the interpreter a 32 KB heap (static memory, not the stack). On the TTGO, a loop creating
+2 000 strings in it takes 1.6 s, with the collector running as needed.
 
 ### Function calls
 
@@ -248,7 +287,8 @@ impl Output for UartWriter {
 
 fn run_script() {
     let mut uart = UartWriter;
-    let mut vm = Interpreter::new(&mut uart);
+    let mut heap = [0u8; 8 * 1024];  // optional: memory for strings built at runtime
+    let mut vm = Interpreter::new(&mut uart).with_heap(&mut heap);
     let _ = vm.eval("print('Hello from bare metal!')");
 }
 ```

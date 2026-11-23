@@ -27,7 +27,9 @@ fn main() {
     };
 
     let mut out = StdoutSink;
-    let mut vm = Interpreter::new(&mut out);
+    // Objects created at runtime (strings built by the script) live here
+    let mut heap = vec![0u8; 256 * 1024];
+    let mut vm = Interpreter::new(&mut out).with_heap(&mut heap);
 
     if let Err(err) = vm.eval(&script) {
         match vm.error_line() {
