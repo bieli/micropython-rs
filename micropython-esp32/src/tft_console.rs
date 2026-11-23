@@ -16,7 +16,6 @@ use esp_hal::{
     time::Rate,
     Blocking,
 };
-use esp_println::print;
 use micropython_rs::Output;
 use mipidsi::{
     interface::SpiInterface,
@@ -265,6 +264,11 @@ impl<'d> TftConsole<'d> {
             self.col = 0;
             return;
         }
+        if ch == '\x08' {
+            // Backspace (the REPL erases with "\x08 \x08")
+            self.col = (self.col - 1).max(0);
+            return;
+        }
 
         if self.col >= MAX_COLS {
             self.newline();
@@ -287,7 +291,7 @@ impl<'d> TftConsole<'d> {
 impl<'d> Output for TftConsole<'d> {
     fn write_str(&mut self, s: &str) {
         // Mirror output to USB serial console as well
-        print!("{}", s);
+        crate::serial_console::write_serial(s);
 
         for ch in s.chars() {
             self.put_char(ch);

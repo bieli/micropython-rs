@@ -255,6 +255,10 @@ impl<'d> Board<'d> {
     fn sleep_ms(&mut self, ms: i64) -> Result<(), Error> {
         let mut remaining = non_negative(ms)?;
         while remaining > 0 {
+            // Ctrl-C on the serial port interrupts long sleeps too
+            if crate::ABORT.load(core::sync::atomic::Ordering::Relaxed) {
+                return Err(Error::Interrupted);
+            }
             let chunk = remaining.min(SLEEP_CHUNK_MS);
             self.delay.delay_millis(chunk as u32);
             remaining -= chunk;

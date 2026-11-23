@@ -20,6 +20,11 @@ FEATURES_FLAG := $(if $(FEATURES),--features $(FEATURES),)
 # directory; leave empty for the board's demo (scripts/demo.py or scripts/ttgo_demo.py)
 SCRIPT       ?=
 
+# `make flash` erases a main.py saved in flash (nvs partition), so the new build runs its
+# embedded script; KEEP_MAIN=1 keeps the saved main.py
+KEEP_MAIN    ?=
+ERASE_FLAG   := $(if $(KEEP_MAIN),,--erase-parts nvs)
+
 # Mount the parent directory so Cargo inside Docker can resolve `micropython-rs = { path = ".." }`
 WORKSPACE_ROOT := $(abspath ..)
 
@@ -44,7 +49,7 @@ build:
 
 # Build via Docker, then flash to the ESP32 and open the serial monitor
 flash: build
-	$(ESPFLASH) flash $(PORT_FLAG) --monitor $(ELF_PATH)
+	$(ESPFLASH) flash $(PORT_FLAG) $(ERASE_FLAG) --monitor $(ELF_PATH)
 
 # Open the serial monitor without rebuilding or reflashing
 monitor:
