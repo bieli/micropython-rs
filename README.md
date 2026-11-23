@@ -181,8 +181,10 @@ Calls are expressions, so they can be nested and combined with operators: `print
 
 * `print(...)` is built in. It prints its arguments separated by spaces and returns `None`.
 * Your own `def` functions are looked up next.
-* Every other name is passed to your `HardwareBridge`. Arguments must be integers or bools (otherwise `Error::TypeError`).
-  Return `Ok(Some(n))` to give the script a value, or `Ok(None)` for `None`.
+* Every other name is passed to your `HardwareBridge` (see [Connecting hardware](#connecting-hardware-hardwarebridge)).
+  Arguments are integers, bools (passed as 0/1) or strings; `None` is a `TypeError`.
+  The bridge returns `Ok(Some(n))` to give the script a value, or `Ok(None)` for `None`.
+* `help()` lists the built-ins, the script's `def` functions, and the bridge's functions and constants.
 * All arguments are evaluated before the call runs. If one fails, nothing is printed or sent to hardware.
 
 ### Errors, line numbers and running safely on a device
@@ -239,21 +241,63 @@ fn run_script() {
 }
 ```
 
+### Connecting hardware (`HardwareBridge`)
+
+Hardware functions come from a `HardwareBridge`. All its methods have defaults, so implement only what you need:
+
+| Method | Purpose |
+|--------|---------|
+| `call(name, &[i64])` | Integer-only functions: the simplest option |
+| `call_args(name, &[Arg])` | Functions that also take strings (`Arg::Int` / `Arg::Str`). The default converts to integers and calls `call` |
+| `functions() -> &[HwFn]` | Function table. When it's not empty, unknown names and wrong argument counts are rejected before your code runs, and `help()` lists the entries |
+| `constants() -> &[(&str, i64)]` | Named constants scripts can read, such as `OUT` or `LED`. Variables with the same name take precedence |
+
+```rust
+use micropython_rs::{Arg, Error, HardwareBridge, HwFn, Interpreter};
+
+const FUNCTIONS: &[HwFn] = &[
+    HwFn::new("pin_write", "pin, value", "Set an output pin"),
+    HwFn::new("show", "text", "Show text on the LCD"),
+];
+
+struct MyBoard;
+
+impl HardwareBridge for MyBoard {
+    fn call_args(&mut self, name: &str, args: &[Arg<'_>]) -> Result<Option<i64>, Error> {
+        match name {
+            "pin_write" => { /* set_pin(args[0].int()?, args[1].int()?) */ Ok(None) }
+            "show" => { /* lcd_print(args[0].str()?) */ Ok(None) }
+            _ => Err(Error::UnknownIdentifier),
+        }
+    }
+    fn functions(&self) -> &[HwFn] { FUNCTIONS }
+    fn constants(&self) -> &[(&'static str, i64)] { &[("LED", 2), ("HIGH", 1), ("LOW", 0)] }
+}
+
+// let mut vm = Interpreter::with_hardware(&mut uart, &mut MyBoard);
+// vm.eval("pin_write(LED, HIGH)\nshow('ready')")
+```
+
+Return `Error::ValueError` for bad values (a pin that doesn't exist) and `Error::IoError` when the hardware fails
+(an I2C device that doesn't answer).
+
 ## Running on real ESP32 hardware
 
-The [`micropython-esp32/`](micropython-esp32) folder holds the firmware. It runs Python code on ESP32 (Xtensa) boards.
-You pick the board at build time with a **Cargo feature**.
+The [`micropython-esp32/`](micropython-esp32) folder holds the firmware. It runs Python scripts on ESP32 (Xtensa) boards,
+with a MicroPython-style hardware API: time, GPIO, ADC, PWM, I²C, a watchdog, and drawing on the TTGO's screen.
+You pick the board with a **Cargo feature** and the script with **`SCRIPT=`**.
 
 ### Supported boards (`FEATURES`)
 
-| Board | Cargo feature | Make command | Python `print()` goes to | Python hardware functions |
-|-------|---------------|--------------|--------------------------|---------------------------|
-| Any ESP32 board (DevKit, WROOM, WROVER, ...) | *(none, default)* | `make flash` | USB/UART serial monitor | `led_on()`, `led_off()`, `delay_ms(ms)` |
-| LilyGO TTGO T-Display (ST7789 1.14" TFT) | `tft` | `make flash FEATURES=tft` | TFT screen **and** serial monitor | `delay_ms(ms)` |
+| Board | Cargo feature | Make command | Python `print()` goes to | Extra functions |
+|-------|---------------|--------------|--------------------------|-----------------|
+| Any ESP32 board (DevKit, WROOM, WROVER, ...) | *(none, default)* | `make flash` | USB/UART serial monitor | `led_on()`, `led_off()` (GPIO2) |
+| LilyGO TTGO T-Display (ST7789 1.14" TFT) | `tft` | `make flash FEATURES=tft` | TFT screen **and** serial monitor | `cls`, `color`, `text`, `rect`, `backlight` |
+
+Both builds share every function in [Hardware API](#hardware-api). Run `help()` from a script to list what your build has.
 
 > [!IMPORTANT]
-> On a TTGO T-Display, always build with `FEATURES=tft`. The default build switches GPIO4 off as the "LED" pin,
-> and on this board GPIO4 is the display backlight, so the screen stays dark.
+> On a TTGO T-Display, build with `FEATURES=tft`. The default build doesn't start the display or its backlight, so the screen stays dark.
 
 ### Quick start (Docker + Make)
 
@@ -263,28 +307,86 @@ Docker image, so you don't need the Xtensa toolchain on your machine. Flashing a
 ```bash
 cd micropython-esp32
 
-make build                         # generic ESP32 firmware (serial console + LED)
-make build FEATURES=tft            # LilyGO TTGO T-Display firmware (TFT console)
+make flash                                   # generic ESP32, runs scripts/demo.py
+make flash FEATURES=tft                      # TTGO T-Display, runs scripts/ttgo_demo.py
+make flash SCRIPT=scripts/blink.py           # run your own script
+make flash FEATURES=tft SCRIPT=scripts/help.py
+make flash PORT=/dev/ttyUSB0                 # pick a serial port explicitly
 
-make flash                         # build, flash and open the serial monitor (generic)
-make flash FEATURES=tft            # build, flash and open the serial monitor (TTGO T-Display)
-make flash PORT=/dev/ttyUSB0       # pick a serial port explicitly
-
-make monitor                       # open the serial monitor only (CTRL+R reset, CTRL+C exit)
-make clean                         # remove build artifacts
+make build                                   # build only
+make monitor                                 # serial monitor only (CTRL+R reset, CTRL+C exit)
+make clean                                   # remove build artifacts
 ```
 
 | Make variable | Default | Meaning |
 |---------------|---------|---------|
 | `FEATURES` | *(empty)* | Cargo features passed as `--features ...` (e.g. `tft`) |
+| `SCRIPT` | *(empty: the board's demo)* | Python file to embed, relative to `micropython-esp32/`. It must be inside the repository, because the Docker build only sees the repository |
 | `PORT` | *(empty, espflash picks the saved port)* | Serial port for `flash` / `monitor` |
+
+The script is compiled into the firmware (`include_str!`), so changing it means flashing again.
+Docker builds keep the Cargo registry in `target/cargo-registry`, so crates are downloaded only once.
 
 Without Docker/Make (the `esp` toolchain installed locally with `espup`):
 
 ```bash
-cargo build --release                     # generic ESP32
-cargo build --release --features tft      # TTGO T-Display
+cargo build --release                                       # generic ESP32
+MPY_SCRIPT=scripts/blink.py cargo build --release           # with your own script
+cargo build --release --features tft                        # TTGO T-Display
 espflash flash --monitor target/xtensa-esp32-none-elf/release/micropython-esp32
+```
+
+### Example scripts
+
+| Script | Shows |
+|--------|-------|
+| [`scripts/demo.py`](micropython-esp32/scripts/demo.py) | Default for the generic build: language features, time, ADC, I²C scan, LED blink and PWM dimming |
+| [`scripts/ttgo_demo.py`](micropython-esp32/scripts/ttgo_demo.py) | Default for the TTGO: the above plus buttons, battery ADC and a status bar drawn on the screen |
+| [`scripts/help.py`](micropython-esp32/scripts/help.py) | `help()`: every function and constant of the build |
+| [`scripts/blink.py`](micropython-esp32/scripts/blink.py) | `pin_mode`, `pin_toggle`, `sleep_ms` |
+| [`scripts/button.py`](micropython-esp32/scripts/button.py) | Counting button presses with a pull-up and debouncing, timed with `ticks_ms` |
+| [`scripts/pwm_fade.py`](micropython-esp32/scripts/pwm_fade.py) | Fading an LED, and a 50 Hz servo pulse |
+| [`scripts/i2c_scan.py`](micropython-esp32/scripts/i2c_scan.py) | Scanning the I²C bus and reading a register |
+| [`scripts/watchdog.py`](micropython-esp32/scripts/watchdog.py) | The watchdog resetting a hung script, and `reset_cause()` after the reboot |
+| [`scripts/errors.py`](micropython-esp32/scripts/errors.py) | A forbidden pin reported as `ValueError` with its line number |
+
+### Hardware API
+
+The names follow MicroPython's `time` and `machine` modules, as flat functions (there's no `import` or `Pin` object yet).
+Pins are plain GPIO numbers.
+
+| Area | Functions | Notes |
+|------|-----------|-------|
+| Time | `sleep_ms(ms)`, `sleep_us(us)`, `ticks_ms()`, `ticks_us()`, `ticks_diff(new, old)` | `delay_ms(ms)` is an alias of `sleep_ms`. Ticks count from boot as 64-bit values and don't wrap |
+| GPIO | `pin_mode(pin, mode)`, `pin_write(pin, value)`, `pin_read(pin)`, `pin_toggle(pin)` | Modes: `OUT`, `IN`, `IN_PULLUP`, `IN_PULLDOWN`. `pin_write` on an unconfigured pin makes it an output; `pin_read` on one makes it an input. Outputs read back their own level |
+| ADC | `adc_read(pin)` | Raw 12-bit value (0–4095, 11 dB attenuation, about 0–3.3 V) on GPIO34, 36 and 39 |
+| PWM | `pwm(pin, freq, duty)`, `pwm_stop(pin)` | `duty` in percent (0–100). Up to 4 pins at once, each with its own frequency (LEDC timers 0–3). The duty resolution adapts to the frequency (14 bits at 50 Hz for servos). `pwm_stop` leaves the pin as a low output |
+| I²C | `i2c_probe(addr)`, `i2c_scan()`, `i2c_read_reg(addr, reg)`, `i2c_read_reg16(addr, reg)`, `i2c_write_reg(addr, reg, value)` | 100 kHz on SDA = GPIO21, SCL = GPIO22. `i2c_scan()` returns the number of devices; loop over `i2c_probe` to list addresses. 16-bit reads are big-endian. A device that doesn't answer raises `IoError` |
+| Watchdog | `wdt_enable(timeout_ms)`, `wdt_feed()`, `wdt_disable()` | The RTC watchdog resets the whole board when it isn't fed in time. `sleep_ms` feeds it automatically every 100 ms |
+| System | `reset()`, `reset_cause()` | `reset_cause()` returns `PWRON_RESET`, `HARD_RESET`, `WDT_RESET`, `DEEPSLEEP_RESET` or `SOFT_RESET` (MicroPython's values). The firmware also prints the reset reason at boot |
+| TFT (`tft` only) | `cls()`, `color(r, g, b)`, `text(x, y, s)`, `rect(x, y, w, h)`, `backlight(on)` | `color` sets the text and fill color (0–255 per channel). `text` and `rect` draw at pixel positions. `WIDTH` and `HEIGHT` are 240 and 135 |
+
+Constants: `OUT`, `IN`, `IN_PULLUP`, `IN_PULLDOWN`, `HIGH`, `LOW` and the `*_RESET` values in both builds;
+`LED` (2) and `BOOT_BUTTON` (0) in the generic build; `BUTTON_L` (0), `BUTTON_R` (35), `BAT_ADC` (34) and `ADC_EN` (14) on the TTGO.
+
+**Pins scripts may use.** Anything else raises `ValueError`, which protects the flash chip, the serial console and the pins the firmware owns:
+
+| Build | Allowed GPIOs | Reserved |
+|-------|---------------|----------|
+| Generic | 0, 2, 4, 5, 12–19, 23, 25–27, 32, 33, 35 | 1/3 (UART0 console), 6–11 (flash), 21/22 (I²C), 34/36/39 (ADC) |
+| TTGO T-Display | 0, 2, 12–15, 17, 25–27, 32, 33, 35 | as above, plus 4, 5, 16, 18, 19, 23 (display) |
+
+GPIO34–39 are input-only on the ESP32, so `pin_mode(35, OUT)` raises `ValueError`.
+
+```python
+# Blink until the BOOT button is pressed, with a watchdog in case the loop hangs
+wdt_enable(2000)
+pin_mode(BOOT_BUTTON, IN_PULLUP)
+while pin_read(BOOT_BUTTON) == 1:
+    pin_toggle(LED)
+    sleep_ms(250)          # also feeds the watchdog
+wdt_disable()
+print('stopped after', ticks_ms(), 'ms')
 ```
 
 ### Implementation details
@@ -293,47 +395,47 @@ espflash flash --monitor target/xtensa-esp32-none-elf/release/micropython-esp32
 
 | File | Purpose |
 |------|---------|
-| `micropython-esp32/src/bin/main.rs` | Firmware entry point. Each board has its own `#[cfg(feature = ...)]` setup and demo Python script, and both share a `run()` helper |
-| `micropython-esp32/src/serial_console.rs` | `EspSerialOut`, an `Output` that writes `print()` text to USB/UART with `esp_println` (always compiled) |
-| `micropython-esp32/src/tft_console.rs` | `TftConsole`, an `Output` that draws text on the ST7789 TFT (only compiled with `tft`) |
+| `micropython-esp32/src/bin/main.rs` | Entry point. Each board has a `#[cfg(feature = ...)]` `main()`, a `HardwareBridge` adding its own functions on top of `Board`, and its function and constant tables |
+| `micropython-esp32/src/board.rs` | `Board`: time, GPIO, ADC, PWM, I²C, watchdog and reset functions for every build, plus the `board_functions!` and `board_constants!` table macros |
+| `micropython-esp32/src/serial_console.rs` | `EspSerialOut`, an `Output` that writes `print()` text to USB/UART with `esp_println` |
+| `micropython-esp32/src/tft_console.rs` | `TftConsole`: the scrolling text console and drawing functions on the ST7789 (only compiled with `tft`) |
+| `micropython-esp32/scripts/` | The demo and example scripts |
+| `micropython-esp32/build.rs` | Picks the script (`MPY_SCRIPT`, or the board's demo) and hands its path to `include_str!` |
 | `micropython-esp32/Cargo.toml` | Declares the `tft` feature. `mipidsi`, `embedded-graphics` and `embedded-hal-bus` are optional dependencies, so boards without a display don't pull them in |
-| `micropython-esp32/Makefile` | Docker build and host flash/monitor, with the `FEATURES` and `PORT` variables |
+| `micropython-esp32/Makefile` | Docker build and host flash/monitor, with the `FEATURES`, `SCRIPT` and `PORT` variables |
 
-#### How Python talks to the hardware
+#### How the hardware layer works
 
-The interpreter core (`micropython-rs`) has no hardware code of its own. The firmware plugs hardware in through two traits:
-
-* **`Output`** decides where `print()` text goes. It is `EspSerialOut` (serial) or `TftConsole` (screen + serial).
-* **`HardwareBridge`** handles calls to functions the interpreter doesn't know, such as `led_on()` or `delay_ms(500)`.
-  The firmware matches the function name and its integer arguments, and returns `Error::UnknownIdentifier` for anything else.
-
-```rust
-impl HardwareBridge for Esp32Board<'_> {
-    fn call(&mut self, name: &str, args: &[i64]) -> Result<Option<i64>, Error> {
-        match (name, args) {
-            ("led_on", [])  => { self.led.set_high(); Ok(None) }
-            ("led_off", []) => { self.led.set_low();  Ok(None) }
-            ("delay_ms", [ms]) if *ms >= 0 => { self.delay.delay_millis(*ms as u32); Ok(None) }
-            _ => Err(Error::UnknownIdentifier),
-        }
-    }
-}
-```
+* **Pins by number at runtime.** `esp-hal` normally hands out one typed object per pin at startup. To let scripts pick
+  pins, `Board` takes them with `AnyPin::steal(n)` (after checking the allowlist) and drives them with `Flex`, which can
+  switch between input and output.
+* **ADC.** The `esp-hal` ADC driver is typed per pin, so the three ADC pins are set up once at boot. They're the
+  input-only GPIO34/36/39, so analog inputs can't collide with digital outputs.
+* **PWM.** Each `pwm()` call configures an LEDC timer and channel and then drops the driver objects; the hardware keeps
+  running. It tries duty resolutions from 14 bits down until one fits the requested frequency.
+* **Watchdog.** `wdt_enable` sets the RTC watchdog's first stage to reset the whole system. `sleep_ms` waits in 100 ms
+  chunks and feeds the watchdog in between, so only a script that stops sleeping (a busy loop, a hang) gets reset.
+* **TTGO console.** `print()` and the drawing functions share one `TftConsole` through a `RefCell`: `print()` goes
+  through `SharedConsole` (the `Output`), drawing through the bridge.
 
 #### Generic ESP32 build (default)
 
-* The onboard LED is on **GPIO2**, which is common on ESP32 DevKit boards.
-  If your board uses another pin, change `peripherals.GPIO2` in `src/bin/main.rs`.
+* The onboard LED is on **GPIO2**, common on ESP32 DevKit boards. If yours is elsewhere, change `LED_PIN` in `src/bin/main.rs`,
+  or just use `pin_write(n, 1)` in your script.
 * `print()` output appears in the serial monitor (`make monitor`).
 
 #### TTGO T-Display build (`--features tft`)
 
-* The display driver is `mipidsi` (ST7789) on SPI2 at 26 MHz in SPI mode 0, with a 512-byte SPI buffer.
+* The display driver is `mipidsi` (ST7789) on SPI2 at 40 MHz in SPI mode 0.
 * The screen runs in landscape at **240 × 135 px** (rotated 90°, panel offset 52/40, inverted colors).
-* Text uses `FONT_6X10` in a 6 × 12 px cell with a 4 px margin, which gives **38 columns × 10 rows**, light green on black.
-* `\n` starts a new line, `\r` returns to column 0, and long lines wrap. When all 10 rows are full, the screen clears and writing starts again at the top. It does not scroll.
+* Console text uses `FONT_6X10` in a 6 × 12 px cell with a 4 px margin: **38 columns × 10 rows**, light green on black
+  by default (`color()` changes it). The text area covers y = 4 to 123, so y ≥ 124 is free for a status bar.
+* `\n` starts a new line, `\r` returns to column 0, and long lines wrap. When the screen is full, the text **scrolls up
+  half a screen**. Each line is rendered into a 5.6 KB RAM strip and sent in one SPI transfer. A full redraw takes about
+  25 ms, so `help()` (about 40 lines) prints in about 1.4 s.
+* Scrolling repaints only the text area. Drawings inside it are overwritten by later `print()` output; call `cls()` first
+  for a full-screen drawing.
 * All output is copied to the serial monitor as well.
-* GPIO4 is used by the backlight, so this build has no `led_on()`/`led_off()`. Only `delay_ms(ms)` is available.
 
 | TFT signal | ESP32 GPIO |
 |------------|------------|
@@ -348,8 +450,10 @@ impl HardwareBridge for Esp32Board<'_> {
 
 1. Add a feature in `micropython-esp32/Cargo.toml`, for example `myboard = []`, plus any optional `dep:` crates it needs.
 2. If the board needs its own output (LCD, OLED, ...), add a module that implements `micropython_rs::Output`, and gate it in `src/lib.rs` with `#[cfg(feature = "myboard")]`.
-3. In `src/bin/main.rs`, add a `#[cfg(feature = "myboard")]` `main()` that sets up the peripherals, a `HardwareBridge` with your functions, and a `SCRIPT`. Then call `run(...)`.
-4. Build it with `make flash FEATURES=myboard`.
+3. In `src/bin/main.rs`, add a `#[cfg(feature = "myboard")]` `main()` that creates a `Board` with your pin allowlist, and a
+   `HardwareBridge` whose `call_args` handles your extra functions and passes the rest to `board.call(...)`.
+   Build its tables with `board_functions!(HwFn::new(...), ...)` and `board_constants!(("NAME", value), ...)`.
+4. Add a default demo in `scripts/` and pick it in `build.rs`, then build with `make flash FEATURES=myboard`.
 
 ### Toolchain setup (first time only)
 
@@ -438,6 +542,7 @@ I (89) esp_image: segment 3: paddr=00013940 vaddr=00000000 size=0c6d8h ( 50904)
 I (112) esp_image: segment 4: paddr=00020020 vaddr=400d0020 size=04540h ( 17728) map
 I (120) boot: Loaded app from partition at offset 0x10000
 
+Reset reason: Some(ChipPowerOn)
 === micropython-rs ===
 Hello from ESP32
 a = 21 b = 21
@@ -445,15 +550,19 @@ a = 21 b = 21
 square 1 = 1 odd
 square 2 = 4 even
 square 3 = 9 odd
+slept 200 ms
+ADC34 raw: 1468
+I2C devices: 0
 Blinking onboard LED 3 times...
-LED sequence complete!
+LED dimmed to 10% with PWM
 === Execution complete ===
 ```
 
 TTGO T-Display build (`make flash FEATURES=tft`). The Python `print()` lines are also shown on the TFT screen (`=== Execution complete ===` goes to serial only):
 ```bash
 ...
-I (125) boot: Loaded app from partition at offset 0x10000
+I (131) boot: Loaded app from partition at offset 0x10000
+Reset reason: Some(ChipPowerOn)
 === micropython-rs ===
 Board: TTGO T-Display
 a = 21 b = 21
@@ -461,6 +570,11 @@ a = 21 b = 21
 square 1 = 1 odd
 square 2 = 4 even
 square 3 = 9 odd
+slept 200 ms
+ADC34 raw: 1560
+I2C devices: 0
+buttons (1 = up): 1 1
+battery ADC raw: 1565
 TFT console active!
 === Execution complete ===
 ```
@@ -481,6 +595,8 @@ TFT console active!
 - [x] Control flow (if / elif / else, while, break / continue, with indentation tracking)
 - [x] Comparisons, booleans, `and` / `or` / `not`, hex / binary literals, bitwise operators, augmented assignment
 - [x] `def` functions with parameters, local variables, `return` and recursion
+- [x] Hardware API on ESP32: time, GPIO, ADC, PWM, I²C, watchdog, reset cause, TFT drawing; `help()`
+- [x] Scripts loaded from `.py` files at build time (`make flash SCRIPT=...`)
 - [ ] Compact Bytecode Compiler & Stack VM
 
 

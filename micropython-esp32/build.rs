@@ -1,4 +1,5 @@
 fn main() {
+    select_script();
     linker_be_nice();
     check_xtensa_linker_available();
     // make sure linkall.x is the last linker script (otherwise might cause problems with flip-link)
@@ -129,4 +130,36 @@ fn linker_be_nice() {
         "cargo:rustc-link-arg=-Wl,--error-handling-script={}",
         std::env::current_exe().unwrap().display()
     );
+}
+
+/// Chooses the Python script embedded into the firmware.
+///
+/// `MPY_SCRIPT` (set by `make flash SCRIPT=...`) is a path relative to this
+/// crate's directory. Without it, the board's demo from `scripts/` is used.
+/// The path is passed to `main.rs`, which embeds the file with `include_str!`.
+fn select_script() {
+    println!("cargo:rerun-if-env-changed=MPY_SCRIPT");
+
+    let crate_dir = std::path::PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
+    let default = if std::env::var_os("CARGO_FEATURE_TFT").is_some() {
+        "scripts/ttgo_demo.py"
+    } else {
+        "scripts/demo.py"
+    };
+    let chosen = std::env::var("MPY_SCRIPT")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| default.to_string());
+
+    let path = crate_dir.join(&chosen);
+    if !path.is_file() {
+        panic!(
+            "Python script `{}` not found. SCRIPT/MPY_SCRIPT paths are relative to {} \
+             and must stay inside the repository (the Docker build only sees the repository).",
+            chosen,
+            crate_dir.display()
+        );
+    }
+    println!("cargo:rerun-if-changed={}", path.display());
+    println!("cargo:rustc-env=MPY_SCRIPT_PATH={}", path.display());
 }

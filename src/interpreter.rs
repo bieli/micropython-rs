@@ -22,7 +22,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use crate::ast_parser::{
     BinOp, CmpOp, Code, Expr, Item, Parser, Stmt, MAX_CALL_ARGS, MAX_EXPR_ITEMS, MAX_PARAMS,
 };
-use crate::{Error, HardwareBridge, NoHardware, Output};
+use crate::{Arg, Error, HardwareBridge, NoHardware, Output};
 
 /// Variable slots, shared by globals and the locals of active function calls.
 pub const MAX_VARS: usize = 32;
@@ -546,15 +546,25 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
     }
 
     /// Looks a name up in the current scope, then in the globals.
+    /// Looks a name up in the current scope, then in the globals, then in
+    /// the hardware constants (`OUT`, `IN`, ...).
     fn get_var(&self, name: &str) -> Result<Value<'a>, Error> {
-        self.get_scope_var(name).or_else(|err| {
-            if self.call_depth == 0 {
-                return Err(err);
-            }
-            self.find_in(0..self.globals_len, name)
-                .map(|i| self.vars[i].1)
-                .ok_or(err)
-        })
+        self.get_scope_var(name)
+            .or_else(|err| {
+                if self.call_depth == 0 {
+                    return Err(err);
+                }
+                self.find_in(0..self.globals_len, name)
+                    .map(|i| self.vars[i].1)
+                    .ok_or(err)
+            })
+            .or_else(|err| {
+                self.hw
+                    .as_ref()
+                    .and_then(|hw| hw.constants().iter().find(|(n, _)| *n == name))
+                    .map(|&(_, val)| Value::Int(val))
+                    .ok_or(err)
+            })
     }
 
     fn define_func(&mut self, func: FuncDef<'a>) -> Result<(), Error> {
@@ -730,16 +740,89 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
             return Ok(Value::None);
         }
 
-        let hw = self.hw.as_mut().ok_or(Error::UnknownIdentifier)?;
-        let mut int_args = [0i64; MAX_CALL_ARGS];
-        for (slot, val) in int_args.iter_mut().zip(args) {
-            *slot = val.as_int().ok_or(Error::TypeError)?;
+        if name == "help" {
+            if !args.is_empty() {
+                return Err(Error::TypeError);
+            }
+            self.print_help();
+            return Ok(Value::None);
         }
 
-        Ok(match hw.call(name, &int_args[..args.len()])? {
+        let hw = self.hw.as_mut().ok_or(Error::UnknownIdentifier)?;
+
+        // Check the name and argument count against the bridge's function table
+        let table = hw.functions();
+        if !table.is_empty() {
+            let spec = table
+                .iter()
+                .find(|f| f.name == name)
+                .ok_or(Error::UnknownIdentifier)?;
+            if args.len() < spec.min_args as usize || args.len() > spec.max_args as usize {
+                return Err(Error::TypeError);
+            }
+        }
+
+        let mut hw_args = [Arg::Int(0); MAX_CALL_ARGS];
+        for (slot, val) in hw_args.iter_mut().zip(args) {
+            *slot = match *val {
+                Value::Str(s) => Arg::Str(s),
+                other => Arg::Int(other.as_int().ok_or(Error::TypeError)?),
+            };
+        }
+
+        Ok(match hw.call_args(name, &hw_args[..args.len()])? {
             Some(n) => Value::Int(n),
             None => Value::None,
         })
+    }
+
+    /// `help()`: lists built-ins, the script's functions, and the hardware
+    /// functions and constants of the bridge.
+    fn print_help(&mut self) {
+        self.out.write_str("Built-in:\n  print(...)\n  help()\n");
+
+        let mut funcs = self.funcs.iter().flatten().peekable();
+        if funcs.peek().is_some() {
+            self.out.write_str("Script functions:\n");
+        }
+        for func in self.funcs.iter().flatten() {
+            self.out.write_str("  ");
+            self.out.write_str(func.name);
+            self.out.write_str("(");
+            for (i, param) in func.params[..func.count].iter().enumerate() {
+                if i > 0 {
+                    self.out.write_str(", ");
+                }
+                self.out.write_str(param);
+            }
+            self.out.write_str(")\n");
+        }
+
+        let Some(hw) = self.hw.as_ref() else {
+            return;
+        };
+        let (functions, constants) = (hw.functions(), hw.constants());
+        if !functions.is_empty() {
+            self.out.write_str("Hardware:\n");
+        }
+        for f in functions {
+            for part in ["  ", f.name, "(", f.params, ")"] {
+                self.out.write_str(part);
+            }
+            if !f.doc.is_empty() {
+                self.out.write_str(" - ");
+                self.out.write_str(f.doc);
+            }
+            self.out.write_str("\n");
+        }
+        if !constants.is_empty() {
+            self.out.write_str("Constants:\n ");
+            for (name, _) in constants {
+                self.out.write_str(" ");
+                self.out.write_str(name);
+            }
+            self.out.write_str("\n");
+        }
     }
 
     fn print_value(&mut self, val: Value<'_>) {
@@ -1668,6 +1751,130 @@ print(fact(7), fib(7))
         len += 4;
         let src = core::str::from_utf8(&buf[..len]).unwrap();
         assert_eq!(run_err(src).0, Error::OutOfMemory);
+    }
+
+    /// A bridge with a function table, constants and a string argument.
+    struct TableHardware {
+        last_text: [u8; 16],
+        text_len: usize,
+        pins: [i64; 4],
+    }
+
+    const TABLE_FNS: &[crate::HwFn] = &[
+        crate::HwFn::new("pin_write", "pin, value", "Set an output pin"),
+        crate::HwFn::new("pin_read", "pin", "Read a pin"),
+        crate::HwFn::with_args("text", 1, 3, "s, [x, y]", "Show text"),
+        crate::HwFn::new("ticks_ms", "", ""),
+    ];
+
+    impl HardwareBridge for TableHardware {
+        fn call_args(&mut self, name: &str, args: &[Arg<'_>]) -> Result<Option<i64>, Error> {
+            match name {
+                "pin_write" => {
+                    self.pins[args[0].int()? as usize] = args[1].int()?;
+                    Ok(None)
+                }
+                "pin_read" => Ok(Some(self.pins[args[0].int()? as usize])),
+                "text" => {
+                    let s = args[0].str()?;
+                    self.last_text[..s.len()].copy_from_slice(s.as_bytes());
+                    self.text_len = s.len();
+                    Ok(Some(args.len() as i64))
+                }
+                "ticks_ms" => Ok(Some(1234)),
+                _ => Err(Error::UnknownIdentifier),
+            }
+        }
+
+        fn functions(&self) -> &[crate::HwFn] {
+            TABLE_FNS
+        }
+
+        fn constants(&self) -> &[(&'static str, i64)] {
+            &[("HIGH", 1), ("LOW", 0), ("LED", 2)]
+        }
+    }
+
+    #[test]
+    fn test_hw_function_table_and_constants() {
+        let mut out = MockOut::new();
+        let mut hw = TableHardware {
+            last_text: [0; 16],
+            text_len: 0,
+            pins: [0; 4],
+        };
+        let mut vm = Interpreter::with_hardware(&mut out, &mut hw);
+
+        vm.eval("pin_write(LED, HIGH)\nprint(pin_read(LED), text('hi', 1, 2), ticks_ms())")
+            .unwrap();
+        // A variable shadows a constant
+        vm.eval("LED = 3\npin_write(LED, True)\nprint(pin_read(3))")
+            .unwrap();
+
+        // Table checks happen before the call
+        assert_eq!(vm.eval("pin_write(1)"), Err(Error::TypeError));
+        assert_eq!(vm.eval("text()"), Err(Error::TypeError));
+        assert_eq!(vm.eval("text('a', 1, 2, 3)"), Err(Error::TypeError));
+        assert_eq!(vm.eval("not_in_table()"), Err(Error::UnknownIdentifier));
+        // Type checks inside the bridge
+        assert_eq!(vm.eval("pin_read('x')"), Err(Error::TypeError));
+        assert_eq!(vm.eval("text(5)"), Err(Error::TypeError));
+        assert_eq!(vm.eval("pin_read(None)"), Err(Error::TypeError));
+        // Constants are read-only values, unknown names still fail
+        assert_eq!(vm.eval("print(MISSING)"), Err(Error::UnknownIdentifier));
+
+        assert_eq!(&hw.last_text[..hw.text_len], b"hi");
+        assert_eq!(out.as_str(), "1 3 1234\n1\n");
+    }
+
+    #[test]
+    fn test_default_bridge_rejects_strings() {
+        // MockHardware only implements `call`, so string arguments are a TypeError
+        let mut out = MockOut::new();
+        let mut hw = mock_hw();
+        let mut vm = Interpreter::with_hardware(&mut out, &mut hw);
+        assert_eq!(vm.eval("delay_ms('100')"), Err(Error::TypeError));
+        assert_eq!(vm.eval("delay_ms(True)"), Ok(()));
+        assert_eq!(hw.total_delay_ms, 1);
+    }
+
+    #[test]
+    fn test_help() {
+        let mut out = MockOut::new();
+        let mut hw = TableHardware {
+            last_text: [0; 16],
+            text_len: 0,
+            pins: [0; 4],
+        };
+        let mut vm = Interpreter::with_hardware(&mut out, &mut hw);
+        vm.eval("def blink(times, ms):\n    pass\nhelp()").unwrap();
+        assert_eq!(vm.eval("help(1)"), Err(Error::TypeError));
+        assert_eq!(
+            out.as_str(),
+            "Built-in:\n  print(...)\n  help()\n\
+             Script functions:\n  blink(times, ms)\n\
+             Hardware:\n  pin_write(pin, value) - Set an output pin\n  pin_read(pin) - Read a pin\n  \
+             text(s, [x, y]) - Show text\n  ticks_ms()\n\
+             Constants:\n  HIGH LOW LED\n"
+        );
+
+        // Without hardware, only built-ins are listed
+        let mut out = MockOut::new();
+        Interpreter::new(&mut out).eval("help()").unwrap();
+        assert_eq!(out.as_str(), "Built-in:\n  print(...)\n  help()\n");
+    }
+
+    #[test]
+    fn test_hwfn_param_counting() {
+        let f = crate::HwFn::new("f", "a, b, c", "");
+        assert_eq!((f.min_args, f.max_args), (3, 3));
+        let f = crate::HwFn::new("f", "", "");
+        assert_eq!((f.min_args, f.max_args), (0, 0));
+        assert_eq!(
+            crate::NoHardware.call("x", &[]),
+            Err(Error::UnknownIdentifier)
+        );
+        assert_eq!(Arg::Int(1).str(), Err(Error::TypeError));
     }
 
     #[test]

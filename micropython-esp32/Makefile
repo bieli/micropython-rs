@@ -16,8 +16,15 @@ PORT_FLAG    := $(if $(PORT),--port $(PORT),)
 FEATURES     ?=
 FEATURES_FLAG := $(if $(FEATURES),--features $(FEATURES),)
 
+# Optional Python script to embed (e.g., make flash SCRIPT=scripts/blink.py), relative to this
+# directory; leave empty for the board's demo (scripts/demo.py or scripts/ttgo_demo.py)
+SCRIPT       ?=
+
 # Mount the parent directory so Cargo inside Docker can resolve `micropython-rs = { path = ".." }`
 WORKSPACE_ROOT := $(abspath ..)
+
+# Persist the Cargo registry between Docker builds (no re-download of crates on every build)
+CARGO_CACHE  := $(abspath target/cargo-registry)
 
 .PHONY: all build flash monitor clean
 
@@ -26,8 +33,11 @@ all: flash
 
 # Compile release firmware inside Espressif's Xtensa Docker container
 build:
+	mkdir -p $(CARGO_CACHE)
 	docker run --rm \
 		-v "$(WORKSPACE_ROOT)":/workspace \
+		-v "$(CARGO_CACHE)":/home/esp/.cargo/registry \
+		-e MPY_SCRIPT="$(SCRIPT)" \
 		-w /workspace/$(BIN_NAME) \
 		$(DOCKER_IMAGE) \
 		bash -c "source /home/esp/export-esp.sh && cargo build --release $(FEATURES_FLAG)"
