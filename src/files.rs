@@ -24,6 +24,13 @@ pub(crate) const OS: Module = Module {
     doc: "Files on the board (a flat file system: no directories)",
     functions: &[
         HwFn::with_args("listdir", 0, 1, "[path]", "Names of all files"),
+        HwFn::with_args(
+            "ilistdir",
+            0,
+            1,
+            "[path]",
+            "(name, type, inode, size) of all files",
+        ),
         HwFn::new("remove", "name", "Delete a file"),
         HwFn::new("rename", "old, new", "Rename a file"),
         HwFn::new("stat", "name", "(mode, 0, 0, 0, 0, 0, size, 0, 0, 0)"),
@@ -72,6 +79,21 @@ impl Name {
     }
 }
 
+/// The text of an `OSError`: the errno name first, as MicroPython prints it
+/// (`[Errno 2] ENOENT`, which tools such as mpremote look for), then words.
+fn message(err: FsError) -> &'static str {
+    match err {
+        FsError::NotFound => "ENOENT: no such file",
+        FsError::Io => "EIO: flash I/O error",
+        FsError::Corrupt => "EIO: file corrupted (checksum mismatch)",
+        FsError::NotOpen => "EBADF: file not open for writing",
+        FsError::NoRegion => "ENODEV: no file system",
+        FsError::BadName => "EINVAL: bad file name (use A-Z a-z 0-9 . _ -, max 40 chars)",
+        FsError::TooLarge => "EFBIG: file too large (max 32704 bytes)",
+        FsError::NoSpace => "ENOSPC: no free file slot (saving needs one, even to replace)",
+    }
+}
+
 /// The `OSError` errno for a file system error.
 fn errno(err: FsError) -> i64 {
     match err {
@@ -89,7 +111,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
     /// Raises `OSError(errno, message)` for a file system error.
     fn os_error(&mut self, err: FsError) -> Error {
         let class = super::exceptions::class_by_name("OSError").unwrap_or(0);
-        let args = [Value::Int(errno(err)), Value::Str(err.message())];
+        let args = [Value::Int(errno(err)), Value::Str(message(err))];
         match self.new_exception(class, &args) {
             Ok(exc) => {
                 self.exc = exc;
@@ -134,13 +156,39 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
     /// `os.function(args)`.
     pub(super) fn os_call(&mut self, name: &str, args: &[Value<'a>]) -> Result<Value<'a>, Error> {
         match (name, args) {
-            ("listdir", []) | ("listdir", [_]) => {
+            ("listdir" | "ilistdir", []) | ("listdir" | "ilistdir", [_]) => {
                 if let Some(&path) = args.first() {
                     if !self.is_root(path) {
                         return Err(self.os_error(FsError::NotFound));
                     }
                 }
-                self.listdir()
+                let names = self.listdir()?;
+                if name == "listdir" {
+                    return Ok(names);
+                }
+                // `ilistdir`: `(name, type, inode, size)` per file (a list, not an iterator)
+                let base = self.sp;
+                self.push(names)?;
+                let result = (|| {
+                    let Value::Obj(list) = names else {
+                        return Err(Error::TypeError);
+                    };
+                    for i in 0..self.count(list) {
+                        let file = self.slot(list, i);
+                        let n = self.name_arg(file)?;
+                        let size = self.fs(|fs| fs.file_size(n.as_str()))?.unwrap_or(0);
+                        let entry = self.tuple_of(&[
+                            file,
+                            Value::Int(S_IFREG),
+                            Value::Int(0),
+                            Value::Int(size as i64),
+                        ])?;
+                        self.set_slot(list, i, entry);
+                    }
+                    Ok(names)
+                })();
+                self.sp = base;
+                result
             }
             ("remove", [n]) => {
                 let n = self.name_arg(*n)?;

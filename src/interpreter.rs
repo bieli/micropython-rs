@@ -1590,8 +1590,13 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
                 }
                 Item::GetAttr(attr) => {
                     let target = self.stack[self.sp - 1];
-                    self.stack[self.sp - 1] =
-                        self.get_attr(target, attr)?.ok_or(Error::AttributeError)?;
+                    let val = match self.get_attr(target, attr)? {
+                        Some(v) => v,
+                        None => self
+                            .bound_method(target, attr)?
+                            .ok_or(Error::AttributeError)?,
+                    };
+                    self.stack[self.sp - 1] = val;
                 }
                 Item::CallAttr { attr, argc, kw } => {
                     let start = self.sp - argc as usize;
@@ -1760,6 +1765,9 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
                 self.call_function(builtins::builtin_name(b), args, kwargs)
             }
             Value::ExcClass(class) if kwargs.is_empty() => self.new_exception(class, args),
+            Value::Obj(r) if self.heap.kind(r) == Kind::BoundMethod => {
+                self.call_bound(r, args, kwargs)
+            }
             _ => Err(Error::TypeError), // not callable, or no keyword arguments
         }
     }
@@ -1996,6 +2004,10 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
         // (`ValueError('bad')` creates an exception object)
         match self.get_var(name) {
             Ok(f @ (Value::NativeFn { .. } | Value::Func(_) | Value::ExcClass(_))) => {
+                return self.call_value(f, args, kwargs);
+            }
+            // `w = f.write; w(data)`
+            Ok(f @ Value::Obj(r)) if self.heap.kind(r) == Kind::BoundMethod => {
                 return self.call_value(f, args, kwargs);
             }
             // `op = abs; op(-3)` (but `abs(-3)` itself is handled below)
@@ -3696,7 +3708,8 @@ print(outer(), count)
         assert_eval_err("chr(-1)", Error::ValueError);
         assert_eval_err("ord('ab')", Error::TypeError);
         assert_eval_err("'abc'.nope()", Error::AttributeError);
-        assert_eval_err("'abc'.upper", Error::AttributeError);
+        assert_eval_err("'abc'.nope", Error::AttributeError);
+        assert_eval("'abc'.upper", "<bound method upper>");
         assert_eval_err("'a' + 1", Error::TypeError);
         assert_eval_err("1 in 'abc'", Error::TypeError);
         assert_eval_err("'\\xZZ'", Error::InvalidSyntax);
@@ -3922,8 +3935,8 @@ print(outer(), count)
         assert_eq!(
             out,
             "5 ['a.py'] ['a.py'] True\n(8, 7) micropython-rs x = 1\n\
-             [Errno 2] no such file\n22\n['a.py', 'one.txt']\n\
-             [Errno 9] file not open for writing\n['a.py', 'one.txt', 'two.txt'] 1\n"
+             [Errno 2] ENOENT: no such file\n22\n['a.py', 'one.txt']\n\
+             [Errno 9] EBADF: file not open for writing\n['a.py', 'one.txt', 'two.txt'] 1\n"
         );
 
         // Without a file system: OSError (ENODEV)

@@ -224,8 +224,9 @@ print('v=' + str(adc_vref()) + ' mV', int('0x1F', 16), chr(9786), ord('A'))
 * `repr()` returns a valid Python literal (quotes and escapes chosen like CPython), which is also what the REPL echoes.
 * `str(s)` returns `s` itself (strings never change); a missing index raises `Error::IndexError`, `int('x')` raises
   `Error::ValueError`.
-* All test expressions are checked against CPython. Not supported yet: `format`, `%` and f-strings, and bound
-  methods (`f = s.upper` without calling it).
+* All test expressions are checked against CPython. Formatting (`%`, `format()`, f-strings) is described under
+  [Control flow and functions](#control-flow-and-functions); a method can be taken without calling it
+  (`up = s.upper`, `w = f.write`).
 
 ### Bytes
 
@@ -627,14 +628,16 @@ myapp.py:2: syntax error: unexpected EOF while parsing - not uploaded
 --- ZeroDivisionError: division by zero (line 2) ---
 ```
 
-Thonny's own MicroPython mode (file browser, "Save to device") doesn't work yet: Thonny runs helper code on the board
-that needs the `os` module and file objects (and, for Thonny 4/5, classes), which are being added in Phase 5 of the
-[ROADMAP](ROADMAP.md).
+**Thonny 3.2.7** (the version in Ubuntu 20.04's apt) works in its own MicroPython mode: *Tools → Options →
+Interpreter → MicroPython (generic)*, then pick the board's port. The file browser shows the board's files
+(*View → Files*), files open from and save to the board (*File → Save as → MicroPython device*), *Run* (F5) runs the
+editor's code on the board, *Stop* interrupts it, the shell and the variables view work. See
+[Thonny support](#thonny-support) for how this is tested. Thonny 4.x/5.x need classes, which come next.
 
 `tools/mpy.py` needs `pyserial` and takes `--port` (default `/dev/ttyACM0`, or `$MPY_PORT`). It exits with status 1
-when the script raises an error. `mpremote`'s file commands (`cp`, `ls`, `fs`) don't work yet, because they run Python
-helper code that needs the `os` module and more of the language; use `tools/mpy.py ls/put/get/rm`. Like with MicroPython, `mpremote` soft-resets the board
-before each command unless you add `resume`.
+when the script raises an error. `mpremote`'s file commands work too (`mpremote fs ls`, `fs cp main.py :main.py`,
+`fs cat`, `fs rm`; there are no directories, so `fs mkdir` fails). Like with MicroPython, `mpremote` soft-resets the
+board before each command unless you add `resume`.
 
 If `main.py` hangs the board, press Ctrl-C at boot, or run `tools/mpy.py erase`.
 
@@ -707,7 +710,7 @@ os.remove('old.txt')
 * Writing streams to flash; the new version replaces the old one when the file is closed (crash safe, see above).
   **One file can be open for writing at a time**: opening a second one saves and closes the first. A file that is
   never closed isn't saved, so use `with`.
-* Errors are `OSError` with the usual numbers: `[Errno 2] no such file` (`e.errno == 2`), 22 for a bad name, 27
+* Errors are `OSError` with the usual numbers and names: `[Errno 2] ENOENT: no such file` (`e.errno == 2`), 22 for a bad name, 27
   for a file over 32 KB, 28 when all 30 slots are taken.
 * On a PC, `mpy-cli` gives scripts a file system in RAM with the same rules (it's gone when the script ends).
 * Embedding: `Interpreter::with_files(&RefCell<dyn FileSystem>)`; `flatfs::FlatFs` implements `FileSystem` for any
@@ -718,13 +721,33 @@ The file system itself is hardware-independent code in the core library
 erase 4 KB sectors). Its tests run on the PC against a simulated NOR flash, including a power cut at every
 possible write during a replace.
 
-**Thonny.** Thonny reads and saves device files by running Python helper code on the board. Thonny 3.2.7 (Ubuntu
-20.04) needs strings with escape sequences, `bytes`, a dict comprehension, `print(..., sep=, end=)`, `repr()`,
-`try`/`except`, `del`, `open()` file objects and `binascii`; Thonny 4.x/5.x additionally need classes,
-`@classmethod`, exception classes, list comprehensions and slicing. The flat file system matches Thonny's
-"device without directories" mode (the `os` module deliberately has no `getcwd`, which is how Thonny 3.2.7 detects
-it). All of the Thonny 3.2.7 list is done; the end-to-end test with Thonny is next (see [ROADMAP.md](ROADMAP.md),
-Phase 5).
+#### Thonny support
+
+Thonny reads and saves device files by running Python helper code on the board through the raw REPL. Thonny 3.2.7
+(Ubuntu 20.04) uses strings with escapes, `bytes` and `binascii` (files travel hex-encoded), dict comprehensions,
+`print(..., sep=, end=)`, `repr()`, `globals()`, `try`/`except`, `del` and `open()`. The flat file system matches
+Thonny's "device without directories" mode: the `os` module deliberately has no `getcwd`, which is how Thonny 3.2.7
+detects it, and then it lists files with `os.listdir()` and `os.size()`. Thonny 4.x/5.x also need classes with
+`@classmethod` (their helper is a class), which is Phase 5.8 of the [ROADMAP](ROADMAP.md).
+
+**How it's tested.** `tools/thonny_e2e.py` runs Thonny's *own* backend code (no GUI) against the interpreter:
+`mpy-cli --repl` speaks the same REPL protocol as the firmware, and a pseudo-terminal connects it to Thonny's serial
+connection. It checks connecting, the file browser, saving and opening a text file and a binary file with every byte
+value, the shell (statements, expressions, tracebacks), *Run*, *Stop* on an endless loop, *Stop/Restart* (soft
+reboot), the variables view, the storage info and deleting. `tools/mpremote_e2e.py` does the same with mpremote.
+Both run in CI:
+
+```bash
+pip install pyserial jedi mpremote
+pip download --no-deps thonny==3.2.7 -d /tmp/thonny
+python3 -m zipfile -e /tmp/thonny/thonny-3.2.7-py3-none-any.whl /tmp/thonny/src
+cargo build
+python3 tools/thonny_e2e.py /tmp/thonny/src             # add --port /dev/ttyACM0 to test a real board
+python3 tools/mpremote_e2e.py
+```
+
+`python3 tools/pty_repl.py` prints a port (`/dev/pts/N`) with the interpreter on it, to try Thonny, mpremote or a
+terminal against it on a PC without a board.
 
 ### Example scripts
 

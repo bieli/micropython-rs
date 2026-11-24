@@ -114,6 +114,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
                 Kind::Tuple => "tuple",
                 Kind::Dict => "dict",
                 Kind::File => "TextIOWrapper",
+                Kind::BoundMethod => "builtin_function_or_method",
                 _ => "range",
             },
             Value::Globals => "dict",
@@ -228,10 +229,63 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
                 Some(Kind::List) => LIST,
                 Some(Kind::Tuple) => &["index", "count"],
                 Some(Kind::Dict) => DICT,
+                Some(Kind::File) => &[
+                    "read",
+                    "readline",
+                    "readlines",
+                    "write",
+                    "close",
+                    "flush",
+                    "tell",
+                    "seek",
+                ],
                 _ => &[],
             },
         };
         table.contains(&name)
+    }
+
+    /// `obj.name` for a method (`r = f.read`, `up = s.upper`): a bound
+    /// method object, or `None` if `obj` has no such method.
+    pub(super) fn bound_method(
+        &mut self,
+        obj: Value<'a>,
+        name: &'a str,
+    ) -> Result<Option<Value<'a>>, Error> {
+        if !self.has_method(obj, name) {
+            return Ok(None);
+        }
+        let base = self.sp;
+        let result = (|| {
+            self.push(obj)?;
+            self.push(Value::Str(name))?;
+            self.build(Kind::Tuple, 2)?;
+            let v = self.stack[self.sp - 1];
+            if let Value::Obj(r) = v {
+                self.heap.set_kind(r, Kind::BoundMethod);
+            }
+            Ok(Some(v))
+        })();
+        self.sp = base;
+        result
+    }
+
+    /// Calls a bound method object.
+    pub(super) fn call_bound(
+        &mut self,
+        method: crate::heap::ObjRef,
+        args: &[Value<'a>],
+        kwargs: super::Kwargs<'_, 'a>,
+    ) -> Result<Value<'a>, Error> {
+        let receiver = self.slot(method, 0);
+        let mut buf = [0u8; 32];
+        let name = self.str_of(self.slot(method, 1)).unwrap_or("");
+        let name = copy_name(name, &mut buf).ok_or(Error::AttributeError)?;
+        if kwargs.is_empty() {
+            self.call_method(receiver, name, args)
+        } else {
+            self.call_method_kw(receiver, name, args, kwargs)
+        }
     }
 
     /// `builtins.name`: built-in functions, types and exception classes.

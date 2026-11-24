@@ -196,6 +196,12 @@ pub(crate) fn render(
                 sink(")");
                 return;
             }
+            if kind == Kind::BoundMethod {
+                sink("<bound method ");
+                render(view, modules, slot(view, r, 1), false, depth + 1, sink);
+                sink(">");
+                return;
+            }
             if kind == Kind::File {
                 sink("<file ");
                 render(view, modules, slot(view, r, 0), true, depth + 1, sink);

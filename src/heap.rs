@@ -49,6 +49,9 @@ pub enum Kind {
     Exception,
     /// A file object (see `interpreter/files.rs`), laid out like a tuple.
     File,
+    /// A method taken from an object without calling it (`r = f.read`):
+    /// a tuple of the object and the method name.
+    BoundMethod,
 }
 
 impl Kind {
@@ -56,7 +59,12 @@ impl Kind {
     pub const fn is_container(self) -> bool {
         matches!(
             self,
-            Kind::List | Kind::Tuple | Kind::Dict | Kind::Exception | Kind::File
+            Kind::List
+                | Kind::Tuple
+                | Kind::Dict
+                | Kind::Exception
+                | Kind::File
+                | Kind::BoundMethod
         )
     }
 }

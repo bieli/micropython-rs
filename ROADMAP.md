@@ -88,7 +88,7 @@ Thonny reads and saves device files by running Python helper code on the board (
 | 5.4 | **Exceptions**: `try`/`except`/`else`/`finally`, `OSError`/`ImportError`, `except X as e`, `raise`, `assert`, Python tracebacks | Thonny 3.2.7+ | ✅ |
 | 5.5 | **Built-ins**: keyword arguments (`print(..., sep=, end=)`), default parameters, `lambda`, functions as values, `hasattr`/`getattr`, `globals()`, `id`, `isinstance`/`type`, `dir`, `builtins`, `%`/`format()`/f-strings | Thonny 3.2.7+ | ✅ |
 | 5.6 | **`os` and `open()`** on the flash file system: file objects (read/readline/write/with/iteration), `os.listdir/remove/rename/stat/size/statvfs/uname` | Thonny 3.2.7+, `mpremote cp/ls` | ✅ |
-| 5.7 | **Thonny 3.2.7 end to end**: connect, file list, open `main.py`, save, Run/Stop | milestone | ⬜ |
+| 5.7 | **Thonny 3.2.7 end to end**: connect, file list, open `main.py`, save, Run/Stop (`tools/thonny_e2e.py` with Thonny's own backend code; also `mpremote fs`; bound methods, `os.ilistdir`) | milestone | ✅ on the PC (`mpy-cli --repl`); on the board: run `tools/thonny_e2e.py --port` |
 | 5.8 | **Classes, `@classmethod`, `builtins` module** | Thonny 4.x/5.x | ⬜ |
 
 Found while building 5.1:

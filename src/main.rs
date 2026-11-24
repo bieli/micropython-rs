@@ -1,3 +1,5 @@
+mod host_repl;
+
 use micropython_rs::flatfs::{FlatFs, RamFlash, SLOT_SIZE};
 use micropython_rs::{Interpreter, Output};
 use std::cell::RefCell;
@@ -21,9 +23,15 @@ impl Output for StderrSink {
 
 fn main() {
     let args: Vec<String> = env::args().collect();
+    if args.len() == 2 && args[1] == "--repl" {
+        host_repl::main();
+    }
 
     if args.len() != 2 {
-        eprintln!("Usage: {} <script.py>", args[0]);
+        eprintln!(
+            "Usage: {} <script.py>   (or --repl for a REPL on stdin/stdout)",
+            args[0]
+        );
         process::exit(1);
     }
 

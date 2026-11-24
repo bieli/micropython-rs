@@ -38,3 +38,15 @@ jobs:
 
       - name: Run Makefile (Tests, Coverage >= 30%, and Embedded Build)
         run: make all
+
+      # Real tools against `mpy-cli --repl` on a pseudo-terminal (same REPL
+      # protocol as the ESP32 firmware)
+      - name: End-to-end tests with Thonny 3.2.7's backend and mpremote
+        run: |
+          cargo build
+          python3 -m venv /tmp/venv
+          /tmp/venv/bin/pip install --quiet pyserial jedi mpremote
+          /tmp/venv/bin/pip download --quiet --no-deps thonny==3.2.7 -d /tmp/thonny
+          python3 -m zipfile -e /tmp/thonny/thonny-3.2.7-py3-none-any.whl /tmp/thonny/src
+          /tmp/venv/bin/python tools/thonny_e2e.py /tmp/thonny/src
+          /tmp/venv/bin/python tools/mpremote_e2e.py
