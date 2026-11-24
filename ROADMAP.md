@@ -216,7 +216,8 @@ Done for 7.4:
 Done for 7.5: `micropython_rs::Float` is `f64`, or `f32` with the `float32` feature; libm's `f32` functions;
 `repr()` with 7 significant digits like MicroPython. On the ESP32 the maths is 2-11× faster natively (FPU instead
 of the ROM's soft-float), but Python code only 0-13 % (the interpreter's own overhead is 35-100 times a soft-float
-operation); 6 KB less flash, no RAM change.
+operation); 6 KB less flash, no RAM change. All measurements (native and Python, both builds) are in the README,
+"Single precision".
 
 ## Recommended order
 

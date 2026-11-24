@@ -179,25 +179,37 @@ single precision (`16777217.0` → `16777216`, `1e39` → `inf`). The `math` fun
 (`sinf`, `sqrtf`, ...). Floats still reach the `HardwareBridge` as `f64` (exactly).
 
 Speed on the ESP32 (TTGO, 80 MHz): its FPU only does single precision, so `f64` runs in the ROM's software
-routines (the `f64` firmware calls them from 377 places; the `f32` one has 670 FPU instructions instead):
+routines (the `f64` firmware calls them from 377 places; the `f32` one has 670 FPU instructions instead).
 
-| Operation | `f64` (default) | `f32` | |
-|-----------|----------------:|------:|-|
-| Native `a * 1.0001 + 0.5` | 1924 ns | 175 ns | 11× faster |
-| Native `10 / (a + 1)` | 8302 ns | 2383 ns | 3.5× |
-| Native `sqrt` / `sin` | 6148 / 32225 ns | 2000 / 18200 ns | 3× / 1.8× |
-| Python `y = y * 1.0001 + i * 0.5` (per loop pass) | 258 µs | 254 µs | 2 % |
+Measured on a TTGO T-Display, release build, `CPU_MHZ=80`, the same board for both builds. *Native*: 10 000
+rounds of the operation in Rust, without the interpreter (a temporary benchmark function in the firmware, not part
+of it). *Python*: a 500-pass `for` loop with one line, time per pass, including the loop itself.
+
+| Operation | `f64` (default) | `f32` (`FLOAT=32`) | `f32` vs `f64` |
+|-----------|----------------:|-------------------:|---------------:|
+| Native `a = a * 3 + 5` (`i64`, for comparison) | 264 ns | 264 ns | |
+| Native `a = a * 1.0001 + 0.5` | 1924 ns | 175 ns | 11× faster |
+| Native `a = 10 / (a + 1)` | 8302 ns | 2383 ns | 3.5× faster |
+| Native `sqrt(x)` | 6148 ns | 2000 ns | 3.1× faster |
+| Native `sin(x)` | 32 225 ns | 18 200 ns | 1.8× faster |
+| Python `for i in range(500): pass` | 74 µs | 74 µs | the same |
+| Python `x = (x * 3 + i) % 65536` (ints) | 236 µs | 247 µs | (build noise) |
+| Python `y = y * 1.0001 + i * 0.5` | 258 µs | 254 µs | 2 % faster |
 | Python `y = i / 7.3` | 183 µs | 183 µs | the same |
-| Python `math.sin(x)` / `math.sqrt(x)` | 406 / 270 µs | 352 / 239 µs | 13 % / 11 % |
-| Python `'%.3f' % x` | 571 µs | 597 µs | the same (formatting uses the `f64` value) |
+| Python `z = math.sin(i * 0.01)` | 406 µs | 352 µs | 13 % faster |
+| Python `z = math.sqrt(i)` | 270 µs | 239 µs | 11 % faster |
+| Python `s = '%.3f' % (i / 7)` | 571 µs | 597 µs | the same (formatting uses the `f64` value) |
+| Python `v = adc_read(34) * 3.3 / 4095` and `c = (v - 0.5) * 100.0` | 617 µs | 681 µs | (build noise, ADC reads) |
+| App image (TTGO build) | 424 KB | 418 KB | 6 KB smaller |
+| REPL stack frame (holds the interpreter) | 22 640 B | 22 640 B | the same |
 
-So the maths itself is 2-11 times faster, but a script barely notices: running one line of Python costs 70-250 µs
-in this interpreter (it parses as it runs), against about 2 µs for a software `f64` operation. Only scripts heavy
-on `math` functions gain about 10 %. (Results within ±5 % depend on the build: an int-only loop varied that much
-between the two firmwares.) `f32` saves 6 KB of flash and no RAM (the interpreter's stack frames are the same size: values are as large as
-the 64-bit ints either way). The bigger
-speed-ups are `CPU_MHZ=240` (3×) and the planned bytecode compiler; `float32` is for MicroPython's behaviour
-(its digits and rounding), and for chips with less flash.
+So the maths itself is 2-11 times faster (an `f32` multiply-add is even faster than an `i64` one), but a script
+barely notices: running one line of Python costs 70-250 µs in this interpreter (it parses as it runs), against
+about 2 µs for a software `f64` operation. Only scripts heavy on `math` functions gain about 10 %. Differences
+within about ±5-10 % depend on the build (code placement in flash and IRAM): the int-only loop, which has no floats
+at all, varied that much between the two firmwares. `f32` uses no less RAM: values are as large as the 64-bit ints
+either way. The bigger speed-ups are `make flash CPU_MHZ=240` (3× for everything, "CPU clock" below) and the
+planned bytecode compiler; `float32` is for MicroPython's behaviour (its digits and rounding), and 6 KB of flash.
 
 How it works without a heap: the parser turns each expression into postfix (RPN) order in a fixed-size buffer.
 For example, `(a + 2) * -3` becomes `[a, 2, Add, 3, Neg, Mul]`.
