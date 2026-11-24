@@ -831,7 +831,7 @@ make clean                                   # remove build artifacts
 
 | Make variable | Default | Meaning |
 |---------------|---------|---------|
-| `FEATURES` | *(empty)* | Cargo features passed as `--features ...` (e.g. `tft`) |
+| `FEATURES` | *(empty)* | Cargo features passed as `--features ...`: `tft` (the TTGO's display), `wifi` (the [`network` module](#the-network-module-wi-fi)), e.g. `FEATURES=tft,wifi` |
 | `LEVEL` | `full` | The interpreter's [feature level](#feature-levels): `full` (everything: Thonny, `machine`), `medium` (classes, formatting) or `minimal` (smallest) |
 | `FLOAT` | `64` | Float precision: `64` (double, like CPython) or `32` (single, like MicroPython's ESP32 port; computed by the FPU, see [Single precision](#single-precision-float32)) |
 | `CPU_MHZ` | `80` | CPU clock: `80` (least current, for batteries), `160` or `240` (scripts run 2× / 3× faster). Fixed in the firmware, `machine.freq()` reports it |
@@ -1072,6 +1072,7 @@ terminal against it on a PC without a board.
 | [`scripts/button.py`](micropython-esp32/scripts/button.py) | Counting button presses with a pull-up and debouncing, timed with `ticks_ms` |
 | [`scripts/pwm_fade.py`](micropython-esp32/scripts/pwm_fade.py) | Fading an LED, and a 50 Hz servo pulse |
 | [`scripts/i2c_scan.py`](micropython-esp32/scripts/i2c_scan.py) | Scanning the I²C bus, and reading registers with `i2c_write_read` |
+| [`scripts/wifi_connect.py`](micropython-esp32/scripts/wifi_connect.py) | `network.WLAN`: scan, connect with error handling, `ifconfig()` (`FEATURES=wifi`) |
 | [`scripts/machine_demo.py`](micropython-esp32/scripts/machine_demo.py) | `from machine import Pin, ADC, PWM, I2C, UART, SPI, WDT`: the `machine` module, checked with two jumper wires |
 | [`scripts/stack_budget.py`](micropython-esp32/scripts/stack_budget.py) | How much native stack calls, blocks and recursion take (`stack_peak()`) |
 | [`scripts/bus_loopback.py`](micropython-esp32/scripts/bus_loopback.py) | UART and SPI checked with one jumper wire each (TX to RX, MOSI to MISO) |
@@ -1230,11 +1231,70 @@ takes 43 of the 64 function slots (`MAX_FUNCS`), and each method call runs Pytho
 on the ESP32 at 80 MHz (0.43 ms at 240 MHz), `pin_write(2, 1)` 0.27 ms (0.12 ms). Fine for blinking, sensors and
 buses, too slow for bit-banging.
 
+#### The `network` module (Wi-Fi)
+
+With `FEATURES=wifi` (`make flash FEATURES=tft,wifi` on the TTGO), MicroPython's `network.WLAN` connects the board to a
+Wi-Fi network, with the same calls as on MicroPython's ESP32 port:
+
+```python
+import network, time
+
+wlan = network.WLAN(network.STA_IF)
+wlan.active(True)
+print(wlan.scan())                       # [(b'my-network', b'\x..', 5, -68, 3, False), ...]
+wlan.connect('your-network', 'your-password')
+while not wlan.isconnected():
+    if wlan.status() in (network.STAT_WRONG_PASSWORD, network.STAT_NO_AP_FOUND):
+        raise OSError(wlan.status())
+    time.sleep_ms(100)
+print(wlan.ifconfig())                   # ('192.168.0.111', '255.255.255.0', '192.168.0.1', '8.8.8.8')
+```
+
+| Call | Does |
+|------|------|
+| `network.WLAN(network.STA_IF)` | The station (client) interface; `network.AP_IF` raises `ValueError` (no access point mode yet) |
+| `active([on])` | Starts or stops the radio; returns whether it's on. The first `active(True)` starts the Wi-Fi stack (93 ms) |
+| `scan()` | `(ssid, bssid, channel, RSSI, security, hidden)` tuples, `ssid` and `bssid` as bytes, `security` an `AUTH_*` value; up to 120 ms per channel like ESP-IDF (0.5-1 s) |
+| `connect(ssid, key)` | Starts connecting and returns, like MicroPython; DHCP follows. WPA2 or better (WPA3 too), or an open network with no key |
+| `isconnected()`, `status()` | `True` once there's an IP address; `STAT_IDLE`, `STAT_CONNECTING`, `STAT_GOT_IP`, `STAT_WRONG_PASSWORD`, `STAT_NO_AP_FOUND`, `STAT_BEACON_TIMEOUT`, `STAT_ASSOC_FAIL`, `STAT_HANDSHAKE_TIMEOUT` (MicroPython's ESP32 values) |
+| `status('rssi')` | Signal strength in dBm |
+| `ifconfig()` | `(ip, netmask, gateway, dns)` from DHCP, `'0.0.0.0'` when not connected |
+| `config('mac')`, `config('ssid')`, `config('hostname')`, `config(hostname=...)` | MAC address (bytes), the network, the host name (`network.hostname()` too) |
+| `disconnect()` | Leaves the network |
+| constants | `STA_IF AP_IF`, `STAT_*`, `AUTH_OPEN AUTH_WEP AUTH_WPA_PSK AUTH_WPA2_PSK AUTH_WPA_WPA2_PSK AUTH_WPA2_ENTERPRISE AUTH_WPA3_PSK AUTH_WPA2_WPA3_PSK`, and `WLAN.IF_STA IF_AP SEC_*` |
+
+Measured on the TTGO T-Display (80 MHz) with a WPA2 home network: the radio starts in 93 ms, a scan takes 0.5-1 s
+(5-19 networks around), `connect()` to `isconnected()` takes 2.7-5.3 s with DHCP, a wrong password is reported
+(`STAT_WRONG_PASSWORD`) after about 8 s and an unknown network (`STAT_NO_AP_FOUND`) after about 1.7 s. The board
+answers pings from the network while a script runs or sleeps (39-139 ms round trips: it's polled every 100 ms); the
+connection stays up across soft resets and Thonny sessions.
+
+How it works ([`src/wifi.rs`](micropython-esp32/src/wifi.rs), [`modules/network.py`](micropython-esp32/modules/network.py)):
+the driver is [`esp-radio`](https://crates.io/crates/esp-radio) (Espressif's Wi-Fi library) on the
+[`esp-rtos`](https://crates.io/crates/esp-rtos) scheduler, both started by the first `active(True)`, and DHCP and IP
+come from [`smoltcp`](https://crates.io/crates/smoltcp). There's no background network task: the interface is polled
+when a script calls `status()`, `isconnected()` or `ifconfig()`, and while it sleeps. `network` is a frozen Python
+module over the firmware's `wifi_*` functions (`wifi_connect(ssid, key)`, `wifi_status()`, ...).
+
+What Wi-Fi costs (the reason it's a feature, not in every build):
+
+| | Without `wifi` | With `wifi` |
+|-|---------------:|------------:|
+| App image (TTGO) | 424 KB | 859 KB |
+| IRAM | 48 KB | 101 KB (the driver's interrupt code) |
+| Static RAM | 11 KB | 81 KB (a 64 KB heap for the driver: 37 KB used when active, 46 KB connected, 57 KB at most) |
+| Main stack | 181 KB | 111 KB (recursion ends with `RecursionError` at about 99 KB instead of 153 KB) |
+| Speed with Wi-Fi off / connected | | the same / 2 % slower (the scheduler's ticks) |
+
+Not there yet: access point mode, static addresses (`ifconfig((...))`), and sockets (`socket`, `urequests`), which are
+next. `network` takes 11 function slots, so a script using both `machine` and `network` has 10 of the 64 left.
+
 #### Modules
 
 | Module | Builds | Contents |
 |--------|--------|----------|
 | `machine` | both | MicroPython's hardware classes, see [The `machine` module](#the-machine-module) |
+| `network` | `wifi` | Wi-Fi: `network.WLAN`, see [The `network` module](#the-network-module-wi-fi) |
 | `time` | both | `sleep(s)` (also a float: `sleep(0.5)`), `sleep_ms(ms)`, `sleep_us(us)`, `ticks_ms()`, `ticks_us()`, `ticks_diff(new, old)`, with MicroPython's names, so `import time; time.sleep_ms(100)` works as on MicroPython |
 | `display` | `tft` | Drawing on the 240 × 135 TFT. See below |
 | `buttons` | both | Debounced button events with short and long presses. TTGO: `LEFT` = GPIO0, `RIGHT` = GPIO35; generic build: `LEFT` = BOOT button (GPIO0) |

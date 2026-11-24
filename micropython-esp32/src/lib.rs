@@ -9,6 +9,8 @@ pub mod serial_console;
 pub mod serial_input;
 pub mod stack;
 pub mod storage;
+#[cfg(feature = "wifi")]
+pub mod wifi;
 
 /// Set by Ctrl-C on the serial port; stops the running script
 /// (checked by the interpreter between statements and inside `sleep_ms`).

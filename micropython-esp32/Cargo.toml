@@ -27,6 +27,13 @@ esp-storage = { version = "=0.8.1", features = ["esp32"] }
 embedded-storage = "0.3"
 # Static buffers for the REPL source arena and the interpreter heap
 
+# Wi-Fi (only with `--features wifi`): the radio driver, the scheduler it runs
+# its tasks on, a heap for it, and smoltcp for DHCP and IP
+esp-radio = { version = "=0.17.0", features = ["esp32", "wifi", "smoltcp", "esp-alloc", "unstable"], optional = true }
+esp-rtos = { version = "=0.2.0", features = ["esp32", "esp-radio", "esp-alloc"], optional = true }
+esp-alloc = { version = "=0.9.0", features = ["esp32"], optional = true }
+smoltcp = { version = "0.12", default-features = false, features = ["medium-ethernet", "proto-ipv4", "proto-dhcpv4", "socket-dhcpv4", "socket-udp", "socket-tcp"], optional = true }
+
 # TFT ST7789 display & 2D text rendering (only pulled in with `--features tft`)
 mipidsi = { version = "0.9.0", optional = true }
 embedded-graphics = { version = "0.8.1", optional = true }
@@ -47,6 +54,8 @@ full = ["micropython-rs/full", "machine"]
 # code built into the firmware (modules/machine.py, about 9 KB of flash); it
 # needs the full level (classes and frozen modules)
 machine = ["micropython-rs/full"]
+# Wi-Fi and MicroPython's `network` module (network.WLAN)
+wifi = ["dep:esp-radio", "dep:esp-rtos", "dep:esp-alloc", "dep:smoltcp"]
 # Single precision floats (`make flash FLOAT=32`): the ESP32's FPU computes
 # them in hardware; double precision (the default) runs in software
 float32 = ["micropython-rs/float32"]

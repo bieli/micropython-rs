@@ -153,6 +153,8 @@ pub fn run<O: Output, H: HardwareBridge>(
 static FROZEN_MODULES: &[(&str, &str)] = &[
     #[cfg(feature = "machine")]
     ("machine", include_str!("../modules/machine.py")),
+    #[cfg(feature = "wifi")]
+    ("network", include_str!("../modules/network.py")),
 ];
 
 /// A new interpreter for a session. Out of line: building it (from parts

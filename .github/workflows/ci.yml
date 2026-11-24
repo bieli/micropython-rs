@@ -79,6 +79,11 @@ jobs:
           - board: generic
             features: ""
             level: minimal
+          # Wi-Fi: its heap and driver take 70 KB of the stack's RAM
+          - board: TTGO T-Display + Wi-Fi
+            features: tft,wifi
+            level: full
+            min_stack: 96
 
     steps:
       - name: Checkout repository
@@ -102,7 +107,7 @@ jobs:
         shell: bash
         run: |
           python3 tools/fw_report.py target/xtensa-esp32-none-elf/release/micropython-esp32 \
-            --min-stack-kb 128 --max-frame-kb 32 --markdown | tee -a "$GITHUB_STEP_SUMMARY"
+            --min-stack-kb ${{ matrix.min_stack || 128 }} --max-frame-kb 32 --markdown | tee -a "$GITHUB_STEP_SUMMARY"
 
   # Random scripts through the whole interpreter (fuzz/fuzz_targets/eval.rs):
   # no panic, hang or native stack overflow in 5 minutes

@@ -34,6 +34,10 @@ const SCRIPT: &str = include_str!(env!("MPY_SCRIPT_PATH"));
 macro_rules! board_peripherals {
     ($p:ident) => {
         BoardPeripherals {
+            #[cfg(feature = "wifi")]
+            wifi: $p.WIFI,
+            #[cfg(feature = "wifi")]
+            timg1: $p.TIMG1,
             adc1: $p.ADC1,
             gpio34: $p.GPIO34,
             gpio36: $p.GPIO36,
@@ -126,6 +130,8 @@ impl HardwareBridge for GenericHardware<'_> {
 fn main() -> ! {
     let config = esp_hal::Config::default().with_cpu_clock(micropython_esp32::board::CPU_CLOCK);
     let peripherals = esp_hal::init(config);
+    #[cfg(feature = "wifi")]
+    wifi_heap();
     // Set up serial input first: it resets UART0, which drops unsent output
     serial_input::init(peripherals.UART0, peripherals.GPIO3);
     print_reset_reason();
@@ -294,6 +300,8 @@ impl HardwareBridge for TtgoHardware<'_, '_> {
 fn main() -> ! {
     let config = esp_hal::Config::default().with_cpu_clock(micropython_esp32::board::CPU_CLOCK);
     let peripherals = esp_hal::init(config);
+    #[cfg(feature = "wifi")]
+    wifi_heap();
     // Set up serial input first: it resets UART0, which drops unsent output
     serial_input::init(peripherals.UART0, peripherals.GPIO3);
     print_reset_reason();
@@ -338,3 +346,12 @@ const BOOT_SCRIPT: BootScript = BootScript {
     source: SCRIPT,
     name: env!("MPY_SCRIPT_NAME"),
 };
+
+/// The heap the Wi-Fi driver allocates from (`wifi` feature): 16 KB in the
+/// second data RAM region (what the REPL's buffers leave of it) and 48 KB of
+/// the main data RAM, which the stack gives up.
+#[cfg(feature = "wifi")]
+fn wifi_heap() {
+    esp_alloc::heap_allocator!(#[link_section = ".dram2_uninit"] size: 16 * 1024);
+    esp_alloc::heap_allocator!(size: 48 * 1024);
+}
