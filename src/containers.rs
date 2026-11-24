@@ -425,6 +425,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
 
     /// `BuildList` / `BuildTuple` / `BuildDict`: replaces the top `n` values
     /// (`2n` for a dict) with the new container.
+    #[inline(never)]
     pub(super) fn build(&mut self, kind: Kind, n: usize) -> Result<(), Error> {
         let values = if kind == Kind::Dict { 2 * n } else { n };
         let from = self.sp - values;
@@ -922,6 +923,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
     // ---- methods -------------------------------------------------------
 
     /// Methods of lists, tuples and dicts; `None` if `receiver` isn't one.
+    #[inline(never)]
     pub(super) fn container_method(
         &mut self,
         receiver: Value<'a>,
@@ -1009,6 +1011,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
 
     /// Stable insertion sort with `<` (fine for the list sizes of an MCU),
     /// optionally by `key(element)` and/or in reverse order. `r` is rooted.
+    #[inline(never)]
     pub(super) fn sort_list(
         &mut self,
         r: ObjRef,
@@ -1180,6 +1183,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
     // ---- built-in functions ----------------------------------------------
 
     /// Built-ins for containers and iterables; `None` if `name` isn't one.
+    #[inline(never)]
     pub(super) fn container_builtin(
         &mut self,
         name: &str,

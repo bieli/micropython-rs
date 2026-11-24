@@ -14,8 +14,8 @@ Usage (Thonny isn't needed as an app, only its sources):
     cd /tmp/thonny && python3 -m zipfile -e thonny-3.2.7-py3-none-any.whl src
     cargo build && python3 tools/thonny_e2e.py /tmp/thonny/src [--port /dev/ttyACM0]
 
-With `--port`, the same test runs against a real board (it deletes and
-recreates `t_thonny.py` and `main.py` there: back up `main.py` first).
+With `--port`, the same test runs against a real board (it creates and
+deletes files named `t_*` there; `main.py` isn't touched).
 """
 
 import argparse
@@ -145,9 +145,10 @@ check("the board answers after Stop", result["value_info"].repr, "True")
 
 # Stop/Restart backend: a soft reboot clears the variables, files stay
 be._cmd_write_file(InlineCommand("write_file", path="t_keep.txt", content_bytes=b"kept", editor_id=3))
-be._soft_reboot(False)
+be._cmd_execute_source(ToplevelCommand("execute_source", source="t_before_reboot = 1"))
+be._soft_reboot(False)  # on a board, main.py runs again here
 be.messages.clear()
-be._cmd_execute_source(ToplevelCommand("execute_source", source="print('x' in globals())"))
+be._cmd_execute_source(ToplevelCommand("execute_source", source="print('t_before_reboot' in globals())"))
 check("soft reboot clears variables", be.output().strip(), "False")
 read = be._cmd_read_file(InlineCommand("read_file", path="t_keep.txt"))
 check("files survive the soft reboot", read["content_bytes"], b"kept")

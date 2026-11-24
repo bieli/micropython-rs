@@ -228,6 +228,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
 
     /// `obj.name(args)` for classes, instances and `super()`; `None` if
     /// `obj` is none of them.
+    #[inline(never)]
     pub(super) fn object_method(
         &mut self,
         obj: Value<'a>,
@@ -272,6 +273,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
     }
 
     /// `Class(args)`: a new instance, initialized by `__init__`.
+    #[inline(never)]
     pub(super) fn instantiate(
         &mut self,
         class: ObjRef,
@@ -339,6 +341,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
 
     /// `super()` inside a method: the base of the method's class, bound to
     /// its `self` (or `cls`).
+    #[inline(never)]
     pub(super) fn make_super(&mut self) -> Result<Value<'a>, Error> {
         let (Some(class), this) = (self.as_class(self.method_class), self.method_self) else {
             let class = super::exceptions::class_by_name("RuntimeError").unwrap_or(0);
@@ -413,6 +416,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
     }
 
     /// `str(obj)` / `repr(obj)` through `__str__` / `__repr__`, if defined.
+    #[inline(never)]
     pub(super) fn custom_str(
         &mut self,
         obj: Value<'a>,

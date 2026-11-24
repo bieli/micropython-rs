@@ -387,7 +387,9 @@ let (used, capacity, objects, collections) = vm.heap_stats();
 ```
 
 The ESP32 firmware gives the interpreter a 32 KB heap (static memory, not the stack). On the TTGO, a loop creating
-2 000 strings in it takes 1.6 s, with the collector running as needed.
+2 000 strings in it takes 1.6 s, with the collector running as needed. Everything in this section is also checked on
+the board: the scripts in `tests/cpython/` print exactly what CPython prints when they run on the TTGO
+(`tools/mpy.py run tests/cpython/classes.py`, ...).
 
 ### Function calls
 
@@ -435,6 +437,24 @@ vm.set_abort_flag(&ABORT);        // eval() returns Error::Interrupted once ABOR
 
 The step budget starts over for each `eval()` call. The abort flag is checked before every statement and loop pass.
 It's only read, so clear it yourself before the next run. The ESP32 firmware connects the abort flag to Ctrl-C on the serial port.
+
+A third guard protects the native stack, which on a microcontroller is small and crashes the device when it
+overflows:
+
+```rust
+// The stack grows down: below this address, scripts get a RecursionError
+vm.set_stack_floor(Some(stack_bottom_address + 16 * 1024));
+```
+
+The interpreter compares the stack position (the address of a local variable) with the floor at every call, block
+and expression, so deep recursion or deeply nested code raises `RecursionError` (`Error::RecursionLimit`), which a
+script can catch. The margin is for what runs below the last check: hardware drivers, flash writes, interrupts. The
+ESP32 firmware takes the bottom from esp-hal's linker script (`_stack_end_cpu0`) and keeps 16 KB.
+
+**Speed on the ESP32 (`iram` feature).** The firmware enables the core library's `iram` feature, which puts the
+interpreter's hot loop (lexer, parser, statement and expression evaluation, about 40 KB) into the `.rwtext` section,
+i.e. the ESP32's internal instruction RAM. Running from flash, the loop missed the 32 KB flash cache all the time:
+5000 empty `while` passes took 1.6 s instead of 0.9 s.
 
 ## Using micropython-rs on a Microcontroller
 

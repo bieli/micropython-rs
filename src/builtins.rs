@@ -375,6 +375,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
 
     /// Calls a built-in that takes values of any kind; `None` if `name`
     /// isn't one of them.
+    #[inline(never)]
     pub(super) fn value_builtin(
         &mut self,
         name: &str,
@@ -506,6 +507,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
 
     /// Methods of `globals()`: `clear()` changes the globals; the others
     /// work on a snapshot dict.
+    #[inline(never)]
     pub(super) fn globals_view(
         &mut self,
         name: &str,

@@ -91,11 +91,16 @@ Thonny reads and saves device files by running Python helper code on the board (
 | 5.7 | **Thonny 3.2.7 end to end**: connect, file list, open `main.py`, save, Run/Stop (`tools/thonny_e2e.py` with Thonny's own backend code; also `mpremote fs`; bound methods, `os.ilistdir`) | milestone | ✅ on the PC (`mpy-cli --repl`); on the board: run `tools/thonny_e2e.py --port` |
 | 5.8 | **Classes** (inheritance, `super()`, `@classmethod`/`@staticmethod`, `__str__`/`__enter__`, own exceptions), closures and decorators, `*args`/`**kwargs`, `sys`, `os.getcwd` | Thonny 4.x/5.x | ✅ (`tools/thonny5_e2e.py`: Thonny 4.1.7 and 5.0.0) |
 
-**Phase 5 is done on the PC:** Thonny 3.2.7, 4.1.7 and 5.0.0 and mpremote run against the interpreter through
-`mpy-cli --repl` (same REPL protocol as the firmware), in CI. **Still to do on a board:** flash the firmware and run
-`tools/thonny_e2e.py --port` / `tools/thonny5_e2e.py --port` (the board wasn't connected while 5.2–5.8 were built;
-the firmware builds, and 5.1 was tested on a TTGO). Every language feature is checked against CPython
-(`tests/cpython/*.py`, run by `cargo test`).
+**Phase 5 is done**, on the PC and on a TTGO T-Display:
+
+* Thonny 3.2.7, 4.1.7 and 5.0.0 and mpremote work: `tools/thonny_e2e.py` and `tools/thonny5_e2e.py` pass against
+  `mpy-cli --repl` (in CI) and against the board (`--port /dev/ttyACM0`).
+* Every language feature is checked against CPython: `tests/cpython/*.py` must print what CPython printed, run by
+  `cargo test` and, with `tools/mpy.py run`, on the board (all identical).
+* Found on the board: the stack. The REPL's buffers were built on the stack before being copied to their statics
+  (64 KB of the 118 KB stack, now `ConstStaticCell`), the old-`main.py` migration buffer stayed in `main`'s frame
+  (24 KB, now out of line), and deep recursion overflowed it. The interpreter now has a stack guard
+  (`set_stack_floor`): too deep raises `RecursionError` instead of crashing the board.
 
 Left for later (documented in the README): floats, sets, generators, `nonlocal`, operator methods (`__add__`,
 `__eq__`, ...), multiple inheritance, importing `.py` files, `bytearray`, step slices (`a[::2]`).
@@ -103,9 +108,9 @@ Left for later (documented in the README): floats, sets, generators, `nonlocal`,
 Found while building 5.1:
 
 * **Speed on the ESP32:** with the heap and the shared value stack, tight loops got ~20% slower on the ESP32
-  (5000 empty `while` passes: 829 ms before, 1005 ms after) although the host is unchanged. Changing only the struct
-  layout moved the result between 1.0 and 1.5 s, which points at the flash instruction cache. Proper fix: put the
-  interpreter's hot loop (lexer, parser, evaluator) into IRAM, behind a feature of the core library.
+  (5000 empty `while` passes: 829 ms before, 1005 ms after) although the host was unchanged, and after 5.8 they
+  took 1635 ms: the flash instruction cache. Fixed with the `iram` feature of the core library (the hot loop runs
+  from IRAM): 897 ms, with all of Phase 5 in; drawing 50 pixels takes 31 ms (34 ms before Phase 5).
 
 **Later:** once loops and functions exist and profiling shows the evaluator is a bottleneck, add the
 bytecode compiler and VM, plus a `const` folding pass.

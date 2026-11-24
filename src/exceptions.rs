@@ -150,6 +150,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
     }
 
     /// A new exception object of `class` with `args` (rooted).
+    #[inline(never)]
     pub(super) fn new_exception(
         &mut self,
         class: u8,
@@ -224,6 +225,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
 
     /// The exception object for a caught error (made for internal errors,
     /// with their message as the argument).
+    #[inline(never)]
     pub(super) fn exception_object(&mut self, err: Error) -> Result<Value<'a>, Error> {
         if err == Error::Exception && self.exc_class(self.exc).is_some() {
             return Ok(self.exc);

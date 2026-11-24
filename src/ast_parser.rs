@@ -516,6 +516,7 @@ impl<'a> Parser<'a> {
 
     /// Skips blank lines and returns the indentation of the next statement,
     /// or `None` at the end of the source.
+    #[cfg_attr(feature = "iram", link_section = ".rwtext")]
     pub fn next_indent(&mut self) -> Result<Option<u32>, Error> {
         self.skip_newlines()?;
         Ok(match self.current {
@@ -553,6 +554,7 @@ impl<'a> Parser<'a> {
         self.current == Token::Finally
     }
 
+    #[cfg_attr(feature = "iram", link_section = ".rwtext")]
     fn advance(&mut self) -> Result<(), Error> {
         let result = self.lexer.next_token();
         self.current_line = self.lexer.token_line();
@@ -563,10 +565,12 @@ impl<'a> Parser<'a> {
     }
 
     /// Looks at the token after `current` without consuming anything.
+    #[cfg_attr(feature = "iram", link_section = ".rwtext")]
     fn peek(&self) -> Result<Token<'a>, Error> {
         self.lexer.clone().next_token()
     }
 
+    #[cfg_attr(feature = "iram", link_section = ".rwtext")]
     fn expect(&mut self, token: Token<'a>) -> Result<(), Error> {
         if self.current != token {
             return Err(Error::UnexpectedToken);
@@ -574,6 +578,7 @@ impl<'a> Parser<'a> {
         self.advance()
     }
 
+    #[cfg_attr(feature = "iram", link_section = ".rwtext")]
     fn skip_newlines(&mut self) -> Result<(), Error> {
         while self.current == Token::Newline {
             self.advance()?;
@@ -583,6 +588,7 @@ impl<'a> Parser<'a> {
 
     /// A simple statement ends at a newline, the end of input, or `;`
     /// (which is consumed, so the parser is at the next statement).
+    #[cfg_attr(feature = "iram", link_section = ".rwtext")]
     fn expect_stmt_end(&mut self) -> Result<(), Error> {
         match self.current {
             Token::Newline | Token::Eof => Ok(()),
@@ -599,6 +605,7 @@ impl<'a> Parser<'a> {
     ///
     /// For compound statements only the header up to and including `:` is
     /// consumed; the parser is then at the start of the body.
+    #[cfg_attr(feature = "iram", link_section = ".rwtext")]
     pub fn parse_next_stmt(&mut self, code: &mut Code<'a>) -> Result<Option<Stmt<'a>>, Error> {
         code.clear();
         self.after_semicolon = false;
@@ -852,6 +859,7 @@ impl<'a> Parser<'a> {
     /// An expression statement, or an assignment to an element (`x[k] = v`,
     /// `x[k] += v`): the target is parsed as an expression ending in `Index`,
     /// which is then removed, so the target leaves the container and the key.
+    #[cfg_attr(feature = "iram", link_section = ".rwtext")]
     fn parse_expr_stmt(&mut self, code: &mut Code<'a>) -> Result<Stmt<'a>, Error> {
         let start = code.len;
         self.parse_test(code)?;
@@ -1006,6 +1014,7 @@ impl<'a> Parser<'a> {
 
     /// def := 'def' IDENT '(' [param (',' param)* [',']] ')' ':'
     /// with param := IDENT ['=' expr]
+    #[inline(never)]
     fn parse_def(&mut self, code: &mut Code<'a>) -> Result<Stmt<'a>, Error> {
         let defaults_start = code.len;
         let mut ndefaults = 0u8;
@@ -1083,6 +1092,7 @@ impl<'a> Parser<'a> {
     }
 
     /// Parses one full expression and returns its range in `code`.
+    #[cfg_attr(feature = "iram", link_section = ".rwtext")]
     fn parse_expr(&mut self, code: &mut Code<'a>) -> Result<Expr, Error> {
         let start = code.len;
         self.parse_test(code)?;
@@ -1094,6 +1104,7 @@ impl<'a> Parser<'a> {
 
     /// Like `parse_expr`, but `a, b` (without parentheses) is a tuple, as on
     /// the right of `=`, after `return` and after `for ... in`.
+    #[cfg_attr(feature = "iram", link_section = ".rwtext")]
     fn parse_expr_list(&mut self, code: &mut Code<'a>) -> Result<Expr, Error> {
         let start = code.len;
         self.parse_test(code)?;
@@ -1133,6 +1144,7 @@ impl<'a> Parser<'a> {
     }
 
     /// test := or ['if' or 'else' test] | lambda
+    #[cfg_attr(feature = "iram", link_section = ".rwtext")]
     fn parse_test(&mut self, code: &mut Code<'a>) -> Result<(), Error> {
         if self.current == Token::Lambda {
             return self.parse_lambda(code);
@@ -1161,6 +1173,7 @@ impl<'a> Parser<'a> {
 
     /// The rest of a comprehension, at `for`: the element part(s) are
     /// already in `code` from `start` (`a` and, for a dict, `b` items).
+    #[inline(never)]
     fn parse_comprehension(
         &mut self,
         code: &mut Code<'a>,
@@ -1202,6 +1215,7 @@ impl<'a> Parser<'a> {
     }
 
     /// `[...]`, `(...)` and `{...}` displays, at the opening bracket.
+    #[inline(never)]
     fn parse_display(&mut self, code: &mut Code<'a>) -> Result<(), Error> {
         let open = self.current;
         self.advance()?;
@@ -1252,6 +1266,7 @@ impl<'a> Parser<'a> {
     }
 
     /// or := and ('or' and)*
+    #[cfg_attr(feature = "iram", link_section = ".rwtext")]
     fn parse_or(&mut self, code: &mut Code<'a>) -> Result<(), Error> {
         self.parse_and(code)?;
         while self.current == Token::Or {
@@ -1264,6 +1279,7 @@ impl<'a> Parser<'a> {
     }
 
     /// and := not ('and' not)*
+    #[cfg_attr(feature = "iram", link_section = ".rwtext")]
     fn parse_and(&mut self, code: &mut Code<'a>) -> Result<(), Error> {
         self.parse_not(code)?;
         while self.current == Token::And {
@@ -1276,6 +1292,7 @@ impl<'a> Parser<'a> {
     }
 
     /// not := 'not' not | comparison
+    #[cfg_attr(feature = "iram", link_section = ".rwtext")]
     fn parse_not(&mut self, code: &mut Code<'a>) -> Result<(), Error> {
         if self.current == Token::Not {
             self.advance()?;
@@ -1289,6 +1306,7 @@ impl<'a> Parser<'a> {
     ///
     /// `a < b < c` compiles to [a, b, CmpChain(Lt, skip=2), c, Cmp(Lt)], so
     /// `b` is evaluated only once and `c` is skipped if `a < b` is false.
+    #[cfg_attr(feature = "iram", link_section = ".rwtext")]
     fn parse_comparison(&mut self, code: &mut Code<'a>) -> Result<(), Error> {
         self.parse_bitor(code)?;
         let Some(mut op) = self.take_cmp_op()? else {
@@ -1321,6 +1339,7 @@ impl<'a> Parser<'a> {
     }
 
     /// Consumes a comparison operator (`not in` is two tokens), if any.
+    #[cfg_attr(feature = "iram", link_section = ".rwtext")]
     fn take_cmp_op(&mut self) -> Result<Option<CmpOp>, Error> {
         let op = match self.current {
             Token::Not if self.peek()? == Token::In => {
@@ -1343,6 +1362,7 @@ impl<'a> Parser<'a> {
     }
 
     /// bitor := bitxor ('|' bitxor)*
+    #[cfg_attr(feature = "iram", link_section = ".rwtext")]
     fn parse_bitor(&mut self, code: &mut Code<'a>) -> Result<(), Error> {
         self.parse_left_assoc(code, Self::parse_bitxor, |t| match t {
             Token::Pipe => Some(BinOp::BitOr),
@@ -1351,6 +1371,7 @@ impl<'a> Parser<'a> {
     }
 
     /// bitxor := bitand ('^' bitand)*
+    #[cfg_attr(feature = "iram", link_section = ".rwtext")]
     fn parse_bitxor(&mut self, code: &mut Code<'a>) -> Result<(), Error> {
         self.parse_left_assoc(code, Self::parse_bitand, |t| match t {
             Token::Caret => Some(BinOp::BitXor),
@@ -1359,6 +1380,7 @@ impl<'a> Parser<'a> {
     }
 
     /// bitand := shift ('&' shift)*
+    #[cfg_attr(feature = "iram", link_section = ".rwtext")]
     fn parse_bitand(&mut self, code: &mut Code<'a>) -> Result<(), Error> {
         self.parse_left_assoc(code, Self::parse_shift, |t| match t {
             Token::Amp => Some(BinOp::BitAnd),
@@ -1367,6 +1389,7 @@ impl<'a> Parser<'a> {
     }
 
     /// shift := additive (('<<' | '>>') additive)*
+    #[cfg_attr(feature = "iram", link_section = ".rwtext")]
     fn parse_shift(&mut self, code: &mut Code<'a>) -> Result<(), Error> {
         self.parse_left_assoc(code, Self::parse_additive, |t| match t {
             Token::Shl => Some(BinOp::Shl),
@@ -1376,6 +1399,7 @@ impl<'a> Parser<'a> {
     }
 
     /// additive := term (('+' | '-') term)*
+    #[cfg_attr(feature = "iram", link_section = ".rwtext")]
     fn parse_additive(&mut self, code: &mut Code<'a>) -> Result<(), Error> {
         self.parse_left_assoc(code, Self::parse_term, |t| match t {
             Token::Plus => Some(BinOp::Add),
@@ -1385,6 +1409,7 @@ impl<'a> Parser<'a> {
     }
 
     /// term := unary (('*' | '/' | '//' | '%') unary)*
+    #[cfg_attr(feature = "iram", link_section = ".rwtext")]
     fn parse_term(&mut self, code: &mut Code<'a>) -> Result<(), Error> {
         self.parse_left_assoc(code, Self::parse_unary, |t| match t {
             Token::Star => Some(BinOp::Mul),
@@ -1397,6 +1422,7 @@ impl<'a> Parser<'a> {
 
     /// Shared loop for left-associative binary operator levels:
     /// `operand (op operand)*`, where `op_for` maps a token to its operator.
+    #[cfg_attr(feature = "iram", link_section = ".rwtext")]
     fn parse_left_assoc(
         &mut self,
         code: &mut Code<'a>,
@@ -1413,6 +1439,7 @@ impl<'a> Parser<'a> {
     }
 
     /// unary := ('-' | '+' | '~') unary | power
+    #[cfg_attr(feature = "iram", link_section = ".rwtext")]
     fn parse_unary(&mut self, code: &mut Code<'a>) -> Result<(), Error> {
         let item = match self.current {
             Token::Minus => Some(Item::Neg),
@@ -1429,6 +1456,7 @@ impl<'a> Parser<'a> {
     }
 
     /// power := atom ('**' unary)?
+    #[cfg_attr(feature = "iram", link_section = ".rwtext")]
     fn parse_power(&mut self, code: &mut Code<'a>) -> Result<(), Error> {
         self.parse_postfix(code)?;
         if self.current == Token::DoubleStar {
@@ -1443,6 +1471,7 @@ impl<'a> Parser<'a> {
     ///
     /// `s.strip().upper()`, `d.line(1, 2)`, `s[i]`, `s[a:b]`: the value is
     /// already on the stack when a trailer is applied.
+    #[cfg_attr(feature = "iram", link_section = ".rwtext")]
     fn parse_postfix(&mut self, code: &mut Code<'a>) -> Result<(), Error> {
         self.parse_atom(code)?;
         loop {
@@ -1502,6 +1531,7 @@ impl<'a> Parser<'a> {
     }
 
     /// atom := INT | STR | True | False | None | IDENT | call | '(' expr ')'
+    #[cfg_attr(feature = "iram", link_section = ".rwtext")]
     fn parse_atom(&mut self, code: &mut Code<'a>) -> Result<(), Error> {
         let item = match self.current {
             Token::Int(n) => Item::Int(n),
@@ -1533,6 +1563,7 @@ impl<'a> Parser<'a> {
     /// call := IDENT '(' [expr (',' expr)* [',']] ')'
     ///
     /// Arguments are emitted first, then `Call { name, argc, kw }`.
+    #[cfg_attr(feature = "iram", link_section = ".rwtext")]
     fn parse_call(&mut self, name: &'a str, code: &mut Code<'a>) -> Result<(), Error> {
         let args = self.parse_args(code)?;
         code.push(Item::Call {
@@ -1545,6 +1576,7 @@ impl<'a> Parser<'a> {
 
     /// '(' [arg (',' arg)* [',']] ')' with arg := expr | IDENT '=' expr:
     /// emits the argument values; keyword arguments come last.
+    #[cfg_attr(feature = "iram", link_section = ".rwtext")]
     fn parse_args(&mut self, code: &mut Code<'a>) -> Result<Args<'a>, Error> {
         // Consume '('
         self.advance()?;
@@ -1643,6 +1675,7 @@ impl<'a> Parser<'a> {
     ///
     /// The body is parsed (to check it and to find its end) into a scratch
     /// buffer; the interpreter parses the lambda's text again when it's called.
+    #[inline(never)]
     fn parse_lambda(&mut self, code: &mut Code<'a>) -> Result<(), Error> {
         let start = self.lexer_token_start();
         self.advance()?; // 'lambda'
@@ -1706,6 +1739,7 @@ impl<'a> Parser<'a> {
     /// The parts of an f-string: literal text (as zero-copy `Str` items, so
     /// escapes work as usual) and `{expr!conv:spec}` fields, whose
     /// expressions are parsed from the source in place. Then `BuildStr`.
+    #[inline(never)]
     fn parse_fstring(&mut self, raw: &'a str, code: &mut Code<'a>) -> Result<(), Error> {
         let bytes = raw.as_bytes();
         let (mut i, mut lit, mut parts) = (0, 0, 0u8);
@@ -1803,6 +1837,7 @@ impl<'a> Parser<'a> {
 
     /// Runs `f` one nesting level deeper, failing instead of overflowing the
     /// native stack on inputs like `((((((...))))))` or `- - - - - 1`.
+    #[cfg_attr(feature = "iram", link_section = ".rwtext")]
     fn nested(&mut self, f: impl FnOnce(&mut Self) -> Result<(), Error>) -> Result<(), Error> {
         if self.depth >= MAX_EXPR_DEPTH {
             return Err(Error::OutOfMemory);

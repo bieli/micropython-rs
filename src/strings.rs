@@ -45,6 +45,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
 
     /// Mark and sweep: roots are the variables and the value stack; objects
     /// inside reachable containers are reachable too.
+    #[inline(never)]
     pub(super) fn collect(&mut self) {
         self.heap.begin_mark();
         self.func_marks = 0;
@@ -103,6 +104,21 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
     }
 
     /// A new heap string with the bytes of `parts` (strings) one after another.
+    /// The strings `stack[base..sp]` joined into a new heap string (they
+    /// stay on the stack, rooted, while it's allocated).
+    pub(super) fn concat_stack(&mut self, base: usize) -> Result<Value<'a>, Error> {
+        let mut len = 0;
+        for i in base..self.sp {
+            len += self.str_of(self.stack[i]).ok_or(Error::TypeError)?.len();
+        }
+        let dst = self.alloc_obj(Kind::Str, len)?;
+        let mut at = 0;
+        for i in base..self.sp {
+            at += self.copy_into(self.stack[i], 0, usize::MAX, dst, at);
+        }
+        Ok(Value::HStr(dst))
+    }
+
     /// The bytes of a string or bytes value.
     fn raw_bytes(&self, v: Value<'a>) -> Option<&[u8]> {
         self.str_of(v)
@@ -308,6 +324,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
     }
 
     /// `str(v)` or `repr(v)` as a string value (`v` must be on the stack).
+    #[inline(never)]
     pub(super) fn stringify(&mut self, v: Value<'a>, repr: bool) -> Result<Value<'a>, Error> {
         if Self::is_str(v) && !repr {
             return Ok(v); // strings are immutable: str(s) is s
@@ -379,6 +396,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
 
     /// `repr()` of a container with instances in it: built from the
     /// `repr()` of every element (which runs their `__repr__`).
+    #[inline(never)]
     fn container_str(&mut self, v: Value<'a>) -> Result<Value<'a>, Error> {
         let Value::Obj(r) = v else {
             return Err(Error::TypeError);
@@ -595,6 +613,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
         Some(self.str_builtin_call(name, args))
     }
 
+    #[inline(never)]
     fn str_builtin_call(&mut self, name: &str, args: &[Value<'a>]) -> Result<Value<'a>, Error> {
         match (name, args) {
             ("len", [v]) => match (self.str_of(*v), self.bytes_of(*v), self.container_len(*v)) {
@@ -651,6 +670,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
     }
 
     /// `s.method(args)` for strings.
+    #[inline(never)]
     pub(super) fn str_method(
         &mut self,
         s: Value<'a>,

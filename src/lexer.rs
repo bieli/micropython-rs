@@ -150,10 +150,12 @@ impl<'a> Lexer<'a> {
         self.token_indent
     }
 
+    #[cfg_attr(feature = "iram", link_section = ".rwtext")]
     fn peek(&self) -> Option<char> {
         self.src[self.pos..].chars().next()
     }
 
+    #[cfg_attr(feature = "iram", link_section = ".rwtext")]
     fn advance(&mut self) -> Option<char> {
         let ch = self.peek()?;
         self.pos += ch.len_utf8();
@@ -175,6 +177,7 @@ impl<'a> Lexer<'a> {
         }
     }
 
+    #[cfg_attr(feature = "iram", link_section = ".rwtext")]
     pub fn next_token(&mut self) -> Result<Token<'a>, Error> {
         while let Some(ch) = self.peek() {
             match ch {
@@ -286,6 +289,7 @@ impl<'a> Lexer<'a> {
     }
 
     /// `op` or, if followed by `=`, the augmented assignment `op=`.
+    #[cfg_attr(feature = "iram", link_section = ".rwtext")]
     fn op_or_aug(&mut self, op: Token<'a>, bin: BinOp) -> Token<'a> {
         if self.eat('=') {
             Token::AugAssign(bin)
@@ -295,6 +299,7 @@ impl<'a> Lexer<'a> {
     }
 
     /// `single` or, if followed by `=`, `with_eq` (`=`/`==`, `<`/`<=`, `>`/`>=`).
+    #[cfg_attr(feature = "iram", link_section = ".rwtext")]
     fn op_or_eq(&mut self, single: Token<'a>, with_eq: Token<'a>) -> Token<'a> {
         if self.eat('=') {
             with_eq
@@ -354,6 +359,7 @@ impl<'a> Lexer<'a> {
     }
 
     /// Integer literals: `42`, `1_000`, `0x1F`, `0o17`, `0b1010`.
+    #[cfg_attr(feature = "iram", link_section = ".rwtext")]
     fn lex_int(&mut self, first: char) -> Result<Token<'a>, Error> {
         let radix = if first == '0' {
             match self.peek() {
@@ -408,6 +414,7 @@ impl<'a> Lexer<'a> {
         Ok(Token::Int(val))
     }
 
+    #[cfg_attr(feature = "iram", link_section = ".rwtext")]
     fn lex_ident(&mut self, first: char) -> Token<'a> {
         let start = self.pos - first.len_utf8();
         while let Some(ch) = self.peek() {

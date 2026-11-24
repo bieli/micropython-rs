@@ -36,8 +36,13 @@ pub const HEAP_SIZE: usize = 32 * 1024;
 
 /// Both buffers are static memory rather than locals, so they don't take
 /// 64 KB of the main task's stack.
-static ARENA_MEMORY: static_cell::StaticCell<[u8; ARENA_SIZE]> = static_cell::StaticCell::new();
-static HEAP_MEMORY: static_cell::StaticCell<[u8; HEAP_SIZE]> = static_cell::StaticCell::new();
+// `ConstStaticCell`: the zeroed arrays are in .bss from the start. (With
+// `StaticCell::init([0; N])` they were built on the stack first: 64 KB of
+// the 118 KB stack, gone for good.)
+static ARENA_MEMORY: static_cell::ConstStaticCell<[u8; ARENA_SIZE]> =
+    static_cell::ConstStaticCell::new([0; ARENA_SIZE]);
+static HEAP_MEMORY: static_cell::ConstStaticCell<[u8; HEAP_SIZE]> =
+    static_cell::ConstStaticCell::new([0; HEAP_SIZE]);
 
 const CTRL_A: u8 = 0x01;
 const CTRL_B: u8 = 0x02;
@@ -54,6 +59,20 @@ const MAIN_FILE: &str = "main.py";
 /// Data bytes per `#@get` output chunk.
 const GET_CHUNK: usize = 256;
 
+/// Stack kept free below the interpreter's lowest check, for the code it
+/// calls (display drivers, flash writes, formatting) and for interrupts.
+const STACK_MARGIN: usize = 16 * 1024;
+
+/// The lowest stack address scripts may use: the bottom of the main stack
+/// (from esp-hal's linker script) plus `STACK_MARGIN`.
+fn stack_floor() -> usize {
+    extern "C" {
+        static _stack_end_cpu0: u8;
+    }
+    // Only the address of the linker symbol is taken (it's never read)
+    core::ptr::addr_of!(_stack_end_cpu0) as usize + STACK_MARGIN
+}
+
 /// What the board runs at boot when no `main.py` is saved.
 pub struct BootScript {
     pub source: &'static str,
@@ -68,24 +87,24 @@ pub fn run<O: Output, H: HardwareBridge>(
     boot: &BootScript,
     files: Option<&RefCell<Files>>,
 ) -> ! {
-    let memory = ARENA_MEMORY.init([0; ARENA_SIZE]);
-    let heap = HEAP_MEMORY.init([0; HEAP_SIZE]);
+    let memory = ARENA_MEMORY.take();
+    let heap = HEAP_MEMORY.take();
     let mut mode = Mode::Normal;
     let mut run_boot_script = true;
 
     loop {
-        let vm = Interpreter::with_hardware(&mut *out, &mut *hw).with_heap(&mut heap[..]);
-        // Scripts get the flash files too: `open()` and the `os` module
-        let vm = match files {
-            Some(files) => vm.with_files(files),
-            None => vm,
-        };
         let mut repl = Repl {
-            vm,
+            vm: Interpreter::with_hardware(&mut *out, &mut *hw).with_heap(&mut heap[..]),
             arena: Arena::new(&mut memory[..]),
             history: None,
         };
+        // Scripts get the flash files too: `open()` and the `os` module
+        if let Some(files) = files {
+            repl.vm.set_files(files);
+        }
         repl.vm.set_abort_flag(&ABORT);
+        // Deep recursion raises RecursionError instead of overflowing the stack
+        repl.vm.set_stack_floor(Some(stack_floor()));
 
         // Like MicroPython, a soft reset in the raw REPL skips main.py
         if run_boot_script {

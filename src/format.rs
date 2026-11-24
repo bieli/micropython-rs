@@ -212,6 +212,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
     /// Formats one value (rooted) with a conversion (`!r`, `!s`) and a spec;
     /// returns a string value. `min_digits` is `%`-formatting's precision
     /// for integers (`'%.3d' % 5` is `005`).
+    #[inline(never)]
     pub(super) fn format_one(
         &mut self,
         v: Value<'a>,
@@ -353,17 +354,14 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
         let result = match n {
             0 => Ok(Value::Str("")),
             1 => Ok(self.stack[base]),
-            _ => {
-                let mut pieces = [Value::None; super::VALUE_STACK];
-                pieces[..n].copy_from_slice(&self.stack[base..self.sp]);
-                self.concat_values(Kind::Str, &pieces[..n])
-            }
+            _ => self.concat_stack(base),
         };
         self.sp = base;
         result
     }
 
     /// `fmt % args` (`fmt` and `args` rooted).
+    #[inline(never)]
     pub(super) fn percent_format(
         &mut self,
         fmt: Value<'a>,
@@ -517,6 +515,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
     }
 
     /// `fmt.format(*args, **kwargs)` (`fmt` and the arguments rooted).
+    #[inline(never)]
     pub(super) fn str_format(
         &mut self,
         fmt: Value<'a>,
@@ -604,6 +603,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
     }
 
     /// `format(value, spec)`.
+    #[inline(never)]
     pub(super) fn format_builtin(
         &mut self,
         value: Value<'a>,

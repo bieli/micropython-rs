@@ -160,6 +160,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
     }
 
     /// `os.function(args)`.
+    #[inline(never)]
     pub(super) fn os_call(&mut self, name: &str, args: &[Value<'a>]) -> Result<Value<'a>, Error> {
         match (name, args) {
             ("listdir" | "ilistdir", []) | ("listdir" | "ilistdir", [_]) => {
@@ -318,6 +319,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
     // ---- open() and file objects -------------------------------------------
 
     /// `open(name, [mode])` (`name` and `mode` rooted).
+    #[inline(never)]
     pub(super) fn open(&mut self, args: &[Value<'a>]) -> Result<Value<'a>, Error> {
         let (name_v, mode) = match args {
             [n] => (*n, "r"),
@@ -487,6 +489,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
         Some(self.file_call(r, name, args))
     }
 
+    #[inline(never)]
     fn file_call(&mut self, r: ObjRef, name: &str, args: &[Value<'a>]) -> Result<Value<'a>, Error> {
         let limit = |v: Option<&Value<'a>>| -> Result<Option<usize>, Error> {
             match v {

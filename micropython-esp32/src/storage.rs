@@ -48,6 +48,7 @@ impl Flash for VfsFlash {
 
 /// Mounts the file system, or returns `None` (with a message) if the flash
 /// has no `vfs` partition, e.g. when flashed without `partitions.csv`.
+#[inline(never)]
 pub fn mount(flash: FLASH<'static>) -> Option<Files> {
     let mut storage = FlashStorage::new(flash);
 
@@ -92,6 +93,7 @@ const LEGACY_MAX: usize = 0x6000 - LEGACY_HEADER;
 
 /// Moves a `main.py` saved by older firmware into the file system (unless the
 /// file system already has one), then clears the old copy.
+#[inline(never)]
 fn migrate_legacy_main(files: &mut Files) {
     let flash = &mut files.flash_mut().storage;
     let mut header = [0u8; LEGACY_HEADER];

@@ -14,3 +14,8 @@ path = "src/lib.rs"
 name = "mpy-cli"
 path = "src/main.rs"
 
+[features]
+# Put the interpreter's hot loop (lexer, parser, evaluator) into the
+# `.rwtext` section: on the ESP32 that's internal RAM (IRAM), which runs it
+# without flash cache misses. Only for targets whose linker script has it.
+iram = []

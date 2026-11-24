@@ -213,6 +213,15 @@ pub struct Interpreter<'a, O: Output, H: HardwareBridge = NoHardware> {
     next_env: Value<'a>,
     /// Reachable function slots during a collection (bit per slot).
     func_marks: u32,
+    /// Lowest native stack address scripts may reach (`set_stack_floor`).
+    stack_floor: usize,
+}
+
+/// The address of a local variable: how deep the native stack is right now.
+#[inline(always)]
+fn stack_address() -> usize {
+    let marker = 0u8;
+    core::hint::black_box(&marker) as *const u8 as usize
 }
 
 impl<'a, O: Output> Interpreter<'a, O, NoHardware> {
@@ -256,6 +265,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
             closure_env: Value::None,
             next_env: Value::None,
             func_marks: 0,
+            stack_floor: 0,
         }
     }
 
@@ -275,6 +285,30 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
         self
     }
 
+    /// Like `with_files`, on an interpreter that already exists.
+    pub fn set_files(&mut self, files: &'a RefCell<dyn FileSystem + 'a>) {
+        self.files = Some(files);
+    }
+
+    /// The lowest native stack address scripts may use (the stack grows
+    /// down): deeper calls, blocks or expressions raise `RecursionError`
+    /// (`Error::RecursionLimit`) instead of overflowing the stack, which on a
+    /// microcontroller crashes the device. Give it the bottom of the stack
+    /// plus a margin for the code the interpreter calls (hardware drivers,
+    /// interrupts). `None`: no check.
+    pub fn set_stack_floor(&mut self, address: Option<usize>) {
+        self.stack_floor = address.unwrap_or(0);
+    }
+
+    /// `Err(RecursionLimit)` if the native stack went below the floor.
+    #[inline(always)]
+    fn check_stack(&self) -> Result<(), Error> {
+        if stack_address() < self.stack_floor {
+            return Err(Error::RecursionLimit);
+        }
+        Ok(())
+    }
+
     /// `(used bytes, capacity, live objects, collections)` of the heap.
     pub fn heap_stats(&self) -> (usize, usize, usize, u32) {
         (
@@ -286,6 +320,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
     }
 
     /// Python truth value: `None`, `False`, `0` and `''` are false.
+    #[cfg_attr(feature = "iram", link_section = ".rwtext")]
     fn truthy(&self, v: Value<'a>) -> bool {
         match v {
             Value::None => false,
@@ -305,6 +340,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
         }
     }
 
+    #[cfg_attr(feature = "iram", link_section = ".rwtext")]
     fn push(&mut self, v: Value<'a>) -> Result<(), Error> {
         if self.sp >= VALUE_STACK {
             return Err(Error::OutOfMemory);
@@ -381,6 +417,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
     }
 
     /// Counts one step and checks the abort flag and the step limit.
+    #[cfg_attr(feature = "iram", link_section = ".rwtext")]
     fn tick(&mut self) -> Result<(), Error> {
         if self.abort.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
             return Err(Error::Interrupted);
@@ -396,6 +433,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
     // Statements and blocks
     // ------------------------------------------------------------------
 
+    #[cfg_attr(feature = "iram", link_section = ".rwtext")]
     fn parse_stmt(
         &mut self,
         parser: &mut Parser<'a>,
@@ -408,6 +446,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
         result
     }
 
+    #[cfg_attr(feature = "iram", link_section = ".rwtext")]
     fn next_indent(&mut self, parser: &mut Parser<'a>) -> Result<Option<u32>, Error> {
         let result = parser.next_indent();
         if result.is_err() {
@@ -418,6 +457,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
 
     /// Runs (or, with `run == false`, only parses) the statements of a block
     /// whose statements are indented by exactly `indent` columns.
+    #[cfg_attr(feature = "iram", link_section = ".rwtext")]
     fn exec_block(
         &mut self,
         parser: &mut Parser<'a>,
@@ -449,6 +489,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
 
     /// Runs the body after a `header:` line: an indented block on the next
     /// lines, or a single simple statement on the same line (`if x: y = 1`).
+    #[cfg_attr(feature = "iram", link_section = ".rwtext")]
     fn exec_body(
         &mut self,
         parser: &mut Parser<'a>,
@@ -460,6 +501,10 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
         if self.nesting >= MAX_NESTING {
             self.note_error(parser.line());
             return Err(Error::OutOfMemory);
+        }
+        if let Err(err) = self.check_stack() {
+            self.note_error(parser.line());
+            return Err(err);
         }
         self.nesting += 1;
 
@@ -506,6 +551,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
 
     /// Parses one statement and runs it if `run` is true. `inline` is set for
     /// a body on the same line as its header, which can't be compound.
+    #[cfg_attr(feature = "iram", link_section = ".rwtext")]
     fn exec_stmt(
         &mut self,
         parser: &mut Parser<'a>,
@@ -535,6 +581,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
         result
     }
 
+    #[cfg_attr(feature = "iram", link_section = ".rwtext")]
     #[allow(clippy::too_many_arguments)]
     fn exec_parsed(
         &mut self,
@@ -832,6 +879,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
 
     /// `class Name(Base):` runs its body like a function call; the body's
     /// variables (attributes, methods) become the class dict.
+    #[inline(never)]
     #[allow(clippy::too_many_arguments)]
     fn exec_class(
         &mut self,
@@ -910,6 +958,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
 
     /// `@decorator` before a `def` or `class` (or another decorator): runs
     /// the definition, then replaces it with `decorator(definition)`.
+    #[inline(never)]
     fn exec_decorated(
         &mut self,
         expr: Expr,
@@ -958,6 +1007,8 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
         result.map(|()| Flow::Normal)
     }
 
+    #[cfg_attr(feature = "iram", link_section = ".rwtext")]
+    #[inline(never)]
     fn exec_if(
         &mut self,
         cond: Expr,
@@ -1010,6 +1061,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
 
     /// `with open(...) as f:`: the file is closed when the body ends, also
     /// after an error or a `return`.
+    #[inline(never)]
     #[allow(clippy::too_many_arguments)]
     fn exec_with(
         &mut self,
@@ -1073,6 +1125,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
     }
 
     /// `try:` and its `except` / `else` / `finally` clauses.
+    #[inline(never)]
     fn exec_try(
         &mut self,
         parser: &mut Parser<'a>,
@@ -1095,6 +1148,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
     /// The clauses of a `try`. The outer `Result` is for errors that end the
     /// script (syntax errors); the inner one is the outcome of the statement,
     /// with the line of its error.
+    #[inline(never)]
     #[allow(clippy::type_complexity)]
     fn run_try(
         &mut self,
@@ -1236,6 +1290,8 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
         }
     }
 
+    #[cfg_attr(feature = "iram", link_section = ".rwtext")]
+    #[inline(never)]
     #[allow(clippy::too_many_arguments)]
     fn exec_while(
         &mut self,
@@ -1278,6 +1334,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
     }
 
     /// `x[key] = value` or `x[key] op= value`.
+    #[inline(never)]
     fn exec_set_item(
         &mut self,
         code: &Code<'a>,
@@ -1329,6 +1386,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
         result
     }
 
+    #[inline(never)]
     #[allow(clippy::too_many_arguments)]
     fn exec_for(
         &mut self,
@@ -1427,6 +1485,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
 
     /// Slots of the current scope: all globals at the top level, or the
     /// locals of the innermost function call.
+    #[cfg_attr(feature = "iram", link_section = ".rwtext")]
     fn scope_start(&self) -> usize {
         if self.call_depth == 0 {
             0
@@ -1436,6 +1495,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
     }
 
     /// True if the innermost function call declared `name` with `global`.
+    #[cfg_attr(feature = "iram", link_section = ".rwtext")]
     fn is_declared_global(&self, name: &str) -> bool {
         self.call_depth > 0
             && self.global_decls[self.frame_globals..self.global_count].contains(&name)
@@ -1477,10 +1537,12 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
         Ok(())
     }
 
+    #[cfg_attr(feature = "iram", link_section = ".rwtext")]
     fn find_in(&self, range: core::ops::Range<usize>, name: &str) -> Option<usize> {
         range.into_iter().find(|&i| self.vars[i].0 == name)
     }
 
+    #[cfg_attr(feature = "iram", link_section = ".rwtext")]
     fn set_var(&mut self, name: &'a str, val: Value<'a>) -> Result<(), Error> {
         if self.is_declared_global(name) {
             return self.set_global(name, val);
@@ -1492,6 +1554,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
         Ok(())
     }
 
+    #[cfg_attr(feature = "iram", link_section = ".rwtext")]
     fn push_var(&mut self, name: &'a str, val: Value<'a>) -> Result<(), Error> {
         if self.nvars >= MAX_VARS {
             return Err(Error::OutOfMemory);
@@ -1503,6 +1566,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
 
     /// Looks a name up in the current scope only (the globals, for a name
     /// declared `global`).
+    #[cfg_attr(feature = "iram", link_section = ".rwtext")]
     fn get_scope_var(&self, name: &str) -> Result<Value<'a>, Error> {
         let range = if self.is_declared_global(name) {
             0..self.globals_len
@@ -1515,6 +1579,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
     }
 
     /// `print(*args, sep=' ', end='\n')` (`flush=` is accepted and ignored).
+    #[inline(never)]
     fn print(&mut self, args: &[Value<'a>], kwargs: Kwargs<'_, 'a>) -> Result<Value<'a>, Error> {
         let (mut sep, mut end) = (Value::Str(" "), Value::Str("\n"));
         for &(key, v) in kwargs {
@@ -1555,6 +1620,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
     /// Looks a name up in the current scope, then in the globals, then in
     /// the functions, the hardware constants (`OUT`, `IN`, ...) and the
     /// built-in exception classes.
+    #[cfg_attr(feature = "iram", link_section = ".rwtext")]
     fn get_var(&self, name: &str) -> Result<Value<'a>, Error> {
         self.get_scope_var(name)
             .or_else(|err| {
@@ -1636,6 +1702,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
     }
 
     /// Calls a `def` function: binds the arguments as new locals and runs the body.
+    #[cfg_attr(feature = "iram", link_section = ".rwtext")]
     fn call_user_func(
         &mut self,
         func: FuncDef<'a>,
@@ -1652,7 +1719,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
             }
         };
         let args = &args[..func.count];
-        if self.call_depth >= MAX_CALL_DEPTH {
+        if self.call_depth >= MAX_CALL_DEPTH || self.check_stack().is_err() {
             self.sp = stack_base;
             return Err(Error::RecursionLimit);
         }
@@ -1711,6 +1778,8 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
 
     /// The values of the parameters of `func` for a call: positional
     /// arguments, then keyword arguments, then default values.
+    #[cfg_attr(feature = "iram", link_section = ".rwtext")]
+    #[inline(never)]
     fn bind_args(
         &mut self,
         func: &FuncDef<'a>,
@@ -1784,6 +1853,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
     // ------------------------------------------------------------------
 
     /// Evaluates one RPN expression on the shared value stack.
+    #[cfg_attr(feature = "iram", link_section = ".rwtext")]
     fn eval_expr(&mut self, code: &Code<'a>, expr: Expr) -> Result<Value<'a>, Error> {
         let base = self.sp;
         let result = self.eval_items(code.items(expr));
@@ -1792,6 +1862,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
     }
 
     /// Evaluates a complete expression and leaves its value on the stack.
+    #[cfg_attr(feature = "iram", link_section = ".rwtext")]
     fn eval_items(&mut self, items: &[Item<'a>]) -> Result<Value<'a>, Error> {
         let base = self.sp;
         self.run_items(items)?;
@@ -1804,7 +1875,9 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
 
     /// Runs RPN items. Operands are replaced by their result only after the
     /// result exists, so anything that allocates keeps its inputs rooted.
+    #[cfg_attr(feature = "iram", link_section = ".rwtext")]
     fn run_items(&mut self, items: &[Item<'a>]) -> Result<(), Error> {
+        self.check_stack()?;
         let mut i = 0;
         while i < items.len() {
             let item = items[i];
@@ -1865,23 +1938,13 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
                         self.sp -= 1;
                     }
                 }
-                Item::Call { name, argc, kw } => {
-                    // The arguments stay on the stack (rooted) during the call
-                    let start = self.sp - argc as usize;
-                    let a = self.call_args(start, argc, &items[i..i + kw as usize])?;
+                Item::Call { argc, kw, .. }
+                | Item::CallValue { argc, kw }
+                | Item::CallAttr { argc, kw, .. } => {
+                    // Out of line, so the argument arrays don't make every
+                    // (recursive) `run_items` frame big
+                    self.call_item(item, argc, &items[i..i + kw as usize])?;
                     i += kw as usize;
-                    let val = self.call_function(name, &a.args[..a.npos], &a.kwargs[..a.nkw])?;
-                    self.sp = start;
-                    self.push(val)?;
-                }
-                Item::CallValue { argc, kw } => {
-                    let start = self.sp - argc as usize;
-                    let callee = self.stack[start - 1];
-                    let a = self.call_args(start, argc, &items[i..i + kw as usize])?;
-                    i += kw as usize;
-                    let val = self.call_value(callee, &a.args[..a.npos], &a.kwargs[..a.nkw])?;
-                    self.sp = start - 1;
-                    self.push(val)?;
                 }
                 Item::KwName(_) => {}
                 Item::FormatValue { conv, spec } => {
@@ -1920,19 +1983,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
                     };
                     self.stack[self.sp - 1] = val;
                 }
-                Item::CallAttr { attr, argc, kw } => {
-                    let start = self.sp - argc as usize;
-                    let receiver = self.stack[start - 1];
-                    let a = self.call_args(start, argc, &items[i..i + kw as usize])?;
-                    i += kw as usize;
-                    let val = if a.nkw == 0 {
-                        self.call_method(receiver, attr, &a.args[..a.npos])?
-                    } else {
-                        self.call_method_kw(receiver, attr, &a.args[..a.npos], &a.kwargs[..a.nkw])?
-                    };
-                    self.sp = start - 1;
-                    self.push(val)?;
-                }
+
                 Item::Index => {
                     let (obj, index) = (self.stack[self.sp - 2], self.stack[self.sp - 1]);
                     let val = self.index_value(obj, index)?;
@@ -1991,8 +2042,39 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
         Ok(())
     }
 
+    /// `Call`, `CallValue` and `CallAttr`: the arguments (and the callee or
+    /// receiver below them) stay on the stack, rooted, during the call.
+    #[cfg_attr(feature = "iram", link_section = ".rwtext")]
+    #[inline(never)]
+    fn call_item(&mut self, item: Item<'a>, argc: u8, names: &[Item<'a>]) -> Result<(), Error> {
+        let start = self.sp - argc as usize;
+        let a = self.call_args(start, argc, names)?;
+        let (args, kwargs) = (&a.args[..a.npos], &a.kwargs[..a.nkw]);
+        let (val, below) = match item {
+            Item::Call { name, .. } => (self.call_function(name, args, kwargs)?, start),
+            Item::CallValue { .. } => {
+                let callee = self.stack[start - 1];
+                (self.call_value(callee, args, kwargs)?, start - 1)
+            }
+            Item::CallAttr { attr, .. } => {
+                let receiver = self.stack[start - 1];
+                let val = if kwargs.is_empty() {
+                    self.call_method(receiver, attr, args)?
+                } else {
+                    self.call_method_kw(receiver, attr, args, kwargs)?
+                };
+                (val, start - 1)
+            }
+            _ => unreachable!("call_item for a call item"),
+        };
+        self.sp = below;
+        self.push(val)
+    }
+
     /// The positional and keyword arguments of a call, from the stack
     /// (`stack[start..]`, keyword values last) and the `KwName` items.
+    #[cfg_attr(feature = "iram", link_section = ".rwtext")]
+    #[inline(never)]
     #[allow(clippy::type_complexity)]
     fn call_args(
         &mut self,
@@ -2054,6 +2136,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
 
     /// A function that remembers the values of the variables of the
     /// function it's made in (only inside a function; elsewhere `f` itself).
+    #[inline(never)]
     fn make_closure(&mut self, f: Value<'a>) -> Result<Value<'a>, Error> {
         if self.call_depth == 0 {
             return Ok(f);
@@ -2089,6 +2172,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
     }
 
     /// A method call with keyword arguments: only `list.sort(key=, reverse=)`.
+    #[inline(never)]
     fn call_method_kw(
         &mut self,
         receiver: Value<'a>,
@@ -2122,6 +2206,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
 
     /// The function value of a lambda (its text identifies it, so running
     /// the same `lambda` again reuses its slot in the function table).
+    #[inline(never)]
     fn make_lambda(&mut self, src: &'a str) -> Result<Value<'a>, Error> {
         let same = |f: &FuncDef<'a>| {
             f.lambda && f.name.as_ptr() == src.as_ptr() && f.name.len() == src.len()
@@ -2148,6 +2233,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
 
     /// Calls a function value: a `def` function or lambda, a native module
     /// function, or an exception class.
+    #[cfg_attr(feature = "iram", link_section = ".rwtext")]
     pub(super) fn call_value(
         &mut self,
         f: Value<'a>,
@@ -2181,6 +2267,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
     }
 
     /// Runs a comprehension (see `Item::Comp`) and pushes the new list/dict.
+    #[inline(never)]
     fn comprehension(
         &mut self,
         dict: bool,
@@ -2269,6 +2356,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
     }
 
     /// Replaces the top two stack values with `lhs op rhs`.
+    #[cfg_attr(feature = "iram", link_section = ".rwtext")]
     fn apply_bin(&mut self, op: BinOp) -> Result<(), Error> {
         let (lhs, rhs) = (self.stack[self.sp - 2], self.stack[self.sp - 1]);
         let val = if op == BinOp::Mod && Self::is_str(lhs) {
@@ -2330,6 +2418,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
     /// Comparison with Python semantics: numbers (ints/bools) and strings
     /// compare among themselves; `==`/`!=` between other types are simply
     /// false/true; ordering between other types is a `TypeError`.
+    #[cfg_attr(feature = "iram", link_section = ".rwtext")]
     fn compare(&self, op: CmpOp, lhs: Value<'a>, rhs: Value<'a>) -> Result<bool, Error> {
         match op {
             CmpOp::Is => return Ok(self.identical(lhs, rhs)),
@@ -2409,6 +2498,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
     /// Calls a `def` function, the built-in `print`, or a hardware function.
     /// Arguments are already evaluated, so a failing argument means nothing is
     /// printed or sent to hardware (like Python).
+    #[cfg_attr(feature = "iram", link_section = ".rwtext")]
     fn call_function(
         &mut self,
         name: &str,
@@ -2722,6 +2812,7 @@ fn lookup_module(hw: &[Module], i: u8) -> Option<Module> {
 /// The module in `val`, for `val.attr`; other values have no attributes.
 /// Binary operator on values. Ints and bools mix like in Python (`True + 1 == 2`);
 /// `&`, `|`, `^` on two bools give a bool.
+#[cfg_attr(feature = "iram", link_section = ".rwtext")]
 fn binop<'a>(op: BinOp, lhs: Value<'a>, rhs: Value<'a>) -> Result<Value<'a>, Error> {
     let (Some(a), Some(b)) = (lhs.as_int(), rhs.as_int()) else {
         return Err(Error::TypeError);
@@ -3606,6 +3697,7 @@ print(fact(7), fib(7))
     ];
 
     impl HardwareBridge for TableHardware {
+        #[cfg_attr(feature = "iram", link_section = ".rwtext")]
         fn call_args(&mut self, name: &str, args: &[Arg<'_>]) -> Result<Option<i64>, Error> {
             match name {
                 "pin_write" => {
@@ -4360,6 +4452,33 @@ print(outer(), count)
         assert!(vm.funcs.iter().flatten().count() < MAX_FUNCS);
         let _ = vm;
         assert_eq!(out.as_str(), "7 [0, 30, 60, 90]\n");
+    }
+
+    #[test]
+    fn test_stack_floor_raises_recursion_error() {
+        let mut out = MockOut::new();
+        let mut heap = [0u8; 4096];
+        let mut vm = Interpreter::new(&mut out).with_heap(&mut heap);
+        vm.eval("def f(n):\n    if n:\n        if n:\n            return f(n - 1)\n    return [[[[1]]]]")
+            .unwrap();
+        // The lowest floor (in 4 KB steps) at which one call still works...
+        let here = super::stack_address();
+        let mut room = 4096;
+        loop {
+            vm.set_stack_floor(Some(here - room));
+            if vm.eval("x = f(0)").is_ok() {
+                break;
+            }
+            room += 4096;
+            assert!(room < 4 * 1024 * 1024, "no floor works");
+        }
+        // ...stops deep recursion with a RecursionError that can be caught
+        vm.eval("try:\n    f(7)\nexcept RecursionError:\n    print('caught')\nprint(f(0))")
+            .unwrap();
+        vm.set_stack_floor(None);
+        vm.eval("print(f(7))").unwrap();
+        let _ = vm;
+        assert_eq!(out.as_str(), "caught\n[[[[1]]]]\n[[[[1]]]]\n");
     }
 
     #[test]
