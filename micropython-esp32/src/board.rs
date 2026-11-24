@@ -59,7 +59,7 @@ pub const TIME_MODULE: Module = Module {
     name: "time",
     doc: "Delays and timestamps (MicroPython names)",
     functions: &[
-        HwFn::new("sleep", "s", "Wait s seconds"),
+        HwFn::new("sleep", "s", "Wait s seconds (a float: 0.5)"),
         HwFn::new("sleep_ms", "ms", "Wait ms milliseconds"),
         HwFn::new("sleep_us", "us", "Wait us microseconds"),
         HwFn::new("ticks_ms", "", "Milliseconds since boot"),
@@ -592,8 +592,18 @@ impl<'d> Board<'d> {
     ) -> Result<Option<i64>, Error> {
         match (module, name) {
             ("time", "sleep") => {
-                let ms = args[0].int()?.checked_mul(1000).ok_or(Error::ValueError)?;
-                self.sleep_ms(ms).map(|()| None)
+                // Seconds, an int or a float (`time.sleep(0.5)`), to the microsecond
+                let us = match args[0] {
+                    Arg::Float(s) if s >= 0.0 && s < 1e12 => (s * 1e6) as i64,
+                    Arg::Float(_) => return Err(Error::ValueError),
+                    other => other
+                        .int()?
+                        .checked_mul(1_000_000)
+                        .ok_or(Error::ValueError)?,
+                };
+                self.sleep_ms(us / 1000)?;
+                self.delay.delay_micros((us.max(0) % 1000) as u32);
+                Ok(None)
             }
             // The other `time` functions are the flat ones with the same name
             ("time", _) => self.call(name, args),

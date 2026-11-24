@@ -622,6 +622,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
             ("str", []) => Ok(Value::Str("")),
             ("str", [v]) => self.stringify(*v, false),
             ("repr", [v]) => self.stringify(*v, true),
+            ("int", [Value::Float(f)]) => super::floats::float_to_int(*f).map(Value::Int),
             ("int", [v]) => match v.as_int() {
                 Some(n) => Ok(Value::Int(n)),
                 None => match self.str_of(*v) {
@@ -961,6 +962,7 @@ pub(crate) fn write_plain(
             let mut buf = [0u8; 20];
             sink(format_i64(n, &mut buf));
         }
+        Value::Float(f) => super::floats::write_float(f, sink),
         Value::Str(s) => {
             if repr {
                 write_str_repr(s, sink)

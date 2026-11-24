@@ -4,8 +4,9 @@
 //
 // All three use one format-spec engine (`Spec` + `Interpreter::format_one`),
 // with Python's mini-language: `[[fill]align][sign][#][0][width][,][.prec][type]`.
-// Types: `d x X o b c n` for integers, `s` for strings, and `f %` for integers
-// too (there are no floats: `'{:.2f}'.format(3)` is `3.00`).
+// Types: `d x X o b c n` for integers, `s` for strings, and `f F e E g G %`
+// for floats (and ints, as floats). Without the `float` feature, `f %` format
+// integers exactly (`'{:.2f}'.format(3)` is `3.00`).
 //
 // A formatted string is built from pieces (literal parts and formatted
 // values) kept on the value stack, so they're rooted, then joined with one
@@ -109,6 +110,7 @@ impl Spec {
         match bytes {
             [] => {}
             [t] if b"sdxXobcnf%Fr".contains(t) => spec.ty = *t as char,
+            [t] if cfg!(feature = "float") && b"eEgG".contains(t) => spec.ty = *t as char,
             _ => return Err(Error::ValueError), // invalid format specifier
         }
         Ok(spec)
@@ -248,6 +250,17 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
             self.sp = base;
             return result;
         }
+        if cfg!(feature = "float") {
+            let float_type = matches!(spec.ty, 'e' | 'E' | 'f' | 'F' | 'g' | 'G' | '%');
+            let is_float = matches!(v, Value::Float(_));
+            if is_float && !float_type && !matches!(spec.ty, '\0' | 'n') {
+                return Err(Error::ValueError); // `'{:d}'.format(1.5)`
+            }
+            if is_float || float_type {
+                let x = super::floats::as_f64(v).ok_or(Error::ValueError)?;
+                return self.format_float_spec(x, spec);
+            }
+        }
         if numeric {
             // `'{:d}'.format('s')`: unknown format code for the type
             let n = v.as_int().ok_or(Error::ValueError)?;
@@ -271,6 +284,42 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
         let result = self.padded_text(text, spec);
         self.sp = base;
         result
+    }
+
+    /// A float (or an int, for a float type) formatted with a spec: sign,
+    /// digits (with `,` / `_` groups), then padding.
+    #[inline(never)]
+    fn format_float_spec(&mut self, x: f64, spec: &Spec) -> Result<Value<'a>, Error> {
+        let mut digits = super::floats::Buf::<512>::new();
+        let ty = if spec.ty == 'n' { 'g' } else { spec.ty };
+        super::floats::format_float(x, ty, spec.precision, spec.alt, &mut digits)?;
+        let digits = digits.as_str().as_bytes();
+        let mut text = [0u8; NUM_BUF * 4];
+        let mut len = 0;
+        let mut put = |b: u8, len: &mut usize| -> Result<(), Error> {
+            *text.get_mut(*len).ok_or(Error::Overflow)? = b;
+            *len += 1;
+            Ok(())
+        };
+        match (x.is_sign_negative() && !x.is_nan(), spec.sign) {
+            (true, _) => put(b'-', &mut len)?,
+            (false, '+') => put(b'+', &mut len)?,
+            (false, ' ') => put(b' ', &mut len)?,
+            _ => {}
+        }
+        let head = len;
+        // Groups in the integer part: the digits before `.`, `e` or the end
+        let int_digits = digits.iter().take_while(|b| b.is_ascii_digit()).count();
+        for (i, &b) in digits.iter().enumerate() {
+            put(b, &mut len)?;
+            if let Some(g) = spec.group {
+                let left = int_digits.saturating_sub(i + 1);
+                if i < int_digits && left > 0 && left % 3 == 0 {
+                    put(g as u8, &mut len)?;
+                }
+            }
+        }
+        self.padded_number(&text[..len], head, spec)
     }
 
     /// Pads a number's text (`head` bytes of sign and prefix first).
@@ -488,14 +537,23 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
                 'd' | 'i' | 'u' => ('\0', 'd', min_digits),
                 'x' | 'X' | 'o' => ('\0', conv, min_digits),
                 'c' => ('\0', 'c', 0),
-                'f' | 'F' => ('\0', 'f', 0),
+                'f' | 'F' if !cfg!(feature = "float") => ('\0', 'f', 0),
+                'f' | 'F' | 'e' | 'E' | 'g' | 'G' if cfg!(feature = "float") => ('\0', conv, 0),
                 _ => return Err(Error::ValueError), // unsupported format character
             };
-            if matches!(ty, 'd' | 'x' | 'X' | 'o' | 'f') && value.as_int().is_none() {
+            // `'%d' % 3.7` is `3` (towards zero), `'%x' % 1.5` an error
+            let value = match (ty, value) {
+                ('d', Value::Float(f)) => Value::Int(super::floats::float_to_int(f)?),
+                _ => value,
+            };
+            let float_conv = matches!(ty, 'f' | 'F' | 'e' | 'E' | 'g' | 'G');
+            if matches!(ty, 'd' | 'x' | 'X' | 'o') && value.as_int().is_none()
+                || float_conv && value.as_int().is_none() && !matches!(value, Value::Float(_))
+            {
                 return Err(Error::TypeError); // `%d` needs a number
             }
             spec.ty = ty;
-            if ty != 'f' && digits_for_int > 0 {
+            if !float_conv && digits_for_int > 0 {
                 spec.precision = None;
             }
             if matches!(conv, 's' | 'r' | 'a') {

@@ -14,6 +14,8 @@ pub enum Token<'a> {
     /// `f'...'`: the text between the quotes (the parser splits out the fields).
     FStr(&'a str),
     Int(i64),
+    /// A float literal: `1.5`, `.5`, `1e-3`.
+    Float(f64),
     // Keywords
     If,
     Elif,
@@ -243,6 +245,12 @@ impl<'a> Lexer<'a> {
             ',' => Token::Comma,
             ':' => Token::Colon,
             ';' => Token::Semicolon,
+            // `.5` is a float, `x.y` an attribute
+            '.' if self.peek().is_some_and(|c| c.is_ascii_digit()) => {
+                let start = self.pos - 1; // the `.` (already read)
+                self.digits()?; // the fraction of `.5`
+                return self.lex_float(start);
+            }
             '.' => Token::Dot,
             '@' => Token::At,
             '~' => Token::Tilde,
@@ -361,6 +369,7 @@ impl<'a> Lexer<'a> {
     /// Integer literals: `42`, `1_000`, `0x1F`, `0o17`, `0b1010`.
     #[cfg_attr(feature = "iram", link_section = ".rwtext")]
     fn lex_int(&mut self, first: char) -> Result<Token<'a>, Error> {
+        let start = self.pos - first.len_utf8();
         let radix = if first == '0' {
             match self.peek() {
                 Some('x' | 'X') => 16,
@@ -392,6 +401,9 @@ impl<'a> Lexer<'a> {
                 self.advance();
                 continue;
             }
+            if radix == 10 && matches!(ch, '.' | 'e' | 'E') {
+                break; // a float: `1.5`, `1e3`
+            }
             let Some(digit) = ch.to_digit(radix) else {
                 // A letter/digit glued to the number, like `12abc` or `0b102`
                 if ch.is_ascii_alphanumeric() {
@@ -411,7 +423,70 @@ impl<'a> Lexer<'a> {
         if digits == 0 || last_was_underscore {
             return Err(Error::InvalidSyntax);
         }
+        // `1.5`, `1.`, `1e3`: a float after all
+        if radix == 10 && matches!(self.peek(), Some('.' | 'e' | 'E')) {
+            return self.lex_float(start);
+        }
         Ok(Token::Int(val))
+    }
+
+    /// The rest of a float literal starting at byte `start` (its integer part,
+    /// if any, is already read): `.5`, `1.5`, `1.`, `1e3`, `2.5e-3`, `1_000.5`.
+    /// Parsed with Rust's correctly rounded `str::parse`, like CPython.
+    fn lex_float(&mut self, start: usize) -> Result<Token<'a>, Error> {
+        if self.peek() == Some('.') {
+            self.advance();
+            self.digits()?;
+        }
+        if matches!(self.peek(), Some('e' | 'E')) {
+            self.advance();
+            if matches!(self.peek(), Some('+' | '-')) {
+                self.advance();
+            }
+            if self.digits()? == 0 {
+                return Err(Error::InvalidSyntax); // `1e`
+            }
+        }
+        if self
+            .peek()
+            .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+        {
+            return Err(Error::InvalidSyntax); // `1.5x`
+        }
+        if !cfg!(feature = "float") {
+            return Err(Error::NotEnabled);
+        }
+        // Without the underscores (`1_000.5`)
+        let mut text = [0u8; 64];
+        let mut len = 0;
+        for b in self.src[start..self.pos].bytes().filter(|&b| b != b'_') {
+            *text.get_mut(len).ok_or(Error::InvalidSyntax)? = b;
+            len += 1;
+        }
+        let text = core::str::from_utf8(&text[..len]).map_err(|_| Error::InvalidSyntax)?;
+        text.parse::<f64>()
+            .map(Token::Float)
+            .map_err(|_| Error::InvalidSyntax)
+    }
+
+    /// Decimal digits with single `_` between them; returns how many digits.
+    fn digits(&mut self) -> Result<usize, Error> {
+        let (mut count, mut underscore) = (0, false);
+        while let Some(ch) = self.peek() {
+            if ch == '_' && count > 0 && !underscore {
+                underscore = true;
+            } else if ch.is_ascii_digit() {
+                underscore = false;
+                count += 1;
+            } else {
+                break;
+            }
+            self.advance();
+        }
+        if underscore {
+            return Err(Error::InvalidSyntax); // `1_.5`, `1.5_`
+        }
+        Ok(count)
     }
 
     #[cfg_attr(feature = "iram", link_section = ".rwtext")]
@@ -753,6 +828,38 @@ mod tests {
         for (tok, op) in tokens.iter().zip(ops) {
             assert_eq!(*tok, Token::AugAssign(op));
         }
+    }
+
+    #[test]
+    #[cfg(feature = "float")]
+    fn test_float_literals() {
+        let (tokens, count) = collect_tokens::<12>("1.5 .25 2. 1e3 2.5E-2 1_000.5 0.0 x.y 3e+0");
+        assert_eq!(
+            &tokens[..count],
+            &[
+                Token::Float(1.5),
+                Token::Float(0.25),
+                Token::Float(2.0),
+                Token::Float(1000.0),
+                Token::Float(0.025),
+                Token::Float(1000.5),
+                Token::Float(0.0),
+                Token::Ident("x"),
+                Token::Dot,
+                Token::Ident("y"),
+                Token::Float(3.0),
+            ]
+        );
+        for bad in ["1e", "1.5x", "1_.5", "1._5", "1e+", "2.5_"] {
+            let mut lexer = Lexer::new(bad);
+            assert_eq!(lexer.next_token(), Err(Error::InvalidSyntax), "{}", bad);
+        }
+    }
+
+    #[test]
+    #[cfg(not(feature = "float"))]
+    fn test_float_literals_not_enabled() {
+        assert_eq!(Lexer::new("1.5").next_token(), Err(Error::NotEnabled));
     }
 
     #[test]

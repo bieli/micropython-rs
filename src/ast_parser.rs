@@ -95,6 +95,7 @@ pub enum CmpOp {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Item<'a> {
     Int(i64),
+    Float(f64),
     Str(&'a str),
     /// A `b'...'` literal as written (escapes decoded when evaluated).
     Bytes(&'a str),
@@ -1536,6 +1537,7 @@ impl<'a> Parser<'a> {
     fn parse_atom(&mut self, code: &mut Code<'a>) -> Result<(), Error> {
         let item = match self.current {
             Token::Int(n) => Item::Int(n),
+            Token::Float(f) => Item::Float(f),
             Token::Str(_) | Token::Bytes(_) | Token::FStr(_) => return self.parse_strings(code),
             Token::True => Item::Bool(true),
             Token::False => Item::Bool(false),

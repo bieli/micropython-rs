@@ -35,6 +35,9 @@ mod exceptions;
 #[cfg_attr(feature = "files", path = "files.rs")]
 #[cfg_attr(not(feature = "files"), path = "off/files.rs")]
 mod files;
+#[cfg_attr(feature = "float", path = "floats.rs")]
+#[cfg_attr(not(feature = "float"), path = "off/floats.rs")]
+mod floats;
 #[cfg_attr(feature = "format", path = "format.rs")]
 #[cfg_attr(not(feature = "format"), path = "off/format.rs")]
 mod format;
@@ -89,6 +92,8 @@ pub enum Value<'a> {
     None,
     Bool(bool),
     Int(i64),
+    /// A `float` (double precision).
+    Float(f64),
     /// A string in the script source (literals, and slices of them).
     Str(&'a str),
     /// A string created at runtime, on the heap.
@@ -403,6 +408,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
             Value::None => false,
             Value::Bool(b) => b,
             Value::Int(n) => n != 0,
+            Value::Float(f) => f != 0.0,
             Value::Str(s) => !s.is_empty(),
             Value::HStr(r) => !self.heap.str(r).is_empty(),
             Value::Bytes(b) => !b.is_empty(),
@@ -2027,6 +2033,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
             i += 1;
             match item {
                 Item::Int(n) => self.push(Value::Int(n))?,
+                Item::Float(f) => self.push(Value::Float(f))?,
                 Item::Str(s) => {
                     let val = self.literal(s)?;
                     self.push(val)?;
@@ -2042,7 +2049,12 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
                     self.push(val)?;
                 }
                 Item::Neg | Item::Invert => {
-                    let n = self.stack[self.sp - 1].as_int().ok_or(Error::TypeError)?;
+                    let top = self.stack[self.sp - 1];
+                    if let (Item::Neg, Some(neg)) = (item, floats::negate(top)) {
+                        self.stack[self.sp - 1] = neg;
+                        continue;
+                    }
+                    let n = top.as_int().ok_or(Error::TypeError)?;
                     self.stack[self.sp - 1] = Value::Int(if item == Item::Neg {
                         n.checked_neg().ok_or(Error::Overflow)?
                     } else {
@@ -2626,6 +2638,19 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
             };
             return Ok(found == (op == CmpOp::In));
         }
+        // A float with an int or a float (NaN is neither smaller, equal nor larger)
+        if let Some(order) = floats::float_order(lhs, rhs) {
+            return Ok(match (op, order) {
+                (CmpOp::Ne, None) => true,
+                (_, None) => false,
+                (CmpOp::Eq, Some(o)) => o == CmpOrdering::Equal,
+                (CmpOp::Ne, Some(o)) => o != CmpOrdering::Equal,
+                (CmpOp::Lt, Some(o)) => o == CmpOrdering::Less,
+                (CmpOp::Le, Some(o)) => o != CmpOrdering::Greater,
+                (CmpOp::Gt, Some(o)) => o == CmpOrdering::Greater,
+                (_, Some(o)) => o != CmpOrdering::Less,
+            });
+        }
         let ordering = match (
             self.str_of(lhs)
                 .map(str::as_bytes)
@@ -2725,6 +2750,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
         }
 
         match (name, args) {
+            ("abs", [Value::Float(f)]) => return Ok(Value::Float(f.abs())),
             ("abs", [val]) => {
                 let n = val.as_int().ok_or(Error::TypeError)?;
                 return n.checked_abs().map(Value::Int).ok_or(Error::Overflow);
@@ -2812,6 +2838,11 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
     fn module_attr(&self, module: u8, name: &str) -> Result<Value<'a>, Error> {
         if self.is_builtins_module(module) {
             return Self::builtins_attr(name).ok_or(Error::AttributeError);
+        }
+        if self.module(module).is_some_and(|m| m.name == "math") {
+            if let Some(f) = floats::math_constant(name) {
+                return Ok(Value::Float(f)); // `math.pi`
+            }
         }
         if let Some(func) = self.module_func(module, name) {
             return Ok(Value::NativeFn { module, func });
@@ -2993,6 +3024,7 @@ fn bridge_args<'v>(
             Value::HStr(r) => Arg::Str(view.str(r)),
             Value::Bytes(b) => Arg::Bytes(b),
             Value::HBytes(r) => Arg::Bytes(view.bytes(r)),
+            Value::Float(f) => Arg::Float(f),
             other => Arg::Int(other.as_int().ok_or(Error::TypeError)?),
         };
     }
@@ -3004,6 +3036,8 @@ const CORE_MODULES: &[Module] = &[
     #[cfg(feature = "stdlib")]
     bytes::BINASCII,
     builtins::BUILTINS_MODULE,
+    #[cfg(feature = "float")]
+    floats::MATH,
     #[cfg(feature = "files")]
     files::OS,
     #[cfg(feature = "stdlib")]
@@ -3048,9 +3082,15 @@ fn lookup_module(hw: &[Module], i: u8) -> Option<Module> {
 /// `&`, `|`, `^` on two bools give a bool.
 #[cfg_attr(feature = "iram", link_section = ".rwtext")]
 fn binop<'a>(op: BinOp, lhs: Value<'a>, rhs: Value<'a>) -> Result<Value<'a>, Error> {
-    let (Some(a), Some(b)) = (lhs.as_int(), rhs.as_int()) else {
-        return Err(Error::TypeError);
+    let ints = (lhs.as_int(), rhs.as_int());
+    // Ints first (the common case), unless the result is a float: `/`, or a
+    // negative power; a float operand isn't an int, so it goes there too
+    let (Some(a), Some(b)) = ints else {
+        return floats::float_binop(op, lhs, rhs).unwrap_or(Err(Error::TypeError));
     };
+    if op == BinOp::Div || op == BinOp::Pow && b < 0 {
+        return floats::float_binop(op, lhs, rhs).unwrap_or(Err(Error::TypeError));
+    }
     let both_bool = matches!((lhs, rhs), (Value::Bool(_), Value::Bool(_)));
     let result = int_binop(op, a, b)?;
     Ok(match op {
@@ -3065,7 +3105,7 @@ fn int_binop(op: BinOp, a: i64, b: i64) -> Result<i64, Error> {
         BinOp::Add => a.checked_add(b),
         BinOp::Sub => a.checked_sub(b),
         BinOp::Mul => a.checked_mul(b),
-        // No float support yet: `/` behaves like `//`
+        // (`/` of ints gives a float: see `floats::float_binop`)
         BinOp::Div | BinOp::FloorDiv => {
             if b == 0 {
                 return Err(Error::ZeroDivision);
@@ -3284,9 +3324,14 @@ print('LED ok')
         assert_eval("7 // -2", "-4");
         assert_eval("-7 // -2", "3");
         assert_eval("6 // -3", "-2");
-        // `/` is integer division until floats are supported
-        assert_eval("7 / 2", "3");
-        assert_eval("-7 / 2", "-4");
+        // `/` gives a float (an error without the `float` feature)
+        if cfg!(feature = "float") {
+            assert_eval("7 / 2", "3.5");
+            assert_eval("-7 / 2", "-3.5");
+            assert_eval("6 / 3", "2.0");
+        } else {
+            assert_eval_err("7 / 2", Error::NotEnabled);
+        }
         // Modulo takes the sign of the divisor
         assert_eval("7 % 3", "1");
         assert_eval("-7 % 3", "2");
@@ -3307,7 +3352,9 @@ print('LED ok')
 
     #[test]
     fn test_arithmetic_errors() {
-        assert_eval_err("1 / 0", Error::ZeroDivision);
+        if cfg!(feature = "float") {
+            assert_eval_err("1 / 0", Error::ZeroDivision);
+        }
         assert_eval_err("1 // 0", Error::ZeroDivision);
         assert_eval_err("1 % 0", Error::ZeroDivision);
         assert_eval_err("9223372036854775807 + 1", Error::Overflow);
@@ -3317,7 +3364,11 @@ print('LED ok')
         assert_eval_err("2 ** 9999999999", Error::Overflow);
         assert_eval_err("(-9223372036854775807 - 1) // -1", Error::Overflow);
         assert_eval_err("-(-9223372036854775807 - 1)", Error::Overflow);
-        assert_eval_err("2 ** -1", Error::TypeError);
+        if cfg!(feature = "float") {
+            assert_eval("2 ** -1", "0.5"); // a float, as in Python
+        } else {
+            assert_eval_err("2 ** -1", Error::NotEnabled);
+        }
         assert_eval_err("'a' + 1", Error::TypeError);
         assert_eval_err("'a' - 'b'", Error::TypeError);
         assert_eval_err("-'a'", Error::TypeError);
@@ -3349,7 +3400,7 @@ delay_ms(half - base)
         vm.eval(code).unwrap();
 
         // A failed print outputs nothing and keeps variables intact
-        assert_eq!(vm.eval("print('x', total / 0)"), Err(Error::ZeroDivision));
+        assert_eq!(vm.eval("print('x', total // 0)"), Err(Error::ZeroDivision));
         assert_eq!(vm.eval("print(total)"), Ok(()));
 
         assert_eq!(hw.total_delay_ms, 200 + 75);
@@ -4092,12 +4143,21 @@ print(fact(6), fib(6))
     }
 
     /// `help()`'s list of the interpreter's own modules, in this build.
-    const CORE_NAMES: &str = match (cfg!(feature = "stdlib"), cfg!(feature = "files")) {
-        (true, true) => "binascii builtins os sys",
-        (true, false) => "binascii builtins sys",
-        (false, true) => "builtins os",
-        (false, false) => "builtins",
-    };
+    static CORE_NAMES: std::sync::LazyLock<std::string::String> = std::sync::LazyLock::new(|| {
+        let names = [
+            (cfg!(feature = "stdlib"), "binascii"),
+            (true, "builtins"),
+            (cfg!(feature = "float"), "math"),
+            (cfg!(feature = "files"), "os"),
+            (cfg!(feature = "stdlib"), "sys"),
+        ];
+        let present: std::vec::Vec<&str> = names
+            .iter()
+            .filter(|(on, _)| *on)
+            .map(|(_, n)| *n)
+            .collect();
+        present.join(" ")
+    });
 
     #[test]
     fn test_help() {
@@ -4118,7 +4178,7 @@ print(fact(6), fib(6))
              Hardware:\n  pin_write(pin, value) - Set an output pin\n  pin_read(pin) - Read a pin\n  \
              text(s, [x, y]) - Show text\n  ticks_ms()\n\
              Constants:\n  HIGH LOW LED\n"
-                .replace("CORE", CORE_NAMES)
+                .replace("CORE", &CORE_NAMES)
         );
 
         // Without hardware: built-ins and the core modules
@@ -4128,7 +4188,7 @@ print(fact(6), fib(6))
             out.as_str(),
             "Built-in:\n  print(...)\n  help()\n  abs(x), min(a, b, ...), max(a, b, ...)\n  len(s), str(x), repr(x), int(x, [base]), ord(c), chr(n), bytes(x), bool(x)\n  list(x), tuple(x), dict(x), range(...), sorted(x), reversed(x), sum(x),\n  any(x), all(x), enumerate(x), zip(a, b), format(x, spec)\n  isinstance(x, t), type(x), hasattr(x, name), getattr(x, name, [default]),\n  callable(x), id(x), dir([x]), globals(), help('modules')\n\
              Modules (import them, then help(module)):\n  CORE\n"
-                .replace("CORE", CORE_NAMES)
+                .replace("CORE", &CORE_NAMES)
         );
     }
 
@@ -4371,7 +4431,7 @@ print(gfx == g, gfx == clock, f == gfx.pixel)
             .unwrap();
         assert!(out.as_str().ends_with(
             &"Modules (import them, then help(module)):\n  CORE gfx clock\n"
-                .replace("CORE", CORE_NAMES)
+                .replace("CORE", &CORE_NAMES)
         ));
     }
 
@@ -4683,6 +4743,7 @@ print(outer(), count)
             case!("containers"),
             case!("exceptions"),
             case!("files", cfg!(feature = "files")),
+            case!("floats", cfg!(all(feature = "float", feature = "format"))),
             case!("formatting", medium),
             case!("functions"),
             case!("modules", cfg!(all(feature = "files", feature = "modules"))),
@@ -4790,6 +4851,7 @@ print(outer(), count)
     const BUS_FNS: &[crate::HwFn] = &[
         crate::HwFn::new("bus_write", "data", "Send bytes"),
         crate::HwFn::new("bus_read", "n", "Receive n bytes").returning_bytes(),
+        crate::HwFn::new("scaled", "x, n", "x * 1000 + n"),
     ];
     const BUS_MODULE: &[crate::Module] = &[crate::Module {
         name: "bus",
@@ -4806,6 +4868,8 @@ print(outer(), count)
                     self.written.extend_from_slice(data);
                     Ok(Some(data.len() as i64))
                 }
+                // Floats arrive as `Arg::Float`; `int()` of one is a TypeError
+                "scaled" => Ok(Some((args[0].float()? * 1000.0) as i64 + args[1].int()?)),
                 _ => Err(Error::UnknownIdentifier),
             }
         }
@@ -4846,6 +4910,23 @@ print(outer(), count)
         fn modules(&self) -> &[crate::Module] {
             BUS_MODULE
         }
+    }
+
+    #[test]
+    #[cfg(feature = "float")]
+    fn test_floats_through_the_bridge() {
+        let mut out = MockOut::new();
+        let mut hw = BusHardware {
+            written: std::vec::Vec::new(),
+        };
+        let mut heap = [0u8; 4096];
+        let mut vm = Interpreter::with_hardware(&mut out, &mut hw).with_heap(&mut heap);
+        vm.eval("print(scaled(1.5, 2), scaled(2, 0), scaled(0.25 * 2, -1))")
+            .unwrap();
+        // A float where the hardware wants an int: TypeError, as in MicroPython
+        assert_eq!(vm.eval("scaled(1, 2.5)"), Err(Error::TypeError));
+        let _ = vm;
+        assert_eq!(out.as_str(), "1502 2000 499\n");
     }
 
     #[test]

@@ -120,7 +120,7 @@ Thonny reads and saves device files by running Python helper code on the board (
   (24 KB, now out of line), and deep recursion overflowed it. The interpreter now has a stack guard
   (`set_stack_floor`): too deep raises `RecursionError` instead of crashing the board.
 
-Left for later (documented in the README): floats, sets, generators, `nonlocal`, operator methods (`__add__`,
+Left for later (documented in the README): sets, generators, `nonlocal`, operator methods (`__add__`,
 `__eq__`, ...), multiple inheritance, `bytearray`, step slices (`a[::2]`). (Importing `.py` files: done in 6.3.)
 
 Found while building 5.1:
@@ -169,6 +169,7 @@ Open after Phase 6 (the `machine` module is done in 7.1): `bytearray`
 | 7.1 | **`machine` module**: `Pin`, `ADC`, `PWM`, `I2C`/`SoftI2C`, `UART`, `SPI`/`SoftSPI`, `WDT`, `reset`, `freq`, `unique_id`, written in Python (`micropython-esp32/modules/machine.py`) and built in as a frozen module (`Interpreter::with_frozen_modules`) | Code from MicroPython tutorials runs unchanged | ✅ on a TTGO T-Display (`scripts/machine_demo.py`) |
 | 7.2 | Raw-paste mode | Faster uploads from Thonny and mpremote | ⬜ |
 | 7.2a | **CPU clock at build time**: `make flash CPU_MHZ=80/160/240` (80 by default); `machine.freq()` reports it | Scripts run 2× / 3× faster when power doesn't matter | ✅ measured on the TTGO (README, "CPU clock") |
+| 7.4 | **Floats** (double precision) and the `math` module, `float()`, `round()`, `divmod()`, `pow()`, `%f %e %g` formatting, `time.sleep(0.5)` | Sensor maths in volts, degrees, percent; MicroPython tutorials use floats everywhere | ✅ identical to CPython (`tests/cpython/floats.py`) on the PC and on the TTGO |
 | 7.3 | **Feature levels** (`minimal`, `medium`, `full`; `full` by default) for the core library and the firmware (`make flash LEVEL=...`) | Smaller builds and less RAM for small chips | ✅ (README, "Feature levels") |
 
 Done for 7.1:
@@ -184,7 +185,7 @@ Done for 7.1:
   syntax error (fixed, in `tests/cpython/functions.py` now), and `I2C(...)` hung the board: the old I2C driver was
   dropped after the new one was made, which reset the peripheral under it.
 * Still missing: `Pin.irq`, `Timer`, `RTC`, `Signal`, the `*_into` methods (need `bytearray`), `time.sleep(0.5)`
-  (floats), keyword-only parameters (`def f(*, x)`), and unpacking into attributes (`self.a, self.b = a, b`). One
+  (floats: done in 7.4), keyword-only parameters (`def f(*, x)`), and unpacking into attributes (`self.a, self.b = a, b`). One
   bus per kind (I²C, UART, SPI). A method call takes 1.2 ms at 80 MHz (`pin_write` 0.27 ms); `CPU_MHZ=240` (7.2a)
   makes that 0.43 ms. Changing the clock while running (`machine.freq(f)`, by saving it and rebooting) is open.
 
@@ -194,10 +195,23 @@ Done for 7.3:
   and `stdlib`. A missing part is replaced by a stub with the same entry points (`src/off/`), so its code isn't in
   the binary and the rest of the interpreter has no `#[cfg]` at its call sites; the limits (functions, variables,
   call depth, nesting, value stack) shrink with the level. Using a missing feature raises `NotImplementedError`.
-* ESP32, generic build: 258 / 278 / 304 KB app, 10.0 / 15.5 / 22.7 KB for the interpreter in RAM, 29 / 35 / 42 KB of
+* ESP32, generic build: 258 / 278 / 304 KB app (356 / 380 KB for `medium` / `full` with floats, 7.4), 10.0 / 15.5 / 22.7 KB for the interpreter in RAM, 29 / 35 / 42 KB of
   stack under a top-level statement. Checked on the TTGO at each level (conformance scripts, stack, speed).
 * CI: `make levels` (lints, tests and the ARM build of `minimal` and `medium`), and a `minimal` firmware build.
 * Not measured yet: the size on a Cortex-M chip (only the ARM build is checked).
+
+Done for 7.4:
+
+* `Value::Float(f64)`, float literals in the lexer, and the float paths in `src/floats.rs` (a stub in `minimal`):
+  Python's arithmetic (CPython's `float_divmod` for `//` and `%`), NaN-aware comparisons, `repr()` as the shortest
+  round-trip text laid out like CPython, `float()`, `round()` (half to even, correctly rounded `round(x, n)`),
+  formatting types `f e g %` for `%`, `str.format` and f-strings, and the `math` module over `libm`.
+* Like MicroPython: ints are converted to floats in mixed operations; `sum()` adds plainly. Like CPython (and
+  MicroPython's double builds): 17 significant digits.
+* On the ESP32: `floats.py` and all other conformance scripts identical to CPython; 86 KB more flash, no more RAM;
+  1000 float additions 209 ms (ints 171 ms); int-only benchmark 2 % slower. Fuzzed with float tokens.
+* Not done: complex numbers, single precision (`f32`, MicroPython's ESP32 default) as an option, floats returned by
+  hardware functions (`HardwareBridge::call` returns ints).
 
 ## Recommended order
 

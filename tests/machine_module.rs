@@ -68,6 +68,7 @@ fn show(args: &[Arg<'_>]) -> String {
         .iter()
         .map(|a| match a {
             Arg::Int(n) => n.to_string(),
+            Arg::Float(f) => f.to_string(),
             Arg::Str(s) => format!("{:?}", s),
             Arg::Bytes(b) => format!("b{:?}", b),
         })

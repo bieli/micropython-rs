@@ -93,10 +93,12 @@ pub trait Output {
 }
 
 /// An argument passed to a hardware function.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Arg<'s> {
     /// An `int` (bools arrive as 0/1, like in Python).
     Int(i64),
+    /// A `float`, e.g. for `time.sleep(0.5)`.
+    Float(f64),
     /// A `str`, e.g. for `text(x, y, 'hello')`.
     Str(&'s str),
     /// A `bytes` value, e.g. for `i2c_write(0x3c, b'\x00\xaf')`.
@@ -104,10 +106,20 @@ pub enum Arg<'s> {
 }
 
 impl<'s> Arg<'s> {
-    /// The integer value, or `Error::TypeError` for a string.
+    /// The integer value, or `Error::TypeError` for a string or a float
+    /// (like MicroPython: "can't convert float to int").
     pub fn int(self) -> Result<i64, Error> {
         match self {
             Arg::Int(n) => Ok(n),
+            _ => Err(Error::TypeError),
+        }
+    }
+
+    /// The value of a float or an int as `f64`, or `Error::TypeError`.
+    pub fn float(self) -> Result<f64, Error> {
+        match self {
+            Arg::Float(f) => Ok(f),
+            Arg::Int(n) => Ok(n as f64),
             _ => Err(Error::TypeError),
         }
     }
@@ -126,7 +138,7 @@ impl<'s> Arg<'s> {
         match self {
             Arg::Bytes(b) => Ok(b),
             Arg::Str(s) => Ok(s.as_bytes()),
-            Arg::Int(_) => Err(Error::TypeError),
+            Arg::Int(_) | Arg::Float(_) => Err(Error::TypeError),
         }
     }
 }

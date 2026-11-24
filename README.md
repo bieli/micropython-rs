@@ -76,7 +76,7 @@ flags |= 1 << 3                   # bitwise & | ^ ~ << >> and augmented assignme
 
 | Area | Supported |
 |------|-----------|
-| Values | `int` (64-bit), `str`, `bytes`, `bool` (`True`/`False`), `None`, `list`, `tuple`, `dict`, `range` |
+| Values | `int` (64-bit), `float` (64-bit), `str`, `bytes`, `bool` (`True`/`False`), `None`, `list`, `tuple`, `dict`, `range` |
 | Containers | `[1, 2]`, `(1, 2)`, `{'k': v}`, `x[i]`, `x[a:b]`, `x[k] = v`, `del x[k]`, `+`, `*`, `in`, `==`/`<`, comprehensions `[f(x) for x in it if c]` / `{k: v for ...}`, list methods `append extend insert pop remove index count clear reverse sort copy`, dict methods `get pop setdefault update keys values items clear copy` |
 | Strings | Escapes (`'\n'`, `'\x41'`, `'\u263a'`), `+`, `*`, `len()`, `s[i]`, `s[a:b]`, `in` / `not in`, `str()`, `repr()`, `int(s, base)`, `ord()`, `chr()`, `s.encode()`, and methods `upper lower strip lstrip rstrip startswith endswith find count replace split join isdigit isalpha isalnum isspace isupper islower` |
 | Bytes | `b'...'` literals with escapes, `bytes()`, `bytes(n)`, `bytes(s, 'utf-8')`, `bytes([1, 2])` (any iterable of 0–255), `+`, `*`, `len()`, `b[i]` (an `int`), `b[a:b]`, `in`, `==`/`<`, `hex()`, `decode()`, `startswith endswith find` |
@@ -93,13 +93,14 @@ flags |= 1 << 3                   # bitwise & | ^ ~ << >> and augmented assignme
 | Scope | `global a, b` in a function, to assign globals (also creates them) |
 | Modules | `import m`, `import m as x, n`, `from m import f, C as K`; `m.f(...)`, `m.CONST`, for native modules written in Rust and for your own `m.py` files ([Your own modules](#your-own-modules-py-files)) |
 
-Not supported yet: floats, sets, generators (`yield`), `nonlocal`, operator methods on classes (`__add__`, `__eq__`,
+Not supported yet: complex numbers, sets, generators (`yield`), `nonlocal`, operator methods on classes (`__add__`, `__eq__`,
 `__len__`, ...), multiple inheritance, packages (`import a.b`).
 See [ROADMAP.md](ROADMAP.md) for what's planned.
 
 ### Arithmetic operators
 
-All arithmetic is on 64-bit integers (`i64`). Precedence goes from lowest to highest, as in Python:
+Integers are 64-bit (`i64`), floats double precision (`f64`, see [Floats](#floats)). Precedence goes from lowest to
+highest, as in Python:
 
 | Precedence | Operators | Associativity | Example |
 |------------|-----------|---------------|---------|
@@ -120,10 +121,10 @@ All arithmetic is on 64-bit integers (`i64`). Precedence goes from lowest to hig
 Rules (they match CPython unless marked *differs*):
 
 * `//` rounds toward −∞ (`-7 // 2` → `-4`), and `%` takes the sign of the divisor (`-7 % 3` → `2`).
-* *Differs:* `/` is integer (floor) division (`7 / 2` → `3`), because floats aren't supported yet.
+* `/` always gives a float (`7 / 2` → `3.5`, `6 / 3` → `2.0`), and so does a negative power (`2 ** -1` → `0.5`).
 * *Differs:* results that don't fit in `i64` raise `Error::Overflow`. CPython has unlimited-size integers.
 * `x / 0`, `x // 0` and `x % 0` raise `Error::ZeroDivision`.
-* Negative exponents (`2 ** -1`) raise `Error::TypeError`. Strings support `+` and `*` (see [Strings](#strings));
+* Strings support `+` and `*` (see [Strings](#strings));
   other operators on strings, and mixing strings with numbers (`'a' + 1`), raise `Error::TypeError`.
 * `bool` behaves as an integer (`True + 1` → `2`); `&`, `|`, `^` of two bools give a bool.
 * `and`/`or` return one of their operands and skip the right side when the result is known,
@@ -131,6 +132,44 @@ Rules (they match CPython unless marked *differs*):
 * Strings compare with each other (`'a' < 'b'`). `==`/`!=` between different types is `False`/`True`;
   ordering them (`1 < 'a'`) raises `Error::TypeError`.
 * *Differs:* `<<` that doesn't fit in `i64` raises `Error::Overflow`; a negative shift count raises `Error::ValueError`.
+
+### Floats
+
+Double precision (`f64`), like MicroPython built with `MICROPY_FLOAT_IMPL_DOUBLE` (its ESP32 port uses single
+precision by default, so it prints fewer digits). Checked against CPython by
+[`tests/cpython/floats.py`](tests/cpython/floats.py), on the PC and on the ESP32.
+
+```python
+import math
+print(7 / 2, 0.1 + 0.2, 1e16, 2 ** 0.5)       # 3.5 0.30000000000000004 1e+16 1.4142135623730951
+print(-7.5 // 2, -7.5 % 2, round(2.5), round(2.675, 2), int(-3.9))   # -4.0 0.5 2 2.67 -3
+print('%.2f V, %e, %g' % (3.14159, 1234.5, 1e-7), f'{0.1234:.1%}')   # 3.14 V, 1.234500e+03, 1e-07 12.3%
+print(math.sqrt(2), math.floor(-2.5), math.log(8, 2), math.pi)       # 1.4142135623730951 -3 3.0 3.141592653589793
+```
+
+| Area | Supported |
+|------|-----------|
+| Literals | `1.5`, `.5`, `1.`, `1e3`, `2.5e-3`, `1_000.5` |
+| Operators | `+ - * / // % **` with ints and floats mixed; `//` and `%` floor like Python (`-7.5 % 2` → `0.5`); comparisons, `==` between `1` and `1.0` (also as dict keys) |
+| Built-ins | `float(x)` (also `'inf'`, `'nan'`, `'1_000.5'`), `int(x)` (towards zero), `round(x)` (half to even, an int), `round(x, n)`, `abs`, `min`, `max`, `sum`, `divmod`, `pow(x, y)`, `pow(x, y, m)`, `isinstance(x, float)` |
+| `str()` / `repr()` | The shortest text that reads back as the same float, laid out like CPython: `0.1`, `1e+16`, `1.5e-05`, `inf`, `nan`, `-0.0` |
+| Formatting | `%f %e %g %F %E %G`, `'{:.2f}'`, `'{:,.2f}'`, `'{:e}'`, `'{:g}'`, `'{:.1%}'`, `'{:.3}'`, f-strings; `'%d' % 3.7` → `'3'` |
+| `math` | `pi e tau inf nan`, `sqrt pow exp expm1 log log2 log10`, `sin cos tan asin acos atan atan2`, `sinh cosh tanh asinh acosh atanh`, `floor ceil trunc` (ints), `fabs fmod modf frexp ldexp copysign hypot`, `isfinite isinf isnan`, `degrees radians`, `erf erfc gamma lgamma`, `factorial` |
+| Errors | `1 / 0` `ZeroDivisionError`, `2.0 ** 10000` and `math.exp(1000)` `OverflowError`, `math.sqrt(-1)` and `math.log(0)` `ValueError`, `int(float('nan'))` `ValueError` |
+| Hardware | Floats reach the `HardwareBridge` as `Arg::Float` (`arg.float()` also takes ints); `time.sleep(0.5)` works on the ESP32. A float where a function wants an int (`pin_write(2, 1.0)`) raises `TypeError`, as in MicroPython |
+
+* *Like MicroPython, differs from CPython:* an int meeting a float is converted to a float first, so ints beyond 2**53
+  compare and divide like their nearest float; `sum()` adds floats one by one (CPython 3.12 compensates rounding:
+  `sum([0.1] * 10)` is `1.0` there, `0.9999999999999999` here and in CPython 3.11).
+* *Differs:* a negative number to a fractional power (`(-8) ** (1/3)`) raises `ValueError`: CPython gives a complex
+  number, which isn't supported.
+* The math functions come from [`libm`](https://crates.io/crates/libm) (musl's, in Rust); results may differ from
+  CPython's C library in the last binary digit for the transcendental ones (`sin`, `exp`, ...).
+* Floats are part of the `medium` and `full` [feature levels](#feature-levels) (Cargo feature `float`). Without them,
+  float literals and `/` raise `NotImplementedError`, as in MicroPython built without floats. On the ESP32 they add
+  86 KB of flash (math functions 24 KB, Rust's float formatting and parsing 14 KB plus tables, the interpreter's
+  float code 8 KB) and no RAM. A float addition in a loop is about 20 % slower than an int one; int-only loops got
+  about 2 % slower.
 
 How it works without a heap: the parser turns each expression into postfix (RPN) order in a fixed-size buffer.
 For example, `(a + 2) * -3` becomes `[a, 2, Add, 3, Neg, Mul]`.
@@ -536,7 +575,7 @@ one before:
 | Level | Python | Limits (functions / variables / call depth) |
 |-------|--------|---------------------------------------------|
 | `minimal` | ints, bools, `None`, strings, bytes, lists, tuples, dicts, comprehensions, `if`/`while`/`for`, `def` with defaults and keyword arguments, `lambda`, closures, decorators, exceptions, native modules and hardware functions, `builtins` | 16 / 48 / 6 |
-| `medium` | + classes (`class`, `super()`, `@classmethod`, `__str__`, `__call__`, your own exceptions), string formatting (`%`, `str.format`, f-strings, `format()`, `hex()`/`bin()`/`oct()`) | 32 / 96 / 8 |
+| `medium` | + floats and `math`, classes (`class`, `super()`, `@classmethod`, `__str__`, `__call__`, your own exceptions), string formatting (`%`, `str.format`, f-strings, `format()`, `hex()`/`bin()`/`oct()`) | 32 / 96 / 8 |
 | `full` | + files (`open()`, `os`), importing `.py` files and frozen modules, `sys`, `binascii`: everything Thonny and mpremote need | 64 / 128 / 8 |
 
 ```toml
@@ -554,9 +593,9 @@ The ESP32 firmware (`make flash LEVEL=minimal`), measured on the generic build a
 
 | `LEVEL` | Interpreter code | App image | Interpreter in RAM | Stack for a top-level statement | Recursion until `RecursionError` |
 |---------|-----------------:|----------:|-------------------:|--------------------------------:|--------------------------------:|
-| `minimal` | 140.7 KB | 258 KB | 10.0 KB | 29 KB | 85 KB (6 calls) |
-| `medium` | 158.2 KB | 278 KB | 15.5 KB | 35 KB | 108 KB (8 calls) |
-| `full` (default) | 172.6 KB + 9 KB `machine.py` | 304 KB | 22.7 KB | 42 KB | 114 KB (8 calls) |
+| `minimal` | 142.0 KB | 258 KB | 10.0 KB | 29 KB | 85 KB (6 calls) |
+| `medium` | 218.8 KB (floats: about 60 KB of it) | 356 KB | 15.5 KB | 35 KB | 108 KB (8 calls) |
+| `full` (default) | 231.2 KB + 9 KB `machine.py` | 380 KB | 22.7 KB | 42 KB | 114 KB (8 calls) |
 
 "Interpreter in RAM" is the REPL's stack frame, which holds the `Interpreter` struct; its tables shrink with the
 level. Speed is the same at every level. Thonny, mpremote's file commands and the `machine` module need `full`.
@@ -1145,7 +1184,7 @@ memory. A `machine.py` on the board's file system comes first, as in MicroPython
 | functions | `reset()`, `reset_cause()` and its constants, `unique_id()`, `freq()` (fixed when building: `CPU_MHZ`; another value raises `ValueError`), `lightsleep(ms)` (waits) |
 
 Not there yet: `Pin.irq`, `Timer`, `RTC`, `Signal`, and the `*_into` methods (`readinto`, `write_readinto`,
-`readfrom_mem_into`), which need `bytearray`. `time.sleep(0.5)` needs floats: use `time.sleep_ms(500)`. The module
+`readfrom_mem_into`), which need `bytearray`. The module
 takes 43 of the 64 function slots (`MAX_FUNCS`), and each method call runs Python code: `led.value(1)` takes 1.2 ms
 on the ESP32 at 80 MHz (0.43 ms at 240 MHz), `pin_write(2, 1)` 0.27 ms (0.12 ms). Fine for blinking, sensors and
 buses, too slow for bit-banging.
@@ -1155,7 +1194,7 @@ buses, too slow for bit-banging.
 | Module | Builds | Contents |
 |--------|--------|----------|
 | `machine` | both | MicroPython's hardware classes, see [The `machine` module](#the-machine-module) |
-| `time` | both | `sleep(s)`, `sleep_ms(ms)`, `sleep_us(us)`, `ticks_ms()`, `ticks_us()`, `ticks_diff(new, old)`, with MicroPython's names, so `import time; time.sleep_ms(100)` works as on MicroPython |
+| `time` | both | `sleep(s)` (also a float: `sleep(0.5)`), `sleep_ms(ms)`, `sleep_us(us)`, `ticks_ms()`, `ticks_us()`, `ticks_diff(new, old)`, with MicroPython's names, so `import time; time.sleep_ms(100)` works as on MicroPython |
 | `display` | `tft` | Drawing on the 240 × 135 TFT. See below |
 | `buttons` | both | Debounced button events with short and long presses. TTGO: `LEFT` = GPIO0, `RIGHT` = GPIO35; generic build: `LEFT` = BOOT button (GPIO0) |
 

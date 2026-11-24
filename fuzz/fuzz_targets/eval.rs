@@ -37,7 +37,10 @@ fuzz_target!(|data: &[u8]| {
         .with_module_memory(&mut module_memory);
     // `while 1:` must end; no stack floor on purpose: unbounded native
     // recursion has to show up as a crash here, not as a RecursionError
-    vm.set_step_limit(Some(20_000));
+    // (5000 per eval: an input of many NUL-separated infinite loops, each
+    // running to the limit, stays well under libFuzzer's timeout with the
+    // sanitizer's slowdown)
+    vm.set_step_limit(Some(5_000));
     vm.set_interactive(true);
     for chunk in text.split('\0') {
         if let Err(err) = vm.eval(chunk) {

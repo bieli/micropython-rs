@@ -10,6 +10,8 @@
 # * ADC: 11 dB attenuation and 12 bits only (0-3.3 V);
 # * UART: 8 data bits, no parity, 1 stop bit; SPI: 8 bits, MSB first.
 # No Pin.irq, Timer, RTC or *_into methods (they need bytearray) yet.
+# Floats work where MicroPython takes them: time.sleep(0.5), machine values
+# from int arithmetic (duty_ns, read_uv) stay ints, as on MicroPython.
 
 PWRON_RESET = PWRON_RESET
 HARD_RESET = HARD_RESET

@@ -44,6 +44,7 @@ const T_EXC_CLASS: u8 = 11;
 const T_FUNC: u8 = 12;
 const T_BUILTIN: u8 = 13;
 const T_GLOBALS: u8 = 14;
+const T_FLOAT: u8 = 15;
 
 /// Encodes a value for a slot. Source strings must be copied to the heap
 /// first (`Interpreter::stored`); only empty ones are encoded directly.
@@ -63,6 +64,7 @@ fn encode(v: Value<'_>) -> [u8; SLOT] {
         Value::Func(f) => (T_FUNC, f as u64),
         Value::Builtin(b) => (T_BUILTIN, b as u64),
         Value::Globals => (T_GLOBALS, 0),
+        Value::Float(f) => (T_FLOAT, f.to_bits()),
         Value::Str(_) => (T_EMPTY_STR, 0),
         Value::Bytes(_) => (T_EMPTY_BYTES, 0),
     };
@@ -94,6 +96,7 @@ fn decode<'a>(slot: &[u8]) -> Value<'a> {
         T_FUNC => Value::Func(n as u8),
         T_BUILTIN => Value::Builtin(n as u8),
         T_GLOBALS => Value::Globals,
+        T_FLOAT => Value::Float(f64::from_bits(n)),
         _ => Value::None,
     }
 }
@@ -432,6 +435,21 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
     /// `BuildList` / `BuildTuple` / `BuildDict`: replaces the top `n` values
     /// (`2n` for a dict) with the new container.
     #[inline(never)]
+    /// A new tuple of `items` (e.g. a `divmod()` result).
+    #[cfg_attr(not(feature = "float"), allow(dead_code))]
+    pub(super) fn new_tuple(&mut self, items: &[Value<'a>]) -> Result<Value<'a>, Error> {
+        let base = self.sp;
+        let result = (|| {
+            for &v in items {
+                self.push(v)?;
+            }
+            self.build(Kind::Tuple, items.len())?;
+            Ok(self.stack[self.sp - 1])
+        })();
+        self.sp = base;
+        result
+    }
+
     pub(super) fn build(&mut self, kind: Kind, n: usize) -> Result<(), Error> {
         let values = if kind == Kind::Dict { 2 * n } else { n };
         let from = self.sp - values;
@@ -535,6 +553,10 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
         if let (Some(x), Some(y)) = (a.as_int(), b.as_int()) {
             return x == y;
         }
+        // 1 == 1.0 (and a dict key 1 finds 1.0); NaN equals nothing
+        if let Some(order) = super::floats::float_order(a, b) {
+            return order == Some(core::cmp::Ordering::Equal);
+        }
         match (a, b) {
             (Value::Obj(x), Value::Obj(y)) => {
                 if x == y {
@@ -589,6 +611,8 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
         match (a, b) {
             (Value::Str(x), Value::Str(y)) => x.as_ptr() == y.as_ptr() && x.len() == y.len(),
             (Value::Bytes(x), Value::Bytes(y)) => x.as_ptr() == y.as_ptr() && x.len() == y.len(),
+            // The same float object (`nan is nan` when it's one value)
+            (Value::Float(x), Value::Float(y)) => x.to_bits() == y.to_bits(),
             _ => a == b,
         }
     }
@@ -1226,16 +1250,24 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
             ("sum", [it] | [it, _]) => {
                 let it = *it;
                 (|| {
-                    let mut total = match args.get(1) {
-                        Some(v) => v.as_int().ok_or(Error::TypeError)?,
-                        None => 0,
-                    };
+                    // Plain `+` from left to right (ints, and floats like
+                    // MicroPython: no compensated summation)
+                    let mut total = args.get(1).copied().unwrap_or(Value::Int(0));
+                    if total.as_int().is_none() && !matches!(total, Value::Float(_)) {
+                        return Err(Error::TypeError);
+                    }
                     let mut state = 0;
                     while let Some(v) = self.iter_next(it, &mut state)? {
-                        let n = v.as_int().ok_or(Error::TypeError)?;
-                        total = total.checked_add(n).ok_or(Error::Overflow)?;
+                        if v.as_int().is_none() && !matches!(v, Value::Float(_)) {
+                            return Err(Error::TypeError);
+                        }
+                        total = super::binop(crate::ast_parser::BinOp::Add, total, v)?;
                     }
-                    Ok(Value::Int(total))
+                    // `sum([True, True])` is 2, not True
+                    Ok(match total {
+                        Value::Bool(b) => Value::Int(b as i64),
+                        other => other,
+                    })
                 })()
             }
             ("any" | "all", [it]) => {

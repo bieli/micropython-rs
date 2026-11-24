@@ -26,6 +26,7 @@ const NAMES: &[&str] = &[
     "tuple",
     "dict",
     "range",
+    "float",
     "NoneType",
     "function",
     "builtin_function_or_method",
@@ -65,10 +66,13 @@ const NAMES: &[&str] = &[
     "hex",
     "bin",
     "oct",
+    "round",
+    "divmod",
+    "pow",
 ];
-const FIRST_FUNCTION: u8 = 14;
+const FIRST_FUNCTION: u8 = 15;
 /// Types that can't be called (`NoneType()`, `function()`, `module()`).
-const FIRST_UNCALLABLE_TYPE: u8 = 8;
+const FIRST_UNCALLABLE_TYPE: u8 = 9;
 
 /// `import builtins`: its attributes are the built-in functions, types and
 /// exception classes (see `Interpreter::builtins_attr`).
@@ -134,6 +138,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
             Value::None => "NoneType",
             Value::Bool(_) => "bool",
             Value::Int(_) => "int",
+            Value::Float(_) => "float",
             Value::Str(_) | Value::HStr(_) => "str",
             Value::Bytes(_) | Value::HBytes(_) => "bytes",
             Value::Obj(r) => match self.heap.kind(r) {
@@ -391,6 +396,17 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
     ) -> Option<Result<Value<'a>, Error>> {
         Some(match (name, args) {
             ("isinstance", [v, spec]) => self.isinstance(*v, *spec).map(Value::Bool),
+            ("float", _) => self.float_builtin(args),
+            ("round", _) => self.round_builtin(args),
+            ("divmod", [a, b]) => self.divmod_builtin(*a, *b),
+            ("pow", [a, b]) => super::binop(crate::ast_parser::BinOp::Pow, *a, *b),
+            ("pow", [a, b, m]) => match (a.as_int(), b.as_int(), m.as_int()) {
+                (Some(base), Some(exp), Some(m)) if exp >= 0 && m != 0 => {
+                    Ok(Value::Int(pow_mod(base, exp, m)))
+                }
+                (Some(_), Some(_), Some(0)) => Err(Error::ValueError),
+                _ => Err(Error::TypeError),
+            },
             ("type", [v]) => Ok(self.type_of(*v)),
             ("callable", [v]) => Ok(Value::Bool(
                 matches!(
@@ -438,6 +454,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
                 Value::Str(s) => s.as_ptr() as usize as i64,
                 Value::Bytes(b) => b.as_ptr() as usize as i64,
                 Value::Int(n) => n.wrapping_mul(2).wrapping_add(1),
+                Value::Float(f) => (f.to_bits() >> 2) as i64 | 0x4000_0000_0000_0000,
                 Value::None => 0x10,
                 Value::Bool(b) => 0x12 + b as i64 * 2,
                 Value::Globals => 0x20,
@@ -619,4 +636,22 @@ fn copy_name<'n>(name: &str, buf: &'n mut [u8; 32]) -> Option<&'n str> {
     }
     buf[..bytes.len()].copy_from_slice(bytes);
     core::str::from_utf8(&buf[..bytes.len()]).ok()
+}
+
+/// `pow(base, exp, m)`: modular power without overflow (Python's sign rules:
+/// the result has the sign of `m`).
+fn pow_mod(base: i64, mut exp: i64, m: i64) -> i64 {
+    let m = m as i128;
+    let mut result: i128 = 1 % m;
+    let mut b = (base as i128).rem_euclid(m);
+    while exp > 0 {
+        if exp & 1 == 1 {
+            result = (result * b).rem_euclid(m);
+        }
+        b = (b * b).rem_euclid(m);
+        exp >>= 1;
+    }
+    // rem_euclid gives 0..|m|; Python's % takes the sign of m
+    let r = result.rem_euclid(m.abs());
+    (if m < 0 && r != 0 { r + m } else { r }) as i64
 }
