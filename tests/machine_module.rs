@@ -238,7 +238,7 @@ fn uart_spi_wdt_and_module_functions() {
         out,
         "19 b'$GPGGA,1\\r\\n' b'$GP2\\n'\nb'res' b't' None 4\nUART(1) needs tx and rx pins\n\
          b'\\xa0\\xa1\\xa2'\n80000000 b'$\\n\\xc4\\x01\\x02\\x03' True\n\
-         the CPU clock is fixed at 80000000 Hz\n"
+         the CPU clock is fixed at 80000000 Hz (build with CPU_MHZ=240)\n"
     );
     assert!(
         log.starts_with("uart_init(17,16,9600)\nuart_any()\nuart_read(512,0)\n"),

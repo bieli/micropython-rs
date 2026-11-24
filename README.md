@@ -488,6 +488,20 @@ interpreter's hot loop (lexer, parser, statement and expression evaluation, abou
 i.e. the ESP32's internal instruction RAM. Running from flash, the loop missed the 32 KB flash cache all the time:
 5000 empty `while` passes took 1.6 s instead of 0.9 s.
 
+**CPU clock (`CPU_MHZ`).** The firmware runs the ESP32 at 80 MHz unless built with `CPU_MHZ=160` or `CPU_MHZ=240`
+(esp-hal sets the clock once, at boot, so it can't change while running like MicroPython's `machine.freq(f)`).
+Measured on the TTGO:
+
+| `CPU_MHZ` | 5000 empty loops | 2000 arithmetic loops | `pin_write` | `led.value(1)` (`machine`) |
+|----------:|-----------------:|----------------------:|------------:|---------------------------:|
+| 80 (default) | 902 ms | 677 ms | 265 µs | 1165 µs |
+| 160 | 451 ms | 339 ms | 145 µs | 600 µs |
+| 240 | 301 ms | 226 ms | 120 µs | 425 µs |
+
+The buses (UART, I²C, SPI) and PWM run from the 80 MHz peripheral clock, and `sleep_ms` and the ticks from a timer,
+so they're the same at every clock (checked at 240 MHz: baud rates, loopbacks, `sleep_ms(1000)` = 1000.4 ms). A
+faster clock draws more current, which matters on a battery.
+
 ## Using micropython-rs on a Microcontroller
 
 Because the core library is #![no_std], you can embed it into any firmware project 
@@ -693,6 +707,7 @@ make flash FEATURES=tft                      # TTGO T-Display, runs scripts/ttgo
 make flash SCRIPT=scripts/blink.py           # run your own script
 make flash FEATURES=tft SCRIPT=scripts/help.py
 make flash PORT=/dev/ttyUSB0                 # pick a serial port explicitly
+make flash FEATURES=tft CPU_MHZ=240          # 3x faster scripts (more current)
 
 make build                                   # build only
 make report                                  # memory of the last build: regions, stack, biggest frames
@@ -704,6 +719,7 @@ make clean                                   # remove build artifacts
 | Make variable | Default | Meaning |
 |---------------|---------|---------|
 | `FEATURES` | *(empty)* | Cargo features passed as `--features ...` (e.g. `tft`) |
+| `CPU_MHZ` | `80` | CPU clock: `80` (least current, for batteries), `160` or `240` (scripts run 2× / 3× faster). Fixed in the firmware, `machine.freq()` reports it |
 | `SCRIPT` | *(empty: the board's demo)* | Python file to embed, relative to `micropython-esp32/`. It must be inside the repository, because the Docker build only sees the repository |
 | `ERASE_FILES` | *(empty)* | Files on the board survive `make flash`. `ERASE_FILES=1` deletes them all (then the embedded `SCRIPT` runs at boot, as no `main.py` is left); `make erase-files` does the same without flashing |
 | `PORT` | *(empty, espflash picks the saved port)* | Serial port for `flash` / `monitor` |
@@ -1051,7 +1067,7 @@ Pins are plain GPIO numbers.
 | UART | `uart_init(tx, rx, [baud])`, `uart_write(data)`, `uart_read([n], [timeout_ms])`, `uart_any()` | UART1 on any two allowed pins, default 115 200 baud (300 to 5 000 000). `uart_write` returns the bytes sent; `uart_read` waits until `n` bytes (default 512) or `timeout_ms` (default 100) and returns what came, possibly `b''`; `uart_any()` counts the bytes waiting. Ctrl-C stops a wait. `uart_init` again changes pins or speed |
 | SPI | `spi_init(sck, mosi, miso, [khz], [mode])`, `spi_write(data)`, `spi_transfer(data)`, `spi_read(n, [fill])` | SPI3 master, default 1000 kHz (10 to 40 000) and mode 0 (0–3). Chip select is yours: a GPIO with `pin_write`. `spi_transfer` returns the bytes read while sending; `spi_read` sends `fill` (default 0) |
 | Watchdog | `wdt_enable(timeout_ms)`, `wdt_feed()`, `wdt_disable()` | The RTC watchdog resets the whole board when it isn't fed in time. `sleep_ms` feeds it automatically every 100 ms |
-| System | `reset()`, `reset_cause()`, `stack_peak()`, `unique_id()`, `cpu_freq()` | `reset_cause()` returns `PWRON_RESET`, `HARD_RESET`, `WDT_RESET`, `DEEPSLEEP_RESET` or `SOFT_RESET` (MicroPython's values). The firmware also prints the reset reason at boot. `stack_peak()`: the most bytes of the main stack used since its previous call (or boot), see [Stack budget](#stack-budget-measured-on-the-esp32). `unique_id()`: the chip's MAC address (6 bytes). `cpu_freq()`: 80 000 000 (esp-hal's default clock) |
+| System | `reset()`, `reset_cause()`, `stack_peak()`, `unique_id()`, `cpu_freq()` | `reset_cause()` returns `PWRON_RESET`, `HARD_RESET`, `WDT_RESET`, `DEEPSLEEP_RESET` or `SOFT_RESET` (MicroPython's values). The firmware also prints the reset reason at boot. `stack_peak()`: the most bytes of the main stack used since its previous call (or boot), see [Stack budget](#stack-budget-measured-on-the-esp32). `unique_id()`: the chip's MAC address (6 bytes). `cpu_freq()`: the CPU clock in Hz (`CPU_MHZ`, 80 MHz by default) |
 | Battery (`tft` only) | `battery_mv([samples])` | Battery voltage in mV: switches on the TTGO's divider (`ADC_EN`, GPIO14), reads GPIO34, doubles it, switches the divider off |
 | TFT (`tft` only) | `cls()`, `color(r, g, b)`, `text(x, y, s)`, `rect(x, y, w, h)`, `backlight(on)` | `color` sets the text and fill color (0–255 per channel). `text` and `rect` draw at pixel positions. `WIDTH` and `HEIGHT` are 240 and 135 |
 
@@ -1091,12 +1107,13 @@ memory. A `machine.py` on the board's file system comes first, as in MicroPython
 | `UART(id, baudrate, tx=, rx=, timeout=)` | `write()`, `read([n])` (`None` when nothing came), `readline()`, `any()`, `init(...)`; id 1 or 2 (UART0 is the REPL), one at a time, 8N1 only; `UART(2)` defaults to tx 17, rx 16 |
 | `SPI(id, baudrate, polarity=, phase=, sck=, mosi=, miso=)`, `SoftSPI` | `read(n, [write])`, `write()`, `init(...)`; one bus, 8 bits MSB first; MicroPython's default pins for ids 1 and 2 |
 | `WDT(timeout=)` | `feed()` |
-| functions | `reset()`, `reset_cause()` and its constants, `unique_id()`, `freq()` (80 MHz, fixed), `lightsleep(ms)` (waits) |
+| functions | `reset()`, `reset_cause()` and its constants, `unique_id()`, `freq()` (fixed when building: `CPU_MHZ`; another value raises `ValueError`), `lightsleep(ms)` (waits) |
 
 Not there yet: `Pin.irq`, `Timer`, `RTC`, `Signal`, and the `*_into` methods (`readinto`, `write_readinto`,
 `readfrom_mem_into`), which need `bytearray`. `time.sleep(0.5)` needs floats: use `time.sleep_ms(500)`. The module
 takes 43 of the 64 function slots (`MAX_FUNCS`), and each method call runs Python code: `led.value(1)` takes 1.2 ms
-on the ESP32, `pin_write(2, 1)` 0.27 ms. Fine for blinking, sensors and buses, too slow for bit-banging.
+on the ESP32 at 80 MHz (0.43 ms at 240 MHz), `pin_write(2, 1)` 0.27 ms (0.12 ms). Fine for blinking, sensors and
+buses, too slow for bit-banging.
 
 #### Modules
 

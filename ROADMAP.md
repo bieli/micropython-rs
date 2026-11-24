@@ -168,6 +168,7 @@ Open after Phase 6 (the `machine` module is done in 7.1): `bytearray`
 |---|---------|-----|--------|
 | 7.1 | **`machine` module**: `Pin`, `ADC`, `PWM`, `I2C`/`SoftI2C`, `UART`, `SPI`/`SoftSPI`, `WDT`, `reset`, `freq`, `unique_id`, written in Python (`micropython-esp32/modules/machine.py`) and built in as a frozen module (`Interpreter::with_frozen_modules`) | Code from MicroPython tutorials runs unchanged | ✅ on a TTGO T-Display (`scripts/machine_demo.py`) |
 | 7.2 | Raw-paste mode | Faster uploads from Thonny and mpremote | ⬜ |
+| 7.2a | **CPU clock at build time**: `make flash CPU_MHZ=80/160/240` (80 by default); `machine.freq()` reports it | Scripts run 2× / 3× faster when power doesn't matter | ✅ measured on the TTGO (README, "CPU clock") |
 | 7.3 | Feature levels (`minimal`, `medium`, `full`) for the core library and the firmware | Smaller builds and less RAM for small chips | ⬜ |
 
 Done for 7.1:
@@ -184,8 +185,8 @@ Done for 7.1:
   dropped after the new one was made, which reset the peripheral under it.
 * Still missing: `Pin.irq`, `Timer`, `RTC`, `Signal`, the `*_into` methods (need `bytearray`), `time.sleep(0.5)`
   (floats), keyword-only parameters (`def f(*, x)`), and unpacking into attributes (`self.a, self.b = a, b`). One
-  bus per kind (I²C, UART, SPI). A method call takes 1.2 ms (`pin_write` 0.27 ms); the CPU runs at esp-hal's
-  default 80 MHz, and 240 MHz would make all scripts up to 3× faster.
+  bus per kind (I²C, UART, SPI). A method call takes 1.2 ms at 80 MHz (`pin_write` 0.27 ms); `CPU_MHZ=240` (7.2a)
+  makes that 0.43 ms. Changing the clock while running (`machine.freq(f)`, by saving it and rebooting) is open.
 
 ## Recommended order
 

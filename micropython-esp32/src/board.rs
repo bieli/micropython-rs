@@ -38,6 +38,15 @@ pub const IN_PULLDOWN: i64 = 4;
 pub const OUT_OD: i64 = 5;
 pub const OUT_OD_PULLUP: i64 = 6;
 
+/// The CPU clock, chosen at build time (`make flash CPU_MHZ=240`; see
+/// build.rs). esp-hal sets it once, in `esp_hal::init`.
+#[cfg(cpu_mhz = "80")]
+pub const CPU_CLOCK: esp_hal::clock::CpuClock = esp_hal::clock::CpuClock::_80MHz;
+#[cfg(cpu_mhz = "160")]
+pub const CPU_CLOCK: esp_hal::clock::CpuClock = esp_hal::clock::CpuClock::_160MHz;
+#[cfg(cpu_mhz = "240")]
+pub const CPU_CLOCK: esp_hal::clock::CpuClock = esp_hal::clock::CpuClock::_240MHz;
+
 /// `reset_cause()` results, with MicroPython's `machine` module values.
 pub const PWRON_RESET: i64 = 1;
 pub const HARD_RESET: i64 = 2;
@@ -283,7 +292,7 @@ impl<'d> Board<'d> {
                 self.i2c_init(pin_number(int(0)?)?, pin_number(int(1)?)?, freq)
                     .map(|()| None)
             }
-            "cpu_freq" => Ok(Some(esp_hal::clock::CpuClock::default() as i64 * 1_000_000)),
+            "cpu_freq" => Ok(Some(CPU_CLOCK as i64 * 1_000_000)),
             "pwm_stop" => self.pwm_stop(pin_number(int(0)?)?).map(|()| None),
             "i2c_probe" => Ok(Some(self.i2c_probe(i2c_addr(int(0)?)?) as i64)),
             "i2c_write" => {

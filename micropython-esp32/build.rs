@@ -1,5 +1,6 @@
 fn main() {
     select_script();
+    select_cpu_clock();
     linker_be_nice();
     check_xtensa_linker_available();
     // make sure linkall.x is the last linker script (otherwise might cause problems with flip-link)
@@ -130,6 +131,21 @@ fn linker_be_nice() {
         "cargo:rustc-link-arg=-Wl,--error-handling-script={}",
         std::env::current_exe().unwrap().display()
     );
+}
+
+/// Chooses the CPU clock: `MPY_CPU_MHZ` (set by `make flash CPU_MHZ=...`) is
+/// 80 (the default), 160 or 240, passed to the code as `cfg(cpu_mhz = "...")`.
+fn select_cpu_clock() {
+    println!("cargo:rerun-if-env-changed=MPY_CPU_MHZ");
+    println!("cargo::rustc-check-cfg=cfg(cpu_mhz, values(\"80\", \"160\", \"240\"))");
+    let mhz = std::env::var("MPY_CPU_MHZ")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "80".to_string());
+    if !["80", "160", "240"].contains(&mhz.as_str()) {
+        panic!("CPU_MHZ/MPY_CPU_MHZ must be 80, 160 or 240, not `{}`", mhz);
+    }
+    println!("cargo:rustc-cfg=cpu_mhz=\"{}\"", mhz);
 }
 
 /// Chooses the Python script embedded into the firmware.

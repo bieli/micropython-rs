@@ -27,7 +27,9 @@ def freq(hz=None):
     if hz is None:
         return cpu_freq()
     if hz != cpu_freq():
-        raise ValueError('the CPU clock is fixed at %d Hz' % cpu_freq())
+        # Set when the firmware is built: make flash CPU_MHZ=80/160/240
+        raise ValueError('the CPU clock is fixed at %d Hz (build with CPU_MHZ=%d)'
+                         % (cpu_freq(), hz // 1000000))
 
 
 def _pin(pin):

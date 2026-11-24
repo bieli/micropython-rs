@@ -20,6 +20,9 @@ FEATURES_FLAG := $(if $(FEATURES),--features $(FEATURES),)
 # directory; leave empty for the board's demo (scripts/demo.py or scripts/ttgo_demo.py)
 SCRIPT       ?=
 
+# CPU clock in MHz: 80 (default, least current), 160 or 240 (fastest)
+CPU_MHZ      ?=
+
 # Partition table with the `vfs` file system partition (main.py and other files)
 PARTITIONS   := partitions.csv
 
@@ -56,6 +59,7 @@ build:
 		-v "$(WORKSPACE_ROOT)":/workspace \
 		-v "$(CARGO_CACHE)":/home/esp/.cargo/registry \
 		-e MPY_SCRIPT="$(SCRIPT)" \
+		-e MPY_CPU_MHZ="$(CPU_MHZ)" \
 		-w /workspace/$(BIN_NAME) \
 		$(DOCKER_IMAGE) \
 		bash -c "source /home/esp/export-esp.sh && cargo build --release $(FEATURES_FLAG)"

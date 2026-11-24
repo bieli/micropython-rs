@@ -124,7 +124,8 @@ impl HardwareBridge for GenericHardware<'_> {
 #[cfg(not(feature = "tft"))]
 #[main]
 fn main() -> ! {
-    let peripherals = esp_hal::init(esp_hal::Config::default());
+    let config = esp_hal::Config::default().with_cpu_clock(micropython_esp32::board::CPU_CLOCK);
+    let peripherals = esp_hal::init(config);
     // Set up serial input first: it resets UART0, which drops unsent output
     serial_input::init(peripherals.UART0, peripherals.GPIO3);
     print_reset_reason();
@@ -291,7 +292,8 @@ impl HardwareBridge for TtgoHardware<'_, '_> {
 #[cfg(feature = "tft")]
 #[main]
 fn main() -> ! {
-    let peripherals = esp_hal::init(esp_hal::Config::default());
+    let config = esp_hal::Config::default().with_cpu_clock(micropython_esp32::board::CPU_CLOCK);
+    let peripherals = esp_hal::init(config);
     // Set up serial input first: it resets UART0, which drops unsent output
     serial_input::init(peripherals.UART0, peripherals.GPIO3);
     print_reset_reason();
