@@ -51,9 +51,12 @@ fn main() {
     // with as many files as the ESP32's flash partition holds
     let mut flash = vec![0u8; 30 * SLOT_SIZE as usize];
     let files = RefCell::new(FlatFs::mount(RamFlash::new(&mut flash)).expect("RAM file system"));
+    // The source of imported `.py` modules (from the RAM file system)
+    let mut module_memory = vec![0u8; 256 * 1024];
     let mut vm = Interpreter::new(&mut out)
         .with_heap(&mut heap)
-        .with_files(&files);
+        .with_files(&files)
+        .with_module_memory(&mut module_memory);
 
     if let Err(err) = vm.eval(&script) {
         // Like Python: the traceback goes to stderr

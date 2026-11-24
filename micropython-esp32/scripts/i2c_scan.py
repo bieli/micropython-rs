@@ -1,13 +1,12 @@
 # Scan the I2C bus (SDA = GPIO21, SCL = GPIO22) and print every address found
-found = 0
-addr = 0x08
-while addr < 0x78:
-    if i2c_probe(addr):
-        print('device at', addr)
-        found += 1
-    addr += 1
-print('devices found:', found)
+found = i2c_scan()                  # the addresses, as bytes
+for addr in found:
+    print('device at 0x%02x' % addr)
+print('devices found:', len(found))
 
-# Reading a register, e.g. the WHO_AM_I register of an MPU6050 at 0x68:
-# if i2c_probe(0x68):
-#     print('WHO_AM_I =', i2c_read_reg(0x68, 0x75))
+# Reading registers, e.g. an MPU6050 accelerometer at 0x68:
+# if 0x68 in found:
+#     print('WHO_AM_I =', hex(i2c_write_read(0x68, b'\x75', 1)[0]))
+#     i2c_write(0x68, b'\x6b\x00')                 # wake it up
+#     raw = i2c_write_read(0x68, b'\x3b', 6)       # X, Y, Z: 16-bit big-endian
+#     x = raw[0] << 8 | raw[1]

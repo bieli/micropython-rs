@@ -23,13 +23,13 @@ Status: ✅ done · 🚧 in progress · ⬜ planned · ➡️ moved
 | 2.3 | **Hex and binary literals and bitwise operators**: `0x40`, `0b1010`, `& \| ^ ~ << >>` | Daily work with registers, flags and masks | ✅ |
 | 2.4 | **Augmented assignment**: `+= -= \|= &= <<=` | Common in counters and bit manipulation | ✅ |
 | 2.5 | **`def` functions** (no closures) | Reusable code such as `blink(n)`. Needs a fixed-size call frame stack | ✅ |
-| 2.6 | **`bytes`/`bytearray` from a static buffer pool** | Needed for I²C, SPI and UART payloads, while staying zero-heap. Moved to Phase 3: it depends on the bus API design (`HardwareBridge` passes only integers today) | ➡️ 3.4 |
+| 2.6 | **`bytes`/`bytearray` from a static buffer pool** | Needed for I²C, SPI and UART payloads, while staying zero-heap. Moved to Phase 3: it depends on the bus API design (`HardwareBridge` passed only integers then) | ✅ `bytes` on the heap (5.2), through the bridge in 6.1; `bytearray` is still open |
 
 Phase 2 follow-ups found while building it:
 
-* `for` loops with `range()`, the most common loop form in MicroPython code.
+* ✅ `for` loops with `range()`, the most common loop form in MicroPython code (5.3).
 * ✅ `global` statement, so functions can update global counters and state (done, with `abs`/`min`/`max`).
-* `hex()`/`bin()` output for register values (needs a small string pool, like 2.6).
+* ✅ `hex()`/`bin()`/`oct()` output for register values (6.1).
 
 ## Phase 3: Hardware API (MicroPython-style names)
 
@@ -40,8 +40,8 @@ Start with flat functions that follow MicroPython's names. Move to `machine.Pin(
 | 3.1 | `sleep_ms(ms)`, `sleep_us(us)`, `ticks_ms()`, `ticks_diff(a, b)` | Same names as MicroPython's `time` module. Keep `delay_ms` as an alias | ✅ |
 | 3.2 | `pin_mode(pin, OUT/IN/IN_PULLUP)`, `pin_write(pin, v)`, `pin_read(pin)` | Runtime pin numbers with an allowlist per board, so scripts can't touch the flash or PSRAM pins | ✅ |
 | 3.3 | `adc_read(pin)`, `pwm(pin, freq, duty)` | Sensors, LED dimming and servos | ✅ |
-| 3.4 | `i2c_write(addr, data)`, `i2c_read(addr, n)`, `i2c_scan()` | `i2c_scan()` is the first thing everyone runs with a new sensor. Needs 2.6 | 🚧 |
-| 3.5 | `uart_write`/`uart_read` and SPI transfers | GPS modules, modems, displays | ⬜ |
+| 3.4 | `i2c_write(addr, data)`, `i2c_read(addr, n)`, `i2c_scan()` | `i2c_scan()` is the first thing everyone runs with a new sensor | ✅ (6.2) |
+| 3.5 | `uart_write`/`uart_read` and SPI transfers | GPS modules, modems, displays | ✅ (6.2) |
 | 3.6 | Watchdog: `wdt_feed()`, plus automatic feeding inside `sleep_ms` | Production firmware has to recover from a hung script | ✅ |
 | 3.7 | TFT functions: `cls()`, `color(r, g, b)`, `text(x, y, s)`, `backlight(on)`, and scrolling | Makes the `tft` feature useful beyond showing logs | ✅ |
 | 3.8 | **Native modules with `import`**: `import display`, `from time import sleep_ms`; a `display` drawing module (pixels, lines, rectangles, circles, triangles, text) and a `time` module | Rust code grouped into MicroPython-style modules instead of one flat namespace | ✅ |
@@ -54,10 +54,9 @@ which keeps the trait simple.
 
 Phase 3 status:
 
-* 3.4 I²C: `i2c_probe`, `i2c_scan`, and single-byte / 16-bit register reads and writes are done. Multi-byte transfers
-  still need `bytes`/`bytearray` (2.6).
-* 3.5 UART/SPI: not started. It needs the same byte buffers.
-* PWM output and the I²C transfers were checked for errors on a TTGO T-Display, but not measured with a scope or a real sensor.
+* 3.4 and 3.5 are done in Phase 6, with `bytes`: multi-byte I²C, UART1 and SPI3.
+* PWM output and the I²C transfers were checked for errors on a TTGO T-Display, but not measured with a scope or a
+  real sensor. UART and SPI were checked with loopback wires (`scripts/bus_loopback.py`), not with real devices.
 
 ## Phase 4: Developer experience on the device
 
@@ -71,9 +70,10 @@ Phase 3 status:
 
 Phase 4 follow-ups found while building it:
 
-* `str()`, string concatenation and formatting (`text()` can't show a number yet), which need a small string pool.
-* Importing `.py` files as modules (only native Rust modules can be imported), and a `machine` module with `Pin` objects.
-* 🚧 A file system: done as a flat file system in a `vfs` partition (`src/flatfs.rs`, `tools/mpy.py ls/put/get/rm`). Still open: `open()` / `os` for scripts, so `mpremote cp`/`ls` and Thonny's file browser work.
+* ✅ `str()`, string concatenation and formatting (5.1, 5.5).
+* ✅ Importing `.py` files as modules (6.3). Still open: a `machine` module with `Pin` objects.
+* ✅ A file system: a flat file system in a `vfs` partition (`src/flatfs.rs`, `tools/mpy.py ls/put/get/rm`), with
+  `open()` / `os` for scripts (5.6), so `mpremote cp`/`ls` and Thonny's file browser work.
 * Raw-paste mode for faster uploads (plain raw mode works).
 
 ## Phase 5: Python features for Thonny (and for scripts)
@@ -103,7 +103,7 @@ Thonny reads and saves device files by running Python helper code on the board (
   (`set_stack_floor`): too deep raises `RecursionError` instead of crashing the board.
 
 Left for later (documented in the README): floats, sets, generators, `nonlocal`, operator methods (`__add__`,
-`__eq__`, ...), multiple inheritance, importing `.py` files, `bytearray`, step slices (`a[::2]`).
+`__eq__`, ...), multiple inheritance, `bytearray`, step slices (`a[::2]`). (Importing `.py` files: done in 6.3.)
 
 Found while building 5.1:
 
@@ -114,6 +114,35 @@ Found while building 5.1:
 
 **Later:** once loops and functions exist and profiling shows the evaluator is a bottleneck, add the
 bytecode compiler and VM, plus a `const` folding pass.
+
+## Phase 6: Buses and modules (unblocked by Phase 5)
+
+Phase 5's heap made `bytes` possible, which the bus APIs of Phase 3 were waiting for, and its file system made
+`import` of `.py` files possible.
+
+| # | Feature | Why | Status |
+|---|---------|-----|--------|
+| 6.1 | **Bytes through `HardwareBridge`**: `Arg::Bytes` arguments, functions that return bytes (`HwFn::returning_bytes`, `call_bytes`/`call_module_bytes`, up to `MAX_BRIDGE_BYTES` = 512), `bytes([1, 2])` / `bytes(iterable)`, `hex()`/`bin()`/`oct()` | Bus payloads in both directions, without allocations in the bridge (it writes into a heap buffer it's given) | ✅ |
+| 6.2 | **Firmware buses**: `i2c_scan()` (addresses as bytes), `i2c_write`, `i2c_read`, `i2c_write_read`; `uart_init/write/read/any` on UART1; `spi_init/write/transfer/read` on SPI3, on any allowed pins | 3.4 and 3.5: sensors, GPS modules, modems, displays | ✅ on a TTGO T-Display (loopback) |
+| 6.3 | **`import` of your own `.py` modules** from the file system: own globals per module, cached (`sys.modules`-like), `from m import f`, `m.x = v`, errors don't leave half-imported modules; source read into a fixed module memory (`with_module_memory`, 16 KB on the ESP32) | Splitting a project into files, libraries for sensors | ✅ |
+| 6.4 | Docs, `tests/cpython/modules.py`, board checks | | ✅ |
+
+**Phase 6 is done**, on the PC and on a TTGO T-Display:
+
+* UART: a TX-to-RX wire on GPIO25 returns what was sent at 115 200 and 9 600 baud; `uart_any()` counts what's
+  waiting, an empty read returns `b''` after the timeout. SPI: a MOSI-to-MISO wire on GPIO27 returns every byte,
+  also in a 512-byte transfer. I²C: without devices, `i2c_scan()` is `b''` and `i2c_read` raises `OSError`.
+  The flash pins (6–11) are refused. All in `micropython-esp32/scripts/bus_loopback.py`.
+* `tests/cpython/modules.py` (modules written to files, then imported) prints what CPython prints, on the PC and
+  on the board, like the ten other conformance scripts. Thonny 3.2.7 and 5.0 still pass against the board.
+* Found on the board: the REPL's 64 KB of buffers (plus the new 16 KB module memory) came out of the main stack,
+  because statics and the stack share the main data RAM. They moved to the ESP32's second data RAM region
+  (`dram2`, 96 KB the bootloader leaves free), so the stack got 80 KB back. `MAX_VARS` went from 64 to 128 (deep
+  method chains with `**kwargs` ran out of variable slots), and `MAX_NESTING` from 24 to 40, raising
+  `RecursionError` like the stack guard instead of `MemoryError`.
+
+Open after Phase 6: a `machine` module with `Pin`/`I2C`/`UART`/`SPI` objects (needs native classes), `bytearray`
+(in-place buffers), packages (`import a.b`), and testing against real sensors (an MPU6050 on I²C, a GPS on UART).
 
 ## Recommended order
 

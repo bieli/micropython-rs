@@ -62,6 +62,9 @@ const NAMES: &[&str] = &[
     "classmethod",
     "staticmethod",
     "super",
+    "hex",
+    "bin",
+    "oct",
 ];
 const FIRST_FUNCTION: u8 = 14;
 /// Types that can't be called (`NoneType()`, `function()`, `module()`).
@@ -139,6 +142,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
                 Kind::File => "TextIOWrapper",
                 Kind::BoundMethod => "builtin_function_or_method",
                 Kind::Class => "type",
+                Kind::PyModule => "module",
                 _ if false => "object",
                 _ => "range",
             },
@@ -186,6 +190,9 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
         name: &str,
     ) -> Result<Option<Value<'a>>, Error> {
         if let Some(found) = self.object_attr(obj, name) {
+            return Ok(found);
+        }
+        if let Some(found) = self.py_module_attr(obj, name) {
             return Ok(found);
         }
         if name == "__name__" {

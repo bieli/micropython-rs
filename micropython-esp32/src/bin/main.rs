@@ -92,6 +92,10 @@ impl HardwareBridge for GenericHardware<'_> {
         }
     }
 
+    fn call_bytes(&mut self, name: &str, args: &[Arg<'_>], out: &mut [u8]) -> Result<usize, Error> {
+        self.board.call_bytes(name, args, out)
+    }
+
     fn functions(&self) -> &[HwFn] {
         GENERIC_FNS
     }
@@ -250,6 +254,10 @@ impl HardwareBridge for TtgoHardware<'_, '_> {
             }
         }
         Ok(None)
+    }
+
+    fn call_bytes(&mut self, name: &str, args: &[Arg<'_>], out: &mut [u8]) -> Result<usize, Error> {
+        self.board.call_bytes(name, args, out)
     }
 
     fn functions(&self) -> &[HwFn] {

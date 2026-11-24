@@ -1,0 +1,11 @@
+100 ok high 2 [50, 150]
+2 pin 36 (limit 100) t_sensors
+main LIMIT is separate high
+ok pin 2 (limit 100) 3
+t_units loaded, __name__ = t_units
+3000 100000 True True
+high 10000
+module True False
+missing module: ImportError
+missing name: ImportError
+error while importing

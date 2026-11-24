@@ -1,5 +1,5 @@
 //! Hardware functions shared by every ESP32 board build:
-//! time, GPIO, ADC, PWM, I2C and the watchdog.
+//! time, GPIO, ADC, PWM, I2C, UART, SPI and the watchdog.
 //!
 //! Scripts address pins by number at runtime (`pin_write(2, 1)`), so pins
 //! are taken with `AnyPin::steal` and driven through `Flex`. Only pins in the
@@ -12,6 +12,11 @@ use esp_hal::{
     delay::Delay,
     gpio::{AnyPin, DriveMode, Flex, InputConfig, Level, OutputConfig, Pull},
     i2c::master::{Config as I2cConfig, I2c},
+    spi::{
+        master::{Config as SpiConfig, Spi},
+        Mode as SpiMode,
+    },
+    uart::{Config as UartConfig, Uart},
     ledc::{
         channel::{self, ChannelIFace},
         timer::{self, TimerIFace},
@@ -86,10 +91,21 @@ macro_rules! board_functions {
             micropython_rs::HwFn::new("pwm", "pin, freq, duty", "PWM output, duty in percent (0-100)"),
             micropython_rs::HwFn::new("pwm_stop", "pin", "Stop PWM on a pin"),
             micropython_rs::HwFn::new("i2c_probe", "addr", "True if a device answers at addr"),
-            micropython_rs::HwFn::new("i2c_scan", "", "Number of devices on the bus"),
+            micropython_rs::HwFn::new("i2c_scan", "", "Addresses of the devices on the bus (bytes)").returning_bytes(),
+            micropython_rs::HwFn::new("i2c_write", "addr, data", "Send bytes; returns how many"),
+            micropython_rs::HwFn::new("i2c_read", "addr, n", "Receive n bytes").returning_bytes(),
+            micropython_rs::HwFn::new("i2c_write_read", "addr, data, n", "Send, then receive n bytes (e.g. a register)").returning_bytes(),
             micropython_rs::HwFn::new("i2c_read_reg", "addr, reg", "Read one register byte"),
             micropython_rs::HwFn::new("i2c_read_reg16", "addr, reg", "Read a big-endian 16-bit register"),
             micropython_rs::HwFn::new("i2c_write_reg", "addr, reg, value", "Write one register byte"),
+            micropython_rs::HwFn::with_args("uart_init", 2, 3, "tx, rx, [baud]", "UART1 on these pins (default 115200 baud)"),
+            micropython_rs::HwFn::new("uart_write", "data", "Send bytes or a str; returns how many"),
+            micropython_rs::HwFn::with_args("uart_read", 0, 2, "[n], [timeout_ms]", "Up to n received bytes (default 64), waiting up to timeout_ms").returning_bytes(),
+            micropython_rs::HwFn::new("uart_any", "", "Number of received bytes waiting"),
+            micropython_rs::HwFn::with_args("spi_init", 3, 5, "sck, mosi, miso, [khz], [mode]", "SPI3 master (default 1000 kHz, mode 0); CS: any pin_write"),
+            micropython_rs::HwFn::new("spi_write", "data", "Send bytes"),
+            micropython_rs::HwFn::new("spi_transfer", "data", "Send bytes, return the bytes received meanwhile").returning_bytes(),
+            micropython_rs::HwFn::with_args("spi_read", 1, 2, "n, [fill]", "Receive n bytes (sending fill, default 0)").returning_bytes(),
             micropython_rs::HwFn::new("wdt_enable", "timeout_ms", "Reset the board unless fed in time"),
             micropython_rs::HwFn::new("wdt_feed", "", "Feed the watchdog"),
             micropython_rs::HwFn::new("wdt_disable", "", "Turn the watchdog off"),
@@ -152,6 +168,9 @@ pub struct Board<'d> {
     ledc: Ledc<'d>,
     pwm_pins: [Option<u8>; PWM_SLOTS],
     i2c: I2c<'d, Blocking>,
+    /// UART1 and SPI3, once a script has set them up (`uart_init`, `spi_init`).
+    uart: Option<Uart<'static, Blocking>>,
+    spi: Option<Spi<'static, Blocking>>,
     rtc: Rtc<'d>,
     wdt_enabled: bool,
 }
@@ -193,6 +212,8 @@ impl<'d> Board<'d> {
             ledc,
             pwm_pins: [None; PWM_SLOTS],
             i2c,
+            uart: None,
+            spi: None,
             rtc: Rtc::new(p.lpwr),
             wdt_enabled: false,
         }
@@ -236,9 +257,57 @@ impl<'d> Board<'d> {
                 .map(|()| None),
             "pwm_stop" => self.pwm_stop(pin_number(int(0)?)?).map(|()| None),
             "i2c_probe" => Ok(Some(self.i2c_probe(i2c_addr(int(0)?)?) as i64)),
-            "i2c_scan" => Ok(Some(
-                (0x08..0x78).filter(|&addr| self.i2c_probe(addr)).count() as i64,
-            )),
+            "i2c_write" => {
+                let data = args[1].bytes()?;
+                self.i2c
+                    .write(i2c_addr(int(0)?)?, data)
+                    .map_err(|_| Error::IoError)?;
+                Ok(Some(data.len() as i64))
+            }
+            "uart_init" => {
+                let baud = match args.get(2) {
+                    Some(b) => b.int()?,
+                    None => 115_200,
+                };
+                self.uart_init(pin_number(int(0)?)?, pin_number(int(1)?)?, baud)
+                    .map(|()| None)
+            }
+            "uart_write" => {
+                let uart = self.uart.as_mut().ok_or(Error::IoError)?;
+                let data = args[0].bytes()?;
+                let mut sent = 0;
+                while sent < data.len() {
+                    sent += uart.write(&data[sent..]).map_err(|_| Error::IoError)?;
+                }
+                uart.flush().map_err(|_| Error::IoError)?;
+                Ok(Some(data.len() as i64))
+            }
+            "uart_any" => {
+                self.uart.as_ref().ok_or(Error::IoError)?;
+                let waiting = esp_hal::peripherals::UART1::regs()
+                    .status()
+                    .read()
+                    .rxfifo_cnt()
+                    .bits();
+                Ok(Some(waiting as i64))
+            }
+            "spi_init" => {
+                let khz = match args.get(3) {
+                    Some(k) => k.int()?,
+                    None => 1000,
+                };
+                let mode = match args.get(4) {
+                    Some(m) => m.int()?,
+                    None => 0,
+                };
+                let pins = [pin_number(int(0)?)?, pin_number(int(1)?)?, pin_number(int(2)?)?];
+                self.spi_init(pins, khz, mode).map(|()| None)
+            }
+            "spi_write" => {
+                let spi = self.spi.as_mut().ok_or(Error::IoError)?;
+                spi.write(args[0].bytes()?).map_err(|_| Error::IoError)?;
+                Ok(None)
+            }
             "i2c_read_reg" => {
                 let mut buf = [0u8; 1];
                 self.i2c_read(int(0)?, int(1)?, &mut buf)?;
@@ -279,6 +348,139 @@ impl<'d> Board<'d> {
             "reset_cause" => Ok(Some(reset_cause())),
             _ => Err(Error::UnknownIdentifier),
         }
+    }
+
+    /// Board functions that return bytes (`i2c_read`, `uart_read`, ...):
+    /// they fill `out` and return how many bytes they have.
+    pub fn call_bytes(&mut self, name: &str, args: &[Arg<'_>], out: &mut [u8]) -> Result<usize, Error> {
+        let int = |i: usize| args[i].int();
+        let count = |n: i64| -> Result<usize, Error> {
+            usize::try_from(n)
+                .ok()
+                .filter(|&n| n <= out.len())
+                .ok_or(Error::ValueError)
+        };
+        match name {
+            "i2c_scan" => {
+                let mut n = 0;
+                for addr in 0x08..0x78 {
+                    if self.i2c_probe(addr) {
+                        out[n] = addr;
+                        n += 1;
+                    }
+                }
+                Ok(n)
+            }
+            "i2c_read" => {
+                let n = count(int(1)?)?;
+                self.i2c
+                    .read(i2c_addr(int(0)?)?, &mut out[..n])
+                    .map_err(|_| Error::IoError)?;
+                Ok(n)
+            }
+            "i2c_write_read" => {
+                let n = count(int(2)?)?;
+                self.i2c
+                    .write_read(i2c_addr(int(0)?)?, args[1].bytes()?, &mut out[..n])
+                    .map_err(|_| Error::IoError)?;
+                Ok(n)
+            }
+            "uart_read" => {
+                let n = count(args.first().map_or(Ok(64), |a| a.int())?)?;
+                let timeout = args.get(1).map_or(Ok(0), |a| a.int())?;
+                let deadline = now_ms() + non_negative(timeout)? as u64;
+                let uart = self.uart.as_mut().ok_or(Error::IoError)?;
+                let mut got = 0;
+                loop {
+                    got += uart.read_buffered(&mut out[got..n]).map_err(|_| Error::IoError)?;
+                    if got == n || now_ms() >= deadline {
+                        return Ok(got);
+                    }
+                    if crate::ABORT.load(core::sync::atomic::Ordering::Relaxed) {
+                        return Err(Error::Interrupted);
+                    }
+                }
+            }
+            "spi_transfer" => {
+                let data = args[0].bytes()?;
+                let n = count(data.len() as i64)?;
+                out[..n].copy_from_slice(data);
+                let spi = self.spi.as_mut().ok_or(Error::IoError)?;
+                spi.transfer(&mut out[..n]).map_err(|_| Error::IoError)?;
+                Ok(n)
+            }
+            "spi_read" => {
+                let n = count(int(0)?)?;
+                let fill = match args.get(1) {
+                    Some(f) => byte(f.int()?)?,
+                    None => 0,
+                };
+                out[..n].fill(fill);
+                let spi = self.spi.as_mut().ok_or(Error::IoError)?;
+                spi.transfer(&mut out[..n]).map_err(|_| Error::IoError)?;
+                Ok(n)
+            }
+            _ => Err(Error::UnknownIdentifier),
+        }
+    }
+
+    /// Takes a pin for a peripheral (UART, SPI): it must be in the
+    /// allowlist, and it's no longer a plain GPIO or PWM output.
+    fn take_pin(&mut self, pin: u8) -> Result<AnyPin<'static>, Error> {
+        self.check_allowed(pin)?;
+        self.pins[pin as usize] = None;
+        if self.pwm_pins.contains(&Some(pin)) {
+            self.pwm_stop(pin)?;
+        }
+        // SAFETY: the pin is in the allowlist (not used by the firmware) and
+        // dropped from the GPIO table above, like the other pin functions do
+        Ok(unsafe { AnyPin::steal(pin) })
+    }
+
+    /// `uart_init(tx, rx, baud)`: UART1 on any two allowed pins (the same
+    /// pin for both is a loopback: the UART receives what it sends).
+    fn uart_init(&mut self, tx: u8, rx: u8, baud: i64) -> Result<(), Error> {
+        let baud = u32::try_from(baud).ok().filter(|b| (300..=5_000_000).contains(b));
+        let baud = baud.ok_or(Error::ValueError)?;
+        self.uart = None; // the old driver goes first: only one at a time
+        let (tx, rx) = (self.take_pin(tx)?, self.take_pin(rx)?);
+        // SAFETY: the previous UART1 driver was dropped just above, so this
+        // is the only one
+        let uart1 = unsafe { esp_hal::peripherals::UART1::steal() };
+        let uart = Uart::new(uart1, UartConfig::default().with_baudrate(baud))
+            .map_err(|_| Error::ValueError)?
+            .with_tx(tx)
+            .with_rx(rx);
+        self.uart = Some(uart);
+        Ok(())
+    }
+
+    /// `spi_init(sck, mosi, miso, khz, mode)`: SPI3 as master (SPI2 drives
+    /// the TTGO's display). Chip select is up to the script (`pin_write`).
+    fn spi_init(&mut self, [sck, mosi, miso]: [u8; 3], khz: i64, mode: i64) -> Result<(), Error> {
+        let khz = u32::try_from(khz).ok().filter(|k| (10..=40_000).contains(k));
+        let khz = khz.ok_or(Error::ValueError)?;
+        let mode = match mode {
+            0 => SpiMode::_0,
+            1 => SpiMode::_1,
+            2 => SpiMode::_2,
+            3 => SpiMode::_3,
+            _ => return Err(Error::ValueError),
+        };
+        self.spi = None;
+        let (sck, mosi, miso) = (self.take_pin(sck)?, self.take_pin(mosi)?, self.take_pin(miso)?);
+        // SAFETY: the previous SPI3 driver was dropped just above
+        let spi3 = unsafe { esp_hal::peripherals::SPI3::steal() };
+        let config = SpiConfig::default()
+            .with_frequency(Rate::from_khz(khz))
+            .with_mode(mode);
+        let spi = Spi::new(spi3, config)
+            .map_err(|_| Error::ValueError)?
+            .with_sck(sck)
+            .with_mosi(mosi)
+            .with_miso(miso);
+        self.spi = Some(spi);
+        Ok(())
     }
 
     /// Runs a function of a module from `board.rs` (`time`).

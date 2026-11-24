@@ -1535,12 +1535,7 @@ impl<'a> Parser<'a> {
     fn parse_atom(&mut self, code: &mut Code<'a>) -> Result<(), Error> {
         let item = match self.current {
             Token::Int(n) => Item::Int(n),
-            Token::Str(s) => Item::Str(s),
-            Token::Bytes(s) => Item::Bytes(s),
-            Token::FStr(s) => {
-                self.parse_fstring(s, code)?;
-                return self.advance();
-            }
+            Token::Str(_) | Token::Bytes(_) | Token::FStr(_) => return self.parse_strings(code),
             Token::True => Item::Bool(true),
             Token::False => Item::Bool(false),
             Token::None => Item::None,
@@ -1558,6 +1553,26 @@ impl<'a> Parser<'a> {
         };
         self.advance()?;
         code.push(item)
+    }
+
+    /// String literals, and adjacent ones joined (`'abc' "def"`, also over
+    /// lines inside brackets): each is emitted as usual (zero-copy, with its
+    /// own escapes), followed by an addition.
+    fn parse_strings(&mut self, code: &mut Code<'a>) -> Result<(), Error> {
+        let mut first = true;
+        loop {
+            match self.current {
+                Token::Str(s) => code.push(Item::Str(s))?,
+                Token::Bytes(s) => code.push(Item::Bytes(s))?,
+                Token::FStr(s) => self.parse_fstring(s, code)?,
+                _ => return Ok(()),
+            }
+            self.advance()?;
+            if !first {
+                code.push(Item::Bin(BinOp::Add))?;
+            }
+            first = false;
+        }
     }
 
     /// call := IDENT '(' [expr (',' expr)* [',']] ')'

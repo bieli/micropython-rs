@@ -34,15 +34,36 @@ pub const ARENA_SIZE: usize = 32 * 1024;
 /// Interpreter heap for objects created at runtime (strings built by scripts).
 pub const HEAP_SIZE: usize = 32 * 1024;
 
-/// Both buffers are static memory rather than locals, so they don't take
-/// 64 KB of the main task's stack.
-// `ConstStaticCell`: the zeroed arrays are in .bss from the start. (With
-// `StaticCell::init([0; N])` they were built on the stack first: 64 KB of
-// the 118 KB stack, gone for good.)
-static ARENA_MEMORY: static_cell::ConstStaticCell<[u8; ARENA_SIZE]> =
-    static_cell::ConstStaticCell::new([0; ARENA_SIZE]);
-static HEAP_MEMORY: static_cell::ConstStaticCell<[u8; HEAP_SIZE]> =
-    static_cell::ConstStaticCell::new([0; HEAP_SIZE]);
+/// Source text of the `.py` modules scripts import (`import sensors` reads
+/// `sensors.py` from flash into it); emptied by every soft reset.
+pub const MODULE_MEMORY_SIZE: usize = 16 * 1024;
+
+/// The REPL's big buffers (80 KB). They live in the ESP32's second data RAM
+/// region (`dram2`, 96 KB the bootloader leaves free), not in the main data
+/// RAM: there, they would come out of the stack, which takes all the main
+/// data RAM that statics leave.
+struct Buffers {
+    arena: [u8; ARENA_SIZE],
+    heap: [u8; HEAP_SIZE],
+    modules: [u8; MODULE_MEMORY_SIZE],
+}
+
+#[link_section = ".dram2_uninit"]
+static mut BUFFERS: core::mem::MaybeUninit<Buffers> = core::mem::MaybeUninit::uninit();
+
+/// The buffers, zeroed; can be taken only once.
+fn take_buffers() -> &'static mut Buffers {
+    static TAKEN: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+    assert!(!TAKEN.swap(true, Ordering::Relaxed), "REPL buffers taken twice");
+    // SAFETY: this is the only reference to BUFFERS (taken once, checked
+    // above), and the memory is zeroed in place before it's used as arrays
+    // of bytes (zeroed in place: building `[0; N]` would use the stack)
+    unsafe {
+        let buffers = core::ptr::addr_of_mut!(BUFFERS);
+        core::ptr::write_bytes(buffers, 0, 1);
+        (*buffers).assume_init_mut()
+    }
+}
 
 const CTRL_A: u8 = 0x01;
 const CTRL_B: u8 = 0x02;
@@ -87,8 +108,11 @@ pub fn run<O: Output, H: HardwareBridge>(
     boot: &BootScript,
     files: Option<&RefCell<Files>>,
 ) -> ! {
-    let memory = ARENA_MEMORY.take();
-    let heap = HEAP_MEMORY.take();
+    let Buffers {
+        arena: memory,
+        heap,
+        modules: module_memory,
+    } = take_buffers();
     let mut mode = Mode::Normal;
     let mut run_boot_script = true;
 
@@ -101,6 +125,7 @@ pub fn run<O: Output, H: HardwareBridge>(
         // Scripts get the flash files too: `open()` and the `os` module
         if let Some(files) = files {
             repl.vm.set_files(files);
+            repl.vm.set_module_memory(&mut module_memory[..]);
         }
         repl.vm.set_abort_flag(&ABORT);
         // Deep recursion raises RecursionError instead of overflowing the stack

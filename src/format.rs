@@ -602,6 +602,19 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
         }
     }
 
+    /// `hex(n)`, `bin(n)`, `oct(n)`: `0xff`, `0b101`, `0o17` (`-0x1` for -1).
+    pub(super) fn int_text(&mut self, v: Value<'a>, ty: char) -> Result<Value<'a>, Error> {
+        if v.as_int().is_none() {
+            return Err(Error::TypeError);
+        }
+        let spec = Spec {
+            alt: true,
+            ty,
+            ..Spec::default()
+        };
+        self.format_one(v, '\0', &spec, 0)
+    }
+
     /// `format(value, spec)`.
     #[inline(never)]
     pub(super) fn format_builtin(

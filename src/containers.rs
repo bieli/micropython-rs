@@ -223,6 +223,12 @@ pub(crate) fn render(
                 });
                 return;
             }
+            if kind == Kind::PyModule {
+                sink("<module '");
+                render(view, modules, slot(view, r, 0), false, depth + 1, sink);
+                sink("'>");
+                return;
+            }
             if kind == Kind::BoundMethod {
                 sink("<bound method ");
                 render(view, modules, slot(view, r, 1), false, depth + 1, sink);
@@ -494,7 +500,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
         result
     }
 
-    fn dict_remove(&mut self, r: ObjRef, i: usize) {
+    pub(super) fn dict_remove(&mut self, r: ObjRef, i: usize) {
         let n = self.count(r);
         let from = HEADER + (i + 1) * 2 * SLOT;
         let to = HEADER + n * 2 * SLOT;
@@ -1362,6 +1368,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
                     self.func_marks |= bit;
                     if let Some(f) = self.funcs[i as usize] {
                         self.mark_value(f.defaults, work, n);
+                        self.mark_value(f.module, work, n);
                     }
                 }
                 return;

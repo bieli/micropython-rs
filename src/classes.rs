@@ -194,6 +194,8 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
             self.slot(inst, I_DICT)
         } else if let Some(class) = self.as_class(obj) {
             self.slot(class, C_DICT)
+        } else if let Some(module) = self.module_dict(obj) {
+            Value::Obj(module) // `sensors.LIMIT = 10`
         } else {
             return Err(Error::AttributeError);
         };

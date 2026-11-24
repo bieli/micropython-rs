@@ -62,6 +62,8 @@ pub enum Kind {
     /// A function made inside a function: `(function, dict of the values
     /// of the enclosing function's variables when it was made)`.
     Closure,
+    /// An imported `.py` module: `(name, dict)`.
+    PyModule,
 }
 
 impl Kind {
@@ -81,6 +83,7 @@ impl Kind {
                 | Kind::StaticMethod
                 | Kind::Super
                 | Kind::Closure
+                | Kind::PyModule
         )
     }
 }

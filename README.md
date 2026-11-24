@@ -79,22 +79,22 @@ flags |= 1 << 3                   # bitwise & | ^ ~ << >> and augmented assignme
 | Values | `int` (64-bit), `str`, `bytes`, `bool` (`True`/`False`), `None`, `list`, `tuple`, `dict`, `range` |
 | Containers | `[1, 2]`, `(1, 2)`, `{'k': v}`, `x[i]`, `x[a:b]`, `x[k] = v`, `del x[k]`, `+`, `*`, `in`, `==`/`<`, comprehensions `[f(x) for x in it if c]` / `{k: v for ...}`, list methods `append extend insert pop remove index count clear reverse sort copy`, dict methods `get pop setdefault update keys values items clear copy` |
 | Strings | Escapes (`'\n'`, `'\x41'`, `'\u263a'`), `+`, `*`, `len()`, `s[i]`, `s[a:b]`, `in` / `not in`, `str()`, `repr()`, `int(s, base)`, `ord()`, `chr()`, `s.encode()`, and methods `upper lower strip lstrip rstrip startswith endswith find count replace split join isdigit isalpha isalnum isspace isupper islower` |
-| Bytes | `b'...'` literals with escapes, `bytes()`, `bytes(n)`, `bytes(s, 'utf-8')`, `+`, `*`, `len()`, `b[i]` (an `int`), `b[a:b]`, `in`, `==`/`<`, `hex()`, `decode()`, `startswith endswith find` |
+| Bytes | `b'...'` literals with escapes, `bytes()`, `bytes(n)`, `bytes(s, 'utf-8')`, `bytes([1, 2])` (any iterable of 0–255), `+`, `*`, `len()`, `b[i]` (an `int`), `b[a:b]`, `in`, `==`/`<`, `hex()`, `decode()`, `startswith endswith find` |
 | Modules | built in: `binascii` (`hexlify`, `unhexlify`), `os` (files), `sys` (`path`, `version`, `platform`, `exit()`, ...), `builtins`; plus the native modules of the firmware (e.g. `display`) |
-| Literals | `42`, `1_000`, `0x1F`, `0o17`, `0b1010`, `'single'`, `"double"`, `'''triple'''`; lines join inside brackets and after `\` |
+| Literals | `42`, `1_000`, `0x1F`, `0o17`, `0b1010`, `'single'`, `"double"`, `'''triple'''`, adjacent strings joined (`'ab' 'cd'`); lines join inside brackets and after `\` |
 | Operators | `+ - * / // % **`, `& \| ^ ~ << >>`, `== != < <= > >=` (chainable), `in`, `not in`, `is`, `is not`, `and or not`, `a if c else b` |
 | Assignment | `x = ...`, `a, b = b, a`, `(a, b) = ...`, `a = b = 0`, `x[k] = v`, `+= -= *= /= //= %= **= &= \|= ^= <<= >>=` (also `x[k] += v`), `del a, b`, `del x[k]` |
 | Statements | `if`/`elif`/`else`, `while`, `for x in ...` (also `for k, v in d.items()`), `break`, `continue`, `pass`, `def`, `return`; `;` between statements (`x = 1; y = 2`) |
 | Exceptions | `try`/`except`/`else`/`finally`, `except (A, B) as e`, `raise`, `raise X('msg')`, bare `raise`, `assert`; built-in classes such as `ValueError`, `KeyError`, `OSError`, `Exception` with CPython's hierarchy; `e.args`, `e.errno` |
 | Functions | `def f(a, b=1, *args, **kwargs):`, keyword arguments `f(1, b=2)`, unpacking `f(*items, **options)`, `lambda x: x * 2`, functions as values (`key=len`, `handlers['up']()`), closures and decorators (`@logged`) |
 | Classes | `class Dog(Animal):` with `__init__`, attributes (`self.x = v`, `self.n += 1`), methods, class attributes, `@classmethod`, `@staticmethod`, `super()`, `__str__`/`__repr__`, `__enter__`/`__exit__` (`with`), `isinstance`/`type`, your own exception classes (`class SensorError(OSError)`) |
-| Calls | `print(..., sep=, end=)`, `abs`, `min`, `max`, `bool`, `len`, `list`, `tuple`, `dict`, `range`, `sorted(key=, reverse=)`, `reversed`, `sum`, `any`, `all`, `enumerate`, `zip`, `format`, `isinstance`, `type`, `hasattr`, `getattr`, `callable`, `id`, `dir`, `globals()`, your own `def` functions, and hardware functions from `HardwareBridge` |
+| Calls | `print(..., sep=, end=)`, `abs`, `min`, `max`, `bool`, `len`, `list`, `tuple`, `dict`, `range`, `sorted(key=, reverse=)`, `reversed`, `sum`, `any`, `all`, `enumerate`, `zip`, `format`, `isinstance`, `type`, `hasattr`, `getattr`, `callable`, `hex`, `bin`, `oct`, `id`, `dir`, `globals()`, your own `def` functions, and hardware functions from `HardwareBridge` |
 | Formatting | `'%5d mV' % v`, `'%s=%r' % (k, v)`, `'{:>8}'.format(s)`, `'{name}'.format(name=x)`, f-strings `f'{v:04x}'`, with fill, alignment, sign, width, `,` separators and `d x X o b c s r f %` |
 | Scope | `global a, b` in a function, to assign globals (also creates them) |
-| Modules | `import m`, `import m as x, n`, `from m import f, C as K`; `m.f(...)`, `m.CONST` for native modules written in Rust |
+| Modules | `import m`, `import m as x, n`, `from m import f, C as K`; `m.f(...)`, `m.CONST`, for native modules written in Rust and for your own `m.py` files ([Your own modules](#your-own-modules-py-files)) |
 
 Not supported yet: floats, sets, generators (`yield`), `nonlocal`, operator methods on classes (`__add__`, `__eq__`,
-`__len__`, ...), multiple inheritance, importing `.py` files.
+`__len__`, ...), multiple inheritance, packages (`import a.b`).
 See [ROADMAP.md](ROADMAP.md) for what's planned.
 
 ### Arithmetic operators
@@ -222,15 +222,15 @@ Limits (in `src/interpreter.rs`):
 
 | Constant | Value | Meaning | Error |
 |----------|-------|---------|-------|
-| `MAX_VARS` | 64 | Variables: globals plus the locals of all active calls | `OutOfMemory` |
+| `MAX_VARS` | 128 | Variables: globals plus the locals of all active calls | `OutOfMemory` |
 | `MAX_FUNCS` | 32 | `def` functions, methods and lambdas | `OutOfMemory` |
 | `MAX_GLOBAL_DECLS` | 16 | Names declared `global` by all active calls together | `OutOfMemory` |
 | `MAX_CALL_DEPTH` | 8 | Nested function calls, recursion included | `RecursionLimit` |
-| `MAX_NESTING` | 24 | Nested blocks (`if`/`while`/function bodies) running at once | `OutOfMemory` |
+| `MAX_NESTING` | 40 | Nested blocks (`if`/`while`/function bodies) running at once | `RecursionLimit` |
 
 Native stack use grows with each nested call (an RPN buffer and value stack per call), which is why
-`MAX_CALL_DEPTH` is small. On a 64-bit host the `Interpreter` struct is about 19 KB (including the 128-value stack,
-the 256-entry object table of the heap and the 32-slot function table); on 32-bit MCUs it's about two thirds of that.
+`MAX_CALL_DEPTH` is small. On a 64-bit host the `Interpreter` struct is about 22 KB (including the 128 variable
+slots, the 128-value stack, the 256-entry object table of the heap and the 32-slot function table); on 32-bit MCUs it's about two thirds of that.
 
 ### Strings
 
@@ -262,7 +262,7 @@ print(binascii.unhexlify('48656c6c6f').decode(), binascii.hexlify(b'OK'))   # He
 `print()`, `str()` and `repr()` of bytes all give the `b'...'` literal, like Python. Bytes and strings never mix:
 `b'a' + 'a'` raises `Error::TypeError` and `b'a' == 'a'` is `False`. Invalid hex digits and undecodable UTF-8 raise
 `Error::ValueError` (CPython raises `binascii.Error` and `UnicodeDecodeError`, both subclasses of `ValueError`).
-Not supported yet: `bytearray`, `bytes([1, 2])`, and the text methods (`upper`, `split`...) on bytes.
+Not supported yet: `bytearray`, and the text methods (`upper`, `split`...) on bytes.
 
 ### Exceptions
 
@@ -489,7 +489,8 @@ Hardware functions come from a `HardwareBridge`. All its methods have defaults, 
 | Method | Purpose |
 |--------|---------|
 | `call(name, &[i64])` | Integer-only functions: the simplest option |
-| `call_args(name, &[Arg])` | Functions that also take strings (`Arg::Int` / `Arg::Str`). The default converts to integers and calls `call` |
+| `call_args(name, &[Arg])` | Functions that also take strings or bytes (`Arg::Int` / `Arg::Str` / `Arg::Bytes`; `arg.bytes()` accepts both). The default converts to integers and calls `call` |
+| `call_bytes(name, &[Arg], out: &mut [u8]) -> usize` | Functions that **return bytes** (marked `.returning_bytes()` in the table): write into `out` (up to `MAX_BRIDGE_BYTES` = 512, less when the heap is fuller) and return the length. The script gets a `bytes` object. `call_module_bytes` is the same for modules |
 | `functions() -> &[HwFn]` | Function table. When it's not empty, unknown names and wrong argument counts are rejected before your code runs, and `help()` lists the entries |
 | `constants() -> &[(&str, i64)]` | Named constants scripts can read, such as `OUT` or `LED`. Variables with the same name take precedence |
 
@@ -521,6 +522,29 @@ impl HardwareBridge for MyBoard {
 
 Return `Error::ValueError` for bad values (a pin that doesn't exist) and `Error::IoError` when the hardware fails
 (an I2C device that doesn't answer).
+
+```rust
+const BUS: &[HwFn] = &[
+    HwFn::with_args("bus_write", 2, 2, "addr, data", "Send bytes"),
+    HwFn::with_args("bus_read", 2, 2, "addr, n", "Read n bytes").returning_bytes(),
+];
+
+impl HardwareBridge for MyBus {
+    fn call_args(&mut self, name: &str, args: &[Arg<'_>]) -> Result<Option<i64>, Error> {
+        match name {
+            "bus_write" => { let data: &[u8] = args[1].bytes()?; /* send(args[0].int()?, data) */ Ok(Some(data.len() as i64)) }
+            _ => Err(Error::UnknownIdentifier),
+        }
+    }
+    fn call_bytes(&mut self, name: &str, args: &[Arg<'_>], out: &mut [u8]) -> Result<usize, Error> {
+        match name {
+            "bus_read" => { let n = (args[1].int()? as usize).min(out.len()); /* receive(&mut out[..n]) */ Ok(n) }
+            _ => Err(Error::UnknownIdentifier),
+        }
+    }
+    fn functions(&self) -> &[HwFn] { BUS }
+}
+```
 
 ### Native modules (`import`)
 
@@ -568,6 +592,35 @@ help(led)                   # lists the module's functions and constants
 * Modules and their functions are values: `f = led.on; f()` works, and `help()` lists the modules a bridge offers.
 * In the RPN code, `led.blink(3)` becomes `[Ident(led), Int(3), CallAttr { blink, 1 }]`: the module is an ordinary
   value on the stack, so every item still holds at most one string (24 bytes per item).
+
+### Your own modules (`.py` files)
+
+When no native module has the name, `import sensors` runs `sensors.py` from the file system (`with_files`), like
+MicroPython. Give the interpreter memory for module source code with `with_module_memory(&mut buf)`: the text is read
+there once and stays (variables and functions point into it), so the buffer only fills up; the ESP32 firmware has 16 KB
+and empties it at every soft reset.
+
+```python
+# sensors.py
+LIMIT = 100
+count = 0
+def record(value):
+    global count          # the module's `count`, not the main script's
+    count += 1
+    return 'high' if value > LIMIT else 'ok'
+```
+
+```python
+import sensors
+from sensors import record
+print(record(150), sensors.count, sensors)   # high 1 <module 'sensors'>
+sensors.LIMIT = 200                          # module attributes can be changed
+```
+
+* Each module has its own globals (a dict): its functions and classes see the module's names, not the main script's.
+* A module runs once: later imports (also from other modules) give the same object.
+* A missing file raises `ImportError`; a module that doesn't fit in the module memory raises `MemoryError`. An
+  error while the module runs propagates, and the module isn't kept, so a fixed file can be imported again.
 
 ### Building a REPL
 
@@ -854,7 +907,8 @@ terminal against it on a PC without a board.
 | [`scripts/blink.py`](micropython-esp32/scripts/blink.py) | `pin_mode`, `pin_toggle`, `sleep_ms` |
 | [`scripts/button.py`](micropython-esp32/scripts/button.py) | Counting button presses with a pull-up and debouncing, timed with `ticks_ms` |
 | [`scripts/pwm_fade.py`](micropython-esp32/scripts/pwm_fade.py) | Fading an LED, and a 50 Hz servo pulse |
-| [`scripts/i2c_scan.py`](micropython-esp32/scripts/i2c_scan.py) | Scanning the I²C bus and reading a register |
+| [`scripts/i2c_scan.py`](micropython-esp32/scripts/i2c_scan.py) | Scanning the I²C bus, and reading registers with `i2c_write_read` |
+| [`scripts/bus_loopback.py`](micropython-esp32/scripts/bus_loopback.py) | UART and SPI checked with one jumper wire each (TX to RX, MOSI to MISO) |
 | [`scripts/adc.py`](micropython-esp32/scripts/adc.py) | Averaging ADC samples and converting them to millivolts |
 | [`scripts/tft_clock.py`](micropython-esp32/scripts/tft_clock.py) | An uptime clock drawn with `text()` (TTGO only) |
 | [`scripts/display_demo.py`](micropython-esp32/scripts/display_demo.py) | `import display`: lines, rectangles, circles, triangles, pixels and text, with timings (TTGO only) |
@@ -948,7 +1002,7 @@ ADC2, so ADC1 readings (GPIO32–39) came out mirrored (`4095 - value`; an uncon
 
 ### Hardware API
 
-The names follow MicroPython's `time` and `machine` modules, as flat functions (there's no `import` or `Pin` object yet).
+The names follow MicroPython's `time` and `machine` modules, as flat functions (there's no `machine` module or `Pin` object yet).
 Pins are plain GPIO numbers.
 
 | Area | Functions | Notes |
@@ -957,7 +1011,9 @@ Pins are plain GPIO numbers.
 | GPIO | `pin_mode(pin, mode)`, `pin_write(pin, value)`, `pin_read(pin)`, `pin_toggle(pin)` | Modes: `OUT`, `IN`, `IN_PULLUP`, `IN_PULLDOWN`. `pin_write` on an unconfigured pin makes it an output; `pin_read` on one makes it an input. Outputs read back their own level |
 | ADC | `adc_read(pin)`, `adc_mv(pin, [samples])`, `adc_vref()` | `adc_read`: raw 12-bit value (0–4095, 11 dB attenuation) on GPIO34, 36 and 39. `adc_mv`: millivolts, averaged over `samples` readings (default 16), calibrated with the chip's eFuse reference voltage (`adc_vref()`, e.g. 1135 mV). See [ADC accuracy](#adc-accuracy) |
 | PWM | `pwm(pin, freq, duty)`, `pwm_stop(pin)` | `duty` in percent (0–100). Up to 4 pins at once, each with its own frequency (LEDC timers 0–3). The duty resolution adapts to the frequency (14 bits at 50 Hz for servos). `pwm_stop` leaves the pin as a low output |
-| I²C | `i2c_probe(addr)`, `i2c_scan()`, `i2c_read_reg(addr, reg)`, `i2c_read_reg16(addr, reg)`, `i2c_write_reg(addr, reg, value)` | 100 kHz on SDA = GPIO21, SCL = GPIO22. `i2c_scan()` returns the number of devices; loop over `i2c_probe` to list addresses. 16-bit reads are big-endian. A device that doesn't answer raises `IoError` |
+| I²C | `i2c_scan()`, `i2c_write(addr, data)`, `i2c_read(addr, n)`, `i2c_write_read(addr, data, n)`, `i2c_probe(addr)`, `i2c_read_reg(addr, reg)`, `i2c_read_reg16(addr, reg)`, `i2c_write_reg(addr, reg, value)` | 100 kHz on SDA = GPIO21, SCL = GPIO22. `i2c_scan()` returns the addresses as `bytes` (`for a in i2c_scan(): print(hex(a))`). `data` is `bytes` (or a `str`); reads return `bytes`, up to 512 at a time. `i2c_write_read` writes (e.g. a register number) and reads back without a stop in between. 16-bit reads are big-endian. A device that doesn't answer raises `OSError` |
+| UART | `uart_init(tx, rx, [baud])`, `uart_write(data)`, `uart_read([n], [timeout_ms])`, `uart_any()` | UART1 on any two allowed pins, default 115 200 baud (300 to 5 000 000). `uart_write` returns the bytes sent; `uart_read` waits until `n` bytes (default 512) or `timeout_ms` (default 100) and returns what came, possibly `b''`; `uart_any()` counts the bytes waiting. Ctrl-C stops a wait. `uart_init` again changes pins or speed |
+| SPI | `spi_init(sck, mosi, miso, [khz], [mode])`, `spi_write(data)`, `spi_transfer(data)`, `spi_read(n, [fill])` | SPI3 master, default 1000 kHz (10 to 40 000) and mode 0 (0–3). Chip select is yours: a GPIO with `pin_write`. `spi_transfer` returns the bytes read while sending; `spi_read` sends `fill` (default 0) |
 | Watchdog | `wdt_enable(timeout_ms)`, `wdt_feed()`, `wdt_disable()` | The RTC watchdog resets the whole board when it isn't fed in time. `sleep_ms` feeds it automatically every 100 ms |
 | System | `reset()`, `reset_cause()` | `reset_cause()` returns `PWRON_RESET`, `HARD_RESET`, `WDT_RESET`, `DEEPSLEEP_RESET` or `SOFT_RESET` (MicroPython's values). The firmware also prints the reset reason at boot |
 | Battery (`tft` only) | `battery_mv([samples])` | Battery voltage in mV: switches on the TTGO's divider (`ADC_EN`, GPIO14), reads GPIO34, doubles it, switches the divider off |
@@ -1293,6 +1349,8 @@ help() lists functions. Ctrl-C stops a script, Ctrl-D soft resets, Ctrl-E pastes
 - [x] `import` of native modules written in Rust: `time` and a `display` drawing module (pixels, lines, shapes, text)
 - [x] `global` statement, `abs`/`min`/`max`; `buttons` module and a two-button calculator app on the TTGO
 - [x] Calibrated ADC readings (`adc_mv`, eFuse Vref), `battery_mv()`, and a voltmeter app with a live graph
+- [x] Strings, bytes, containers, exceptions, classes, closures, files and `os`: Thonny 3.2.7–5.0 and mpremote work
+- [x] Multi-byte I²C, UART and SPI with `bytes`; importing your own `.py` modules
 - [ ] Compact Bytecode Compiler & Stack VM
 
 

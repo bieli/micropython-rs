@@ -32,6 +32,8 @@ mod exceptions;
 mod files;
 #[path = "format.rs"]
 mod format;
+#[path = "modules.rs"]
+mod modules;
 #[path = "strings.rs"]
 mod strings;
 
@@ -47,7 +49,7 @@ use crate::heap::{Heap, Kind, ObjRef};
 use crate::{Arg, Error, FileSystem, HardwareBridge, Module, NoHardware, Output};
 
 /// Variable slots, shared by globals and the locals of active function calls.
-pub const MAX_VARS: usize = 64;
+pub const MAX_VARS: usize = 128;
 /// Number of `def` functions that can exist at the same time.
 pub const MAX_FUNCS: usize = 32;
 /// Maximum depth of nested user function calls (recursion included).
@@ -55,7 +57,7 @@ pub const MAX_CALL_DEPTH: usize = 8;
 /// `global` names declared by all active function calls together.
 pub const MAX_GLOBAL_DECLS: usize = 16;
 /// Maximum nesting of blocks (`if`/`while`/function bodies) being run at once.
-pub const MAX_NESTING: usize = 24;
+pub const MAX_NESTING: usize = 40;
 /// Values in flight: the operands of every expression being evaluated,
 /// including those of the calling functions. They are roots for the garbage
 /// collector, which is why there is one shared stack instead of one per call.
@@ -142,6 +144,9 @@ struct FuncDef<'a> {
     method: bool,
     /// `STAR_ARGS` / `STAR_KWARGS`: the last parameters collect extra arguments.
     star: u8,
+    /// The dict of the `.py` module the function is defined in (its global
+    /// names), or `None` for the main script.
+    module: Value<'a>,
 }
 
 impl FuncDef<'_> {
@@ -215,6 +220,14 @@ pub struct Interpreter<'a, O: Output, H: HardwareBridge = NoHardware> {
     func_marks: u32,
     /// Lowest native stack address scripts may reach (`set_stack_floor`).
     stack_floor: usize,
+    /// Memory for the source of imported `.py` modules (`with_module_memory`).
+    module_memory: Option<&'a mut [u8]>,
+    /// Imported `.py` modules by name (a dict), like `sys.modules`.
+    py_modules: Value<'a>,
+    /// The dict of the module whose code runs (`None`: the main script), and
+    /// whether that's its top level (not inside a function or class body).
+    module_env: Value<'a>,
+    module_top: bool,
 }
 
 /// The address of a local variable: how deep the native stack is right now.
@@ -266,6 +279,10 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
             next_env: Value::None,
             func_marks: 0,
             stack_floor: 0,
+            module_memory: None,
+            py_modules: Value::None,
+            module_env: Value::None,
+            module_top: false,
         }
     }
 
@@ -283,6 +300,20 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
     pub fn with_files(mut self, files: &'a RefCell<dyn FileSystem + 'a>) -> Self {
         self.files = Some(files);
         self
+    }
+
+    /// Memory for the source of `.py` modules that scripts import from the
+    /// file system (`import sensors` reads `sensors.py`). Each module stays
+    /// there until the interpreter is dropped; without it, only native
+    /// modules can be imported.
+    pub fn with_module_memory(mut self, memory: &'a mut [u8]) -> Self {
+        self.module_memory = Some(memory);
+        self
+    }
+
+    /// Like `with_module_memory`, on an interpreter that already exists.
+    pub fn set_module_memory(&mut self, memory: &'a mut [u8]) {
+        self.module_memory = Some(memory);
     }
 
     /// Like `with_files`, on an interpreter that already exists.
@@ -499,8 +530,9 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
         code: &mut Code<'a>,
     ) -> Result<Flow<'a>, Error> {
         if self.nesting >= MAX_NESTING {
+            // Too deep (through calls, e.g. recursion): like Python, a RecursionError
             self.note_error(parser.line());
-            return Err(Error::OutOfMemory);
+            return Err(Error::RecursionLimit);
         }
         if let Err(err) = self.check_stack() {
             self.note_error(parser.line());
@@ -763,8 +795,12 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
             Stmt::Import { names, count } => {
                 if run {
                     for &(module, bound) in &names[..count] {
-                        let index = self.find_module(module).ok_or(Error::ImportError)?;
-                        self.set_var(bound, Value::Module(index))?;
+                        // A native module, or `module.py` from the file system
+                        let value = match self.find_module(module) {
+                            Some(index) => Value::Module(index),
+                            None => self.import_py(module)?,
+                        };
+                        self.set_var(bound, value)?;
                     }
                 }
             }
@@ -774,12 +810,24 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
                 count,
             } => {
                 if run {
-                    let index = self.find_module(module).ok_or(Error::ImportError)?;
-                    for &(name, bound) in &names[..count] {
-                        let val = self
-                            .module_attr(index, name)
-                            .map_err(|_| Error::ImportError)?;
-                        self.set_var(bound, val)?;
+                    match self.find_module(module) {
+                        Some(index) => {
+                            for &(name, bound) in &names[..count] {
+                                let val = self
+                                    .module_attr(index, name)
+                                    .map_err(|_| Error::ImportError)?;
+                                self.set_var(bound, val)?;
+                            }
+                        }
+                        None => {
+                            let py = self.import_py(module)?;
+                            let dict = self.module_dict(py).ok_or(Error::ImportError)?;
+                            for &(name, bound) in &names[..count] {
+                                let val =
+                                    self.dict_get_str(dict, name).ok_or(Error::ImportError)?;
+                                self.set_var(bound, val)?;
+                            }
+                        }
                     }
                 }
             }
@@ -803,8 +851,9 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
                     body: *parser,
                     defaults,
                     lambda: false,
-                    method: ctx.in_class || ctx.in_func,
+                    method: ctx.in_class || ctx.in_func || self.module_top,
                     star,
+                    module: self.module_env,
                 };
                 // Parse (but don't run) the body to find where it ends
                 let body_ctx = Ctx {
@@ -813,7 +862,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
                     in_class: false,
                 };
                 self.exec_body(parser, indent, false, body_ctx, code)?;
-                if run && ctx.in_class {
+                if run && (ctx.in_class || self.module_top) {
                     // A method: a local of the class body (it goes into the class dict)
                     let slot = self.method_slot(func)?;
                     self.set_var(name, Value::Func(slot))?;
@@ -939,7 +988,9 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
         self.frame_off = base_off;
         self.frame_globals = self.global_count;
         self.call_depth += 1;
+        let was_top = core::mem::replace(&mut self.module_top, false);
         let body = self.exec_body(parser, indent, true, class_ctx, code);
+        self.module_top = was_top;
         let first = self.globals_len + base_off;
         let mut moved = Ok(());
         for i in first..self.nvars {
@@ -1459,6 +1510,9 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
 
     /// Removes a variable of the current scope (or a declared global).
     fn del_var(&mut self, name: &str) -> Result<(), Error> {
+        if let (true, Value::Obj(dict)) = (self.module_top, self.module_env) {
+            return self.module_del(dict, name);
+        }
         let (i, global) = if self.is_declared_global(name) {
             (self.find_in(0..self.globals_len, name), true)
         } else {
@@ -1522,6 +1576,9 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
     /// Assigns a global from inside a function, creating it if needed by
     /// moving the locals of the running calls up one slot.
     fn set_global(&mut self, name: &'a str, val: Value<'a>) -> Result<(), Error> {
+        if let Value::Obj(dict) = self.module_env {
+            return self.dict_set(dict, Value::Str(name), val);
+        }
         if let Some(i) = self.find_in(0..self.globals_len, name) {
             self.vars[i].1 = val;
             return Ok(());
@@ -1544,6 +1601,11 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
 
     #[cfg_attr(feature = "iram", link_section = ".rwtext")]
     fn set_var(&mut self, name: &'a str, val: Value<'a>) -> Result<(), Error> {
+        if self.module_top {
+            if let Value::Obj(dict) = self.module_env {
+                return self.dict_set(dict, Value::Str(name), val);
+            }
+        }
         if self.is_declared_global(name) {
             return self.set_global(name, val);
         }
@@ -1568,6 +1630,13 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
     /// declared `global`).
     #[cfg_attr(feature = "iram", link_section = ".rwtext")]
     fn get_scope_var(&self, name: &str) -> Result<Value<'a>, Error> {
+        if let Value::Obj(dict) = self.module_env {
+            if self.module_top || self.is_declared_global(name) {
+                return self
+                    .dict_get_str(dict, name)
+                    .ok_or(Error::UnknownIdentifier);
+            }
+        }
         let range = if self.is_declared_global(name) {
             0..self.globals_len
         } else {
@@ -1633,6 +1702,10 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
                 }
             })
             .or_else(|err| {
+                // The globals: of the function's module, or of the main script
+                if let Value::Obj(dict) = self.module_env {
+                    return self.dict_get_str(dict, name).ok_or(err);
+                }
                 if self.call_depth == 0 {
                     return Err(err);
                 }
@@ -1648,6 +1721,10 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
                     .ok_or(err)
             })
             .or_else(|err| {
+                // `def` functions of the main script (a module's are in its dict)
+                if self.module_env != Value::None {
+                    return Err(err);
+                }
                 self.funcs
                     .iter()
                     .position(|f| f.is_some_and(|f| f.named() && f.name == name))
@@ -1726,6 +1803,9 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
         // A closure's variables apply to this call only
         let env = core::mem::replace(&mut self.next_env, Value::None);
         let outer_env = core::mem::replace(&mut self.closure_env, env);
+        // The function's global names are those of its module
+        let outer_module = (self.module_env, self.module_top);
+        (self.module_env, self.module_top) = (func.module, false);
 
         let saved_off = self.frame_off;
         let saved_globals = (self.frame_globals, self.global_count);
@@ -1765,6 +1845,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
 
         // Drop the locals and `global` declarations, back to the caller's scope
         self.closure_env = outer_env;
+        (self.module_env, self.module_top) = outer_module;
         self.call_depth -= 1;
         self.frame_off = saved_off;
         (self.frame_globals, self.global_count) = saved_globals;
@@ -2184,6 +2265,13 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
             (Value::Module(m), _, _) if self.is_builtins_module(m) => {
                 self.call_function(attr, args, kwargs)
             }
+            (Value::Obj(_), _, _) if self.module_dict(receiver).is_some() => {
+                let f = self
+                    .py_module_attr(receiver, attr)
+                    .flatten()
+                    .ok_or(Error::AttributeError)?;
+                self.call_value(f, args, kwargs)
+            }
             (Value::Str(_) | Value::HStr(_), "format", _) => {
                 self.str_format(receiver, args, kwargs)
             }
@@ -2227,6 +2315,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
             lambda: true,
             method: false,
             star,
+            module: self.module_env,
         });
         Ok(Value::Func(slot as u8))
     }
@@ -2395,6 +2484,13 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
                 self.call_native(module, func, args)
             }
             Value::Globals => self.globals_view(attr, args),
+            Value::Obj(_) if self.module_dict(receiver).is_some() => {
+                let f = self
+                    .py_module_attr(receiver, attr)
+                    .flatten()
+                    .ok_or(Error::AttributeError)?;
+                self.call_value(f, args, &[])
+            }
             Value::Str(_) | Value::HStr(_) => self.str_method(receiver, attr, args),
             Value::Bytes(_) | Value::HBytes(_) => self.bytes_method(receiver, attr, args),
             Value::Obj(_) => match self.file_method(receiver, attr, args) {
@@ -2542,6 +2638,9 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
         match (name, args) {
             ("open", _) => return self.open(args),
             ("format", [v]) => return self.stringify(*v, false),
+            ("hex", [v]) => return self.int_text(*v, 'x'),
+            ("bin", [v]) => return self.int_text(*v, 'b'),
+            ("oct", [v]) => return self.int_text(*v, 'o'),
             ("format", [v, spec]) => return self.format_builtin(*v, *spec),
             _ => {}
         }
@@ -2593,6 +2692,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
 
         // Check the name and argument count against the bridge's function table
         let table = hw.functions();
+        let mut returns_bytes = false;
         if !table.is_empty() {
             let spec = table
                 .iter()
@@ -2601,21 +2701,9 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
             if args.len() < spec.min_args as usize || args.len() > spec.max_args as usize {
                 return Err(Error::TypeError);
             }
+            returns_bytes = spec.returns_bytes;
         }
-
-        let mut hw_args = [Arg::Int(0); MAX_CALL_ARGS];
-        for (slot, val) in hw_args.iter_mut().zip(args) {
-            *slot = match *val {
-                Value::Str(s) => Arg::Str(s),
-                Value::HStr(r) => Arg::Str(self.heap.str(r)),
-                other => Arg::Int(other.as_int().ok_or(Error::TypeError)?),
-            };
-        }
-
-        Ok(match hw.call_args(name, &hw_args[..args.len()])? {
-            Some(n) => Value::Int(n),
-            None => Value::None,
-        })
+        self.call_bridge(None, name, args, returns_bytes)
     }
 
     // ------------------------------------------------------------------
@@ -2680,21 +2768,43 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
         if (module as usize) < CORE_MODULES.len() {
             return self.core_module_call(module_name, spec.name, args);
         }
-        let mut hw_args = [Arg::Int(0); MAX_CALL_ARGS];
-        for (slot, val) in hw_args.iter_mut().zip(args) {
-            *slot = match *val {
-                Value::Str(s) => Arg::Str(s),
-                Value::HStr(r) => Arg::Str(self.heap.str(r)),
-                other => Arg::Int(other.as_int().ok_or(Error::TypeError)?),
+        self.call_bridge(Some(module_name), spec.name, args, spec.returns_bytes)
+    }
+
+    /// Calls a function of the `HardwareBridge` (of a native module, or a
+    /// plain one). Ints, bools, strings and bytes are passed as `Arg`s; a
+    /// function that returns bytes fills a new bytes object.
+    #[inline(never)]
+    fn call_bridge(
+        &mut self,
+        module: Option<&str>,
+        name: &str,
+        args: &[Value<'a>],
+        returns_bytes: bool,
+    ) -> Result<Value<'a>, Error> {
+        if !returns_bytes {
+            let view = self.heap.view();
+            let hw_args = bridge_args(&view, args)?;
+            let hw = self.hw.as_mut().ok_or(Error::UnknownIdentifier)?;
+            let result = match module {
+                Some(m) => hw.call_module(m, name, &hw_args[..args.len()])?,
+                None => hw.call_args(name, &hw_args[..args.len()])?,
             };
+            return Ok(result.map_or(Value::None, Value::Int));
         }
+        // The result buffer is the newest object, so the arguments (older
+        // objects) can be read while the bridge writes it
+        let size = crate::MAX_BRIDGE_BYTES.min(self.heap.capacity());
+        let out = self.alloc_obj(Kind::Bytes, size)?;
+        let (view, buf) = self.heap.view_and_dst(out);
+        let hw_args = bridge_args(&view, args)?;
         let hw = self.hw.as_mut().ok_or(Error::UnknownIdentifier)?;
-        Ok(
-            match hw.call_module(module_name, spec.name, &hw_args[..args.len()])? {
-                Some(n) => Value::Int(n),
-                None => Value::None,
-            },
-        )
+        let n = match module {
+            Some(m) => hw.call_module_bytes(m, name, &hw_args[..args.len()], buf)?,
+            None => hw.call_bytes(name, &hw_args[..args.len()], buf)?,
+        };
+        self.heap.realloc(out, n.min(size));
+        Ok(Value::HBytes(out))
     }
 
     /// `help(module)`: its functions and constants.
@@ -2790,6 +2900,24 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
             self.out.write_str("\n");
         }
     }
+}
+
+/// The `Arg`s for a bridge call (strings and bytes are read from `view`).
+fn bridge_args<'v>(
+    view: &crate::heap::HeapView<'v>,
+    args: &[Value<'v>],
+) -> Result<[Arg<'v>; MAX_CALL_ARGS], Error> {
+    let mut hw_args = [Arg::Int(0); MAX_CALL_ARGS];
+    for (slot, val) in hw_args.iter_mut().zip(args) {
+        *slot = match *val {
+            Value::Str(s) => Arg::Str(s),
+            Value::HStr(r) => Arg::Str(view.str(r)),
+            Value::Bytes(b) => Arg::Bytes(b),
+            Value::HBytes(r) => Arg::Bytes(view.bytes(r)),
+            other => Arg::Int(other.as_int().ok_or(Error::TypeError)?),
+        };
+    }
+    Ok(hw_args)
 }
 
 /// Modules built into the interpreter, numbered before the bridge's modules.
@@ -3610,7 +3738,7 @@ print(fact(7), fib(7))
         let code = core::mem::size_of::<Code<'_>>();
         let parser = core::mem::size_of::<Parser<'_>>();
         std::println!("interp={} code={} parser={}", interp, code, parser);
-        assert!(interp <= 20480, "Interpreter is {} bytes", interp);
+        assert!(interp <= 24576, "Interpreter is {} bytes", interp);
         assert!(code <= 1600, "Code is {} bytes", code);
         assert!(parser <= 128, "Parser is {} bytes", parser);
     }
@@ -3660,10 +3788,10 @@ print(fact(7), fib(7))
 
     #[test]
     fn test_nesting_limit() {
-        // 30 nested ifs exceed MAX_NESTING without overflowing the native stack
-        let mut buf = [0u8; 2048];
+        // 50 nested ifs exceed MAX_NESTING without overflowing the native stack
+        let mut buf = [0u8; 4096];
         let mut len = 0;
-        for depth in 0..30 {
+        for depth in 0..50 {
             for _ in 0..depth {
                 buf[len] = b' ';
                 len += 1;
@@ -3672,14 +3800,14 @@ print(fact(7), fib(7))
             buf[len..len + line.len()].copy_from_slice(line);
             len += line.len();
         }
-        for _ in 0..30 {
+        for _ in 0..50 {
             buf[len] = b' ';
             len += 1;
         }
         buf[len..len + 4].copy_from_slice(b"pass");
         len += 4;
         let src = core::str::from_utf8(&buf[..len]).unwrap();
-        assert_eq!(run_err(src).0, Error::OutOfMemory);
+        assert_eq!(run_err(src).0, Error::RecursionLimit);
     }
 
     /// A bridge with a function table, constants and a string argument.
@@ -4242,9 +4370,11 @@ print(outer(), count)
         );
         let mut out = MockOut::new();
         let mut mem = std::vec![0u8; heap_size];
+        let mut module_memory = std::vec![0u8; 16 * 1024];
         let mut vm = Interpreter::new(&mut out)
             .with_heap(&mut mem)
-            .with_files(&files);
+            .with_files(&files)
+            .with_module_memory(&mut module_memory);
         let result = vm.eval(src);
         (out.as_str().into(), result)
     }
@@ -4342,6 +4472,7 @@ print(outer(), count)
             case!("files"),
             case!("formatting"),
             case!("functions"),
+            case!("modules"),
             case!("readme_examples"),
         ] {
             let (out, result) = run_with_files(src, 64 * 1024);
@@ -4432,6 +4563,127 @@ print(outer(), count)
         // A list growing past the heap fails cleanly
         let (_, result, _) = run_with_heap("a = []\nwhile True:\n    a.append(1)", 512);
         assert_eq!(result, Err(Error::OutOfMemory));
+    }
+
+    // ---- 6.1 bytes through the hardware bridge ------------------------------
+
+    struct BusHardware {
+        written: std::vec::Vec<u8>,
+    }
+
+    const BUS_FNS: &[crate::HwFn] = &[
+        crate::HwFn::new("bus_write", "data", "Send bytes"),
+        crate::HwFn::new("bus_read", "n", "Receive n bytes").returning_bytes(),
+    ];
+    const BUS_MODULE: &[crate::Module] = &[crate::Module {
+        name: "bus",
+        doc: "Test bus",
+        functions: &[crate::HwFn::new("swap", "data", "Reversed").returning_bytes()],
+        constants: &[],
+    }];
+
+    impl HardwareBridge for BusHardware {
+        fn call_args(&mut self, name: &str, args: &[Arg<'_>]) -> Result<Option<i64>, Error> {
+            match name {
+                "bus_write" => {
+                    let data = args[0].bytes()?;
+                    self.written.extend_from_slice(data);
+                    Ok(Some(data.len() as i64))
+                }
+                _ => Err(Error::UnknownIdentifier),
+            }
+        }
+
+        fn call_bytes(
+            &mut self,
+            name: &str,
+            args: &[Arg<'_>],
+            out: &mut [u8],
+        ) -> Result<usize, Error> {
+            assert_eq!(name, "bus_read");
+            let n = (args[0].int()? as usize).min(out.len());
+            for (i, b) in out[..n].iter_mut().enumerate() {
+                *b = (i as u8).wrapping_mul(3);
+            }
+            Ok(n)
+        }
+
+        fn call_module_bytes(
+            &mut self,
+            module: &str,
+            name: &str,
+            args: &[Arg<'_>],
+            out: &mut [u8],
+        ) -> Result<usize, Error> {
+            assert_eq!((module, name), ("bus", "swap"));
+            let data = args[0].bytes()?;
+            for (o, b) in out.iter_mut().zip(data.iter().rev()) {
+                *o = *b;
+            }
+            Ok(data.len())
+        }
+
+        fn functions(&self) -> &[crate::HwFn] {
+            BUS_FNS
+        }
+
+        fn modules(&self) -> &[crate::Module] {
+            BUS_MODULE
+        }
+    }
+
+    #[test]
+    fn test_bytes_through_the_bridge() {
+        let mut out = MockOut::new();
+        let mut hw = BusHardware {
+            written: std::vec::Vec::new(),
+        };
+        let mut heap = [0u8; 4096];
+        let mut vm = Interpreter::with_hardware(&mut out, &mut hw).with_heap(&mut heap);
+        vm.eval(
+            "print(bus_write(b'\\x01\\x02'), bus_write('AT\\r\\n'), bus_write(bytes([7]) if False else b'\\x07'))\n\
+             data = bus_read(5)\nprint(data, len(data), data[4], bus_read(0), len(bus_read(9999)))\n\
+             import bus\nprint(bus.swap(b'abc'), bus.swap(data))",
+        )
+        .unwrap();
+        assert_eq!(vm.eval("bus_write(5)"), Err(Error::TypeError));
+        let _ = vm;
+        assert_eq!(
+            out.as_str(),
+            "2 4 1\nb'\\x00\\x03\\x06\\t\\x0c' 5 12 b'' 512\nb'cba' b'\\x0c\\t\\x06\\x03\\x00'\n"
+        );
+        assert_eq!(hw.written, b"\x01\x02AT\r\n\x07");
+    }
+
+    // ---- 6.3 importing .py modules ------------------------------------------
+
+    #[test]
+    fn test_module_memory_limits() {
+        let mut flash = std::vec![0u8; 4 * crate::flatfs::SLOT_SIZE as usize];
+        let files = RefCell::new(
+            crate::flatfs::FlatFs::mount(crate::flatfs::RamFlash::new(&mut flash)).unwrap(),
+        );
+        crate::FileSystem::create(&mut *files.borrow_mut(), "m.py", false).unwrap();
+        crate::FileSystem::write_file(&mut *files.borrow_mut(), 1, b"VALUE = 42\n").unwrap();
+        crate::FileSystem::close_file(&mut *files.borrow_mut(), 1).unwrap();
+
+        // Without module memory: only native modules
+        let mut out = MockOut::new();
+        let mut heap = [0u8; 4096];
+        let mut vm = Interpreter::new(&mut out)
+            .with_heap(&mut heap)
+            .with_files(&files);
+        assert_eq!(vm.eval("import m"), Err(Error::OutOfMemory));
+        // Too small for the module, then a second one that fits
+        let mut small = [0u8; 4];
+        vm.set_module_memory(&mut small);
+        assert_eq!(vm.eval("import m"), Err(Error::OutOfMemory));
+        let mut enough = [0u8; 64];
+        vm.set_module_memory(&mut enough);
+        assert_eq!(vm.eval("import m\nprint(m.VALUE, m)"), Ok(()));
+        assert_eq!(vm.eval("import nothing_here"), Err(Error::ImportError));
+        let _ = vm;
+        assert_eq!(out.as_str(), "42 <module 'm'>\n");
     }
 
     // ---- 5.8 classes and closures -----------------------------------------
@@ -4765,26 +5017,11 @@ print(outer(), count)
         let mut out = MockOut::new();
         let mut vm = Interpreter::new(&mut out);
 
-        let mut buf = [0u8; 512];
-        let mut len = 0;
-        for i in 0..MAX_VARS {
-            let prefix = b"v";
-            buf[len..len + prefix.len()].copy_from_slice(prefix);
-            len += prefix.len();
-
-            if i >= 10 {
-                buf[len] = b'0' + (i / 10) as u8;
-                len += 1;
-            }
-            buf[len] = b'0' + (i % 10) as u8;
-            len += 1;
-
-            let suffix = b" = 1\n";
-            buf[len..len + suffix.len()].copy_from_slice(suffix);
-            len += suffix.len();
-        }
-
-        let fill_script = core::str::from_utf8(&buf[..len]).unwrap();
+        let fill_script: std::string::String = (0..MAX_VARS)
+            .map(|i| std::format!("v{} = 1\n", i))
+            .collect();
+        // The source must outlive the interpreter's use of it
+        let fill_script: &'static str = std::boxed::Box::leak(fill_script.into_boxed_str());
         assert_eq!(vm.eval(fill_script), Ok(()));
         assert_eq!(vm.eval("v0 = 99"), Ok(()));
         assert_eq!(vm.eval("overflow = 1"), Err(Error::OutOfMemory));

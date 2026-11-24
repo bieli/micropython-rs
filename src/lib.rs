@@ -91,6 +91,8 @@ pub enum Arg<'s> {
     Int(i64),
     /// A `str`, e.g. for `text(x, y, 'hello')`.
     Str(&'s str),
+    /// A `bytes` value, e.g. for `i2c_write(0x3c, b'\x00\xaf')`.
+    Bytes(&'s [u8]),
 }
 
 impl<'s> Arg<'s> {
@@ -98,14 +100,24 @@ impl<'s> Arg<'s> {
     pub fn int(self) -> Result<i64, Error> {
         match self {
             Arg::Int(n) => Ok(n),
-            Arg::Str(_) => Err(Error::TypeError),
+            _ => Err(Error::TypeError),
         }
     }
 
-    /// The string value, or `Error::TypeError` for an integer.
+    /// The string value, or `Error::TypeError` for an integer or bytes.
     pub fn str(self) -> Result<&'s str, Error> {
         match self {
             Arg::Str(s) => Ok(s),
+            _ => Err(Error::TypeError),
+        }
+    }
+
+    /// The bytes of a `bytes` value, or of a `str` (its UTF-8), or
+    /// `Error::TypeError` for an integer: what a bus write sends.
+    pub fn bytes(self) -> Result<&'s [u8], Error> {
+        match self {
+            Arg::Bytes(b) => Ok(b),
+            Arg::Str(s) => Ok(s.as_bytes()),
             Arg::Int(_) => Err(Error::TypeError),
         }
     }
@@ -121,6 +133,8 @@ pub struct HwFn {
     pub params: &'static str,
     /// One-line description for `help()`.
     pub doc: &'static str,
+    /// The function returns `bytes` (see `HardwareBridge::call_bytes`).
+    pub returns_bytes: bool,
 }
 
 impl HwFn {
@@ -145,7 +159,15 @@ impl HwFn {
             max_args,
             params,
             doc,
+            returns_bytes: false,
         }
+    }
+
+    /// Marks a function that returns `bytes` (`i2c_read`, `uart_read`, ...):
+    /// the interpreter calls `call_bytes` / `call_module_bytes` for it.
+    pub const fn returning_bytes(mut self) -> Self {
+        self.returns_bytes = true;
+        self
     }
 }
 
@@ -229,7 +251,33 @@ pub trait HardwareBridge {
     ) -> Result<Option<i64>, Error> {
         Err(Error::UnknownIdentifier)
     }
+
+    /// Calls a function marked with `HwFn::returning_bytes`: write the result
+    /// into `out` (up to `out.len()`, `MAX_BRIDGE_BYTES` at most) and return
+    /// how many bytes it has. The script gets them as a `bytes` object.
+    fn call_bytes(
+        &mut self,
+        _name: &str,
+        _args: &[Arg<'_>],
+        _out: &mut [u8],
+    ) -> Result<usize, Error> {
+        Err(Error::UnknownIdentifier)
+    }
+
+    /// `call_bytes` for a function of a native module.
+    fn call_module_bytes(
+        &mut self,
+        _module: &str,
+        _name: &str,
+        _args: &[Arg<'_>],
+        _out: &mut [u8],
+    ) -> Result<usize, Error> {
+        Err(Error::UnknownIdentifier)
+    }
 }
+
+/// Most bytes one bridge call can return (`i2c_read(addr, n)`, ...).
+pub const MAX_BRIDGE_BYTES: usize = 512;
 
 pub struct NoHardware;
 

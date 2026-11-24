@@ -25,7 +25,7 @@ start = ticks_ms()
 sleep_ms(200)
 print('slept', ticks_diff(ticks_ms(), start), 'ms')
 print('ADC34 raw:', adc_read(34))
-print('I2C devices:', i2c_scan())
+print('I2C devices:', [hex(a) for a in i2c_scan()])
 
 # Buttons are active low: 1 = not pressed
 pin_mode(BUTTON_L, IN_PULLUP)

@@ -182,6 +182,19 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
                 self.new_bytes(n as usize, |_| {})
             }
             [s, _encoding] if Self::is_str(*s) => self.encode(*s),
+            // `bytes([0x00, 0xAF])`, `bytes(range(16))`: from integers 0-255
+            [it] if self.obj_kind(*it).is_some() => {
+                let n = self.container_len(*it).ok_or(Error::TypeError)?;
+                let r = self.alloc_obj(Kind::Bytes, n)?;
+                let mut state = 0;
+                for i in 0..n {
+                    let v = self.iter_next(*it, &mut state)?.ok_or(Error::ValueError)?;
+                    let b = v.as_int().ok_or(Error::TypeError)?;
+                    let b = u8::try_from(b).map_err(|_| Error::ValueError)?;
+                    self.heap.bytes_mut(r)[i] = b;
+                }
+                Ok(Value::HBytes(r))
+            }
             _ => Err(Error::TypeError),
         }
     }
