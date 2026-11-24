@@ -43,6 +43,8 @@ jobs:
       # protocol as the ESP32 firmware)
       - name: End-to-end tests with Thonny 3.2.7's backend and mpremote
         run: |
+          # Thonny's plugin package imports tkinter (no window is opened)
+          sudo apt-get install -y --no-install-recommends python3-tk > /dev/null
           cargo build
           python3 -m venv /tmp/venv
           /tmp/venv/bin/pip install --quiet pyserial jedi mpremote
