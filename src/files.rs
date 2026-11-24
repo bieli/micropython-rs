@@ -48,6 +48,10 @@ pub(crate) const OS: Module = Module {
             "(sysname, nodename, release, version, machine)",
         ),
         HwFn::new("sync", "", "Nothing to do: files are saved when closed"),
+        HwFn::new("getcwd", "", "'' (a flat file system: no directories)"),
+        HwFn::new("chdir", "path", "Only '' or '/' (there are no directories)"),
+        HwFn::new("mkdir", "path", "OSError: there are no directories"),
+        HwFn::new("rmdir", "path", "OSError: there are no directories"),
     ],
     constants: &[],
 };
@@ -91,6 +95,7 @@ fn message(err: FsError) -> &'static str {
         FsError::BadName => "EINVAL: bad file name (use A-Z a-z 0-9 . _ -, max 40 chars)",
         FsError::TooLarge => "EFBIG: file too large (max 32704 bytes)",
         FsError::NoSpace => "ENOSPC: no free file slot (saving needs one, even to replace)",
+        FsError::NoDirectories => "EPERM: no directories (a flat file system)",
     }
 }
 
@@ -104,6 +109,7 @@ fn errno(err: FsError) -> i64 {
         FsError::BadName => 22,              // EINVAL
         FsError::TooLarge => 27,             // EFBIG
         FsError::NoSpace => 28,              // ENOSPC
+        FsError::NoDirectories => 1,         // EPERM
     }
 }
 
@@ -249,6 +255,10 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
                 self.tuple_of(&fields)
             }
             ("sync", []) => Ok(Value::None),
+            // An empty current directory is how Thonny recognizes a flat file system
+            ("getcwd", []) => Ok(Value::Str("")),
+            ("chdir", [path]) if self.is_root(*path) => Ok(Value::None),
+            ("chdir" | "mkdir" | "rmdir", [_]) => Err(self.os_error(FsError::NoDirectories)),
             _ => Err(Error::TypeError),
         }
     }

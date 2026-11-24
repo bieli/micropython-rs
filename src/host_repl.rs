@@ -142,6 +142,9 @@ pub fn main() -> ! {
             CTRL_D if line.is_empty() => {
                 // Soft reboot: a new interpreter (files stay)
                 vm = new_vm(files);
+                if raw {
+                    write("OK\r\n"); // like MicroPython: the empty command is acknowledged
+                }
                 write("MPY: soft reboot\r\n");
                 if raw {
                     write("raw REPL; CTRL-B to exit\r\n>");

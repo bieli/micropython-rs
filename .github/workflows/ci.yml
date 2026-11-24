@@ -41,14 +41,17 @@ jobs:
 
       # Real tools against `mpy-cli --repl` on a pseudo-terminal (same REPL
       # protocol as the ESP32 firmware)
-      - name: End-to-end tests with Thonny 3.2.7's backend and mpremote
+      - name: End-to-end tests with Thonny 3.2.7 and 5.0's backends and mpremote
         run: |
           # Thonny's plugin package imports tkinter (no window is opened)
           sudo apt-get install -y --no-install-recommends python3-tk > /dev/null
           cargo build
           python3 -m venv /tmp/venv
-          /tmp/venv/bin/pip install --quiet pyserial jedi mpremote
+          /tmp/venv/bin/pip install --quiet pyserial jedi asttokens mpremote
           /tmp/venv/bin/pip download --quiet --no-deps thonny==3.2.7 -d /tmp/thonny
           python3 -m zipfile -e /tmp/thonny/thonny-3.2.7-py3-none-any.whl /tmp/thonny/src
           /tmp/venv/bin/python tools/thonny_e2e.py /tmp/thonny/src
+          /tmp/venv/bin/pip download --quiet --no-deps thonny==5.0.0 -d /tmp/thonny5
+          python3 -m zipfile -e /tmp/thonny5/thonny-5.0.0-py3-none-any.whl /tmp/thonny5/src
+          /tmp/venv/bin/python tools/thonny5_e2e.py /tmp/thonny5/src
           /tmp/venv/bin/python tools/mpremote_e2e.py

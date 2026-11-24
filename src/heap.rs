@@ -52,6 +52,16 @@ pub enum Kind {
     /// A method taken from an object without calling it (`r = f.read`):
     /// a tuple of the object and the method name.
     BoundMethod,
+    /// Classes and instances (see `interpreter/classes.rs`), `classmethod` /
+    /// `staticmethod` wrappers and `super()` objects, all laid out like tuples.
+    Class,
+    Instance,
+    ClassMethod,
+    StaticMethod,
+    Super,
+    /// A function made inside a function: `(function, dict of the values
+    /// of the enclosing function's variables when it was made)`.
+    Closure,
 }
 
 impl Kind {
@@ -65,6 +75,12 @@ impl Kind {
                 | Kind::Exception
                 | Kind::File
                 | Kind::BoundMethod
+                | Kind::Class
+                | Kind::Instance
+                | Kind::ClassMethod
+                | Kind::StaticMethod
+                | Kind::Super
+                | Kind::Closure
         )
     }
 }

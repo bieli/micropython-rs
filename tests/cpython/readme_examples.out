@@ -7,3 +7,5 @@ buzzer 25
 config error: not an ADC1 pin: 5
 led off
 1234
+area (3,) -> 12
+battery on pin 35 4120 1 True

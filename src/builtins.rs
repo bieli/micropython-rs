@@ -31,6 +31,7 @@ const NAMES: &[&str] = &[
     "builtin_function_or_method",
     "module",
     "TextIOWrapper",
+    "object",
     // functions
     "print",
     "len",
@@ -58,8 +59,11 @@ const NAMES: &[&str] = &[
     "help",
     "format",
     "open",
+    "classmethod",
+    "staticmethod",
+    "super",
 ];
-const FIRST_FUNCTION: u8 = 13;
+const FIRST_FUNCTION: u8 = 14;
 /// Types that can't be called (`NoneType()`, `function()`, `module()`).
 const FIRST_UNCALLABLE_TYPE: u8 = 8;
 
@@ -70,6 +74,22 @@ pub(crate) const BUILTINS_MODULE: crate::Module = crate::Module {
     doc: "Built-in functions, types and exceptions",
     functions: &[],
     constants: &[],
+};
+
+/// `import sys`: `path`, `version`, `version_info`, `platform`,
+/// `byteorder`, `maxsize`, `argv`, `modules` (see `Interpreter::sys_attr`)
+/// and `exit()`.
+pub(crate) const SYS_MODULE: crate::Module = crate::Module {
+    name: "sys",
+    doc: "System information (path, version, platform, ...), exit()",
+    functions: &[crate::HwFn::with_args(
+        "exit",
+        0,
+        1,
+        "[code]",
+        "Stop the program (raises SystemExit)",
+    )],
+    constants: &[("maxsize", i64::MAX)],
 };
 
 pub(super) fn builtin_by_name(name: &str) -> Option<u8> {
@@ -100,6 +120,9 @@ pub(crate) fn write_builtin(i: u8, sink: &mut dyn FnMut(&str)) {
 impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
     /// The built-in type of a value (`type(v)`); exceptions have their class.
     pub(super) fn type_of(&self, v: Value<'a>) -> Value<'a> {
+        if let Some(class) = self.class_of(v) {
+            return Value::Obj(class);
+        }
         if let Some(class) = self.exc_class(v) {
             return Value::ExcClass(class);
         }
@@ -115,6 +138,8 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
                 Kind::Dict => "dict",
                 Kind::File => "TextIOWrapper",
                 Kind::BoundMethod => "builtin_function_or_method",
+                Kind::Class => "type",
+                _ if false => "object",
                 _ => "range",
             },
             Value::Globals => "dict",
@@ -138,6 +163,9 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
                 Some(class) => self.exc_matches(class, spec),
                 None => Ok(false),
             },
+            Value::Obj(r) if self.heap.kind(r) == Kind::Class => {
+                Ok(self.class_of(v).is_some_and(|c| self.derives_from(c, r)))
+            }
             Value::Obj(r) if self.heap.kind(r) == Kind::Tuple => {
                 for i in 0..self.count(r) {
                     if self.isinstance(v, self.slot(r, i))? {
@@ -157,6 +185,9 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
         obj: Value<'a>,
         name: &str,
     ) -> Result<Option<Value<'a>>, Error> {
+        if let Some(found) = self.object_attr(obj, name) {
+            return Ok(found);
+        }
         if name == "__name__" {
             let n = match obj {
                 Value::Builtin(i) => Some(builtin_name(i)),
@@ -170,6 +201,12 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
             return Ok(n.map(Value::Str));
         }
         match obj {
+            Value::Module(m) if self.module(m).is_some_and(|m| m.name == "sys") => {
+                match self.sys_attr(name)? {
+                    Some(v) => Ok(Some(v)),
+                    None => Ok(self.module_attr(m, name).ok()),
+                }
+            }
             Value::Module(m) => Ok(self.module_attr(m, name).ok()),
             Value::Obj(_) if self.file_attr(obj, name).is_some() => Ok(self.file_attr(obj, name)),
             Value::Obj(_) if self.exc_class(obj).is_some() => match self.exc_attr(obj, name) {
@@ -183,6 +220,9 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
 
     /// True if `obj.name(...)` is a method of a string, bytes or container.
     fn has_method(&self, obj: Value<'a>, name: &str) -> bool {
+        if self.has_class_method(obj, name) {
+            return true;
+        }
         const STR: &[&str] = &[
             "upper",
             "lower",
@@ -288,6 +328,44 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
         }
     }
 
+    /// `sys.name` (values that aren't numbers, made when they're read).
+    pub(super) fn sys_attr(&mut self, name: &str) -> Result<Option<Value<'a>>, Error> {
+        let parts: &[Value<'a>] = match name {
+            "path" => &[Value::Str(""), Value::Str("/lib")],
+            "argv" => &[],
+            "version_info" => &[Value::Int(3), Value::Int(4), Value::Int(0)],
+            "version" => {
+                return Ok(Some(Value::Str(concat!(
+                    "3.4.0; micropython-rs ",
+                    env!("CARGO_PKG_VERSION")
+                ))))
+            }
+            "platform" => return Ok(Some(Value::Str("micropython-rs"))),
+            "byteorder" => return Ok(Some(Value::Str("little"))),
+            "modules" => {
+                return self
+                    .new_container(Kind::Dict, 0)
+                    .map(|d| Some(Value::Obj(d)))
+            }
+            _ => return Ok(None),
+        };
+        let base = self.sp;
+        let result = (|| {
+            for &p in parts {
+                self.push(p)?;
+            }
+            let kind = if name == "version_info" {
+                Kind::Tuple
+            } else {
+                Kind::List
+            };
+            self.build(kind, parts.len())?;
+            Ok(Some(self.stack[self.sp - 1]))
+        })();
+        self.sp = base;
+        result
+    }
+
     /// `builtins.name`: built-in functions, types and exception classes.
     pub(super) fn builtins_attr(name: &str) -> Option<Value<'a>> {
         builtin_by_name(name)
@@ -309,8 +387,12 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
                 matches!(
                     v,
                     Value::Func(_) | Value::NativeFn { .. } | Value::ExcClass(_)
-                ) || matches!(v, Value::Builtin(i) if *i < FIRST_UNCALLABLE_TYPE || *i >= FIRST_FUNCTION),
+                ) || matches!(v, Value::Builtin(i) if *i < FIRST_UNCALLABLE_TYPE || *i >= FIRST_FUNCTION)
+                    || matches!(self.obj_kind(*v), Some(Kind::Class | Kind::BoundMethod)),
             )),
+            ("classmethod", [f]) => self.method_wrapper(Kind::ClassMethod, *f),
+            ("staticmethod", [f]) => self.method_wrapper(Kind::StaticMethod, *f),
+            ("super", []) => self.make_super(),
             ("hasattr", [obj, attr]) => {
                 let Some(attr) = self.str_of(*attr) else {
                     return Some(Err(Error::TypeError));
@@ -411,7 +493,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
             }
             for i in 0..self.funcs.len() {
                 if let Some(f) = self.funcs[i] {
-                    if !f.lambda {
+                    if f.named() {
                         self.dict_set(d, Value::Str(f.name), Value::Func(i as u8))?;
                     }
                 }
@@ -437,7 +519,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
                 self.globals_len = 0;
             }
             for f in self.funcs.iter_mut() {
-                if f.is_some_and(|f| !f.lambda) {
+                if f.is_some_and(|f| f.named()) {
                     *f = None;
                 }
             }
@@ -462,7 +544,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
         }
         self.funcs
             .iter()
-            .position(|f| f.is_some_and(|f| !f.lambda && f.name == name))
+            .position(|f| f.is_some_and(|f| f.named() && f.name == name))
             .map(|i| Value::Func(i as u8))
             .ok_or(Error::KeyError)
     }
@@ -500,7 +582,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
         let slot = self
             .funcs
             .iter()
-            .position(|f| f.is_some_and(|f| !f.lambda && f.name == name))
+            .position(|f| f.is_some_and(|f| f.named() && f.name == name))
             .ok_or(Error::KeyError)?;
         self.funcs[slot] = None;
         Ok(())

@@ -66,6 +66,8 @@ pub enum FsError {
     NoRegion,
     /// Writing to a file that's closed (or was replaced by another open file).
     NotOpen,
+    /// `mkdir` and friends: the file system has no directories.
+    NoDirectories,
 }
 
 impl FsError {
@@ -82,6 +84,7 @@ impl FsError {
             FsError::Corrupt => "file corrupted (checksum mismatch)",
             FsError::NoRegion => "no file system partition",
             FsError::NotOpen => "file not open for writing",
+            FsError::NoDirectories => "no directories (a flat file system)",
         }
     }
 }

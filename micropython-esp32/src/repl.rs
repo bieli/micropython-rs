@@ -470,6 +470,8 @@ impl<'a, O: Output, H: HardwareBridge> Repl<'a, O, H> {
                     overflow = false;
                 }
                 CTRL_D if self.arena.pending().is_empty() && !overflow => {
+                    // Like MicroPython: the empty command is acknowledged first
+                    print!("OK\r\n");
                     return Mode::SoftReset(true);
                 }
                 CTRL_D => {

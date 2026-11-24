@@ -28,3 +28,37 @@ except OSError:
 finally:
     led_off()
 print(read_sensor(36))
+def logged(fn):
+    def wrapper(*args, **kwargs):
+        result = fn(*args, **kwargs)
+        print(fn.__name__, args, '->', result)
+        return result
+    return wrapper
+@logged
+def area(w, h=1):
+    return w * h
+area(3, h=4)
+def adc_mv(pin):
+    return 2060
+class Sensor:
+    count = 0
+    def __init__(self, pin, name='sensor'):
+        self.pin = pin
+        self.name = name
+        Sensor.count += 1
+    def read(self):
+        return adc_mv(self.pin)
+    def __str__(self):
+        return '%s on pin %d' % (self.name, self.pin)
+    @classmethod
+    def made(cls):
+        return cls.count
+class Battery(Sensor):
+    def __init__(self):
+        super().__init__(35, 'battery')
+    def read(self):
+        return super().read() * 2
+class SensorError(OSError):
+    pass
+bat = Battery()
+print(bat, bat.read(), Sensor.made(), isinstance(bat, Sensor))

@@ -284,6 +284,12 @@ impl Default for Code<'_> {
     }
 }
 
+/// `def f(a, *args)`: the last parameter (before `**kwargs`) collects the
+/// extra positional arguments.
+pub const STAR_ARGS: u8 = 1;
+/// `def f(a, **kwargs)`: the last parameter collects extra keyword arguments.
+pub const STAR_KWARGS: u8 = 2;
+
 /// The arguments of a call, as parsed: how many, and the keyword names.
 #[derive(Debug, Clone, Copy, Default)]
 struct Args<'a> {
@@ -343,6 +349,26 @@ pub enum Stmt<'a> {
     DelNames(Targets<'a>),
     /// `del x[key]`: `target` leaves the container and the key.
     DelItem(Expr),
+    /// Header `class Name:` or `class Name(Base):`
+    Class {
+        name: &'a str,
+        base: Option<Expr>,
+    },
+    /// `@decorator` before a `def` or `class`
+    Decorator(Expr),
+    /// `obj.attr = <expr>`: `target` is the object.
+    SetAttr {
+        target: Expr,
+        attr: &'a str,
+        value: Expr,
+    },
+    /// `obj.attr op= <expr>`
+    AugSetAttr {
+        target: Expr,
+        attr: &'a str,
+        op: BinOp,
+        value: Expr,
+    },
     /// Header `with <expr>:` or `with <expr> as name:`
     With {
         expr: Expr,
@@ -397,6 +423,9 @@ pub enum Stmt<'a> {
         params: [&'a str; MAX_PARAMS],
         count: usize,
         defaults: Option<Expr>,
+        /// `STAR_ARGS` / `STAR_KWARGS`: the last parameters are `*args`
+        /// (then) `**kwargs`.
+        star: u8,
     },
     /// `import a, b as c`: `(module, bound name)` pairs.
     Import {
@@ -428,6 +457,7 @@ impl Stmt<'_> {
                 | Stmt::For { .. }
                 | Stmt::Def { .. }
                 | Stmt::Try
+                | Stmt::Class { .. }
                 | Stmt::With { .. }
                 | Stmt::Except { .. }
                 | Stmt::Finally
@@ -603,6 +633,28 @@ impl<'a> Parser<'a> {
                 self.advance()?;
                 self.expect(Token::Colon)?;
                 return Ok(Some(stmt));
+            }
+            Token::Class => {
+                self.advance()?;
+                let name = self.expect_ident()?;
+                let mut base = None;
+                if self.current == Token::LParen {
+                    self.advance()?;
+                    if self.current != Token::RParen {
+                        base = Some(self.parse_expr(code)?);
+                    }
+                    self.expect(Token::RParen)?;
+                }
+                self.expect(Token::Colon)?;
+                return Ok(Some(Stmt::Class { name, base }));
+            }
+            Token::At => {
+                self.advance()?;
+                let decorator = self.parse_expr(code)?;
+                if !self.at_line_end() {
+                    return Err(Error::InvalidSyntax);
+                }
+                return Ok(Some(Stmt::Decorator(decorator)));
             }
             Token::With => {
                 self.advance()?;
@@ -832,6 +884,29 @@ impl<'a> Parser<'a> {
                         return Ok(Stmt::AssignMulti { targets, expr });
                     }
                 }
+                // `obj.attr = value`
+                if let Some(Item::GetAttr(attr)) = code.last() {
+                    code.pop();
+                    let target = Expr {
+                        start: start as u8,
+                        len: (code.len - start) as u8,
+                    };
+                    self.advance()?;
+                    let value = self.parse_expr_list(code)?;
+                    return Ok(match op {
+                        Some(op) => Stmt::AugSetAttr {
+                            target,
+                            attr,
+                            op,
+                            value,
+                        },
+                        None => Stmt::SetAttr {
+                            target,
+                            attr,
+                            value,
+                        },
+                    });
+                }
                 // `123 = 456`, `f() = 1`, `a[1:2] = x`: not assignable here
                 if code.last() != Some(Item::Index) {
                     return Err(Error::InvalidSyntax);
@@ -943,7 +1018,21 @@ impl<'a> Parser<'a> {
 
         let mut params = [""; MAX_PARAMS];
         let mut count = 0;
+        let mut star = 0u8;
         while self.current != Token::RParen {
+            // `*args` and then `**kwargs` come last
+            let marker = match self.current {
+                Token::Star if star == 0 => STAR_ARGS,
+                Token::DoubleStar if star & STAR_KWARGS == 0 => STAR_KWARGS,
+                _ if star & STAR_KWARGS != 0 => return Err(Error::InvalidSyntax),
+                _ => 0,
+            };
+            if marker != 0 {
+                self.advance()?;
+            } else if star != 0 {
+                return Err(Error::InvalidSyntax); // keyword-only parameters aren't supported
+            }
+            star |= marker;
             let Token::Ident(param) = self.current else {
                 return Err(Error::InvalidSyntax);
             };
@@ -957,7 +1046,7 @@ impl<'a> Parser<'a> {
             params[count] = param;
             count += 1;
             self.advance()?;
-            if self.current == Token::Assign {
+            if marker == 0 && self.current == Token::Assign {
                 self.advance()?;
                 self.parse_test(code)?;
                 ndefaults += 1;
@@ -989,6 +1078,7 @@ impl<'a> Parser<'a> {
             params,
             count,
             defaults,
+            star,
         })
     }
 
@@ -1461,16 +1551,23 @@ impl<'a> Parser<'a> {
 
         let mut args = Args::default();
         let mut argc = 0;
+        // After a keyword argument, only keyword arguments and `**` may follow
+        let mut keywords = false;
         while self.current != Token::RParen {
             if argc >= MAX_CALL_ARGS {
                 return Err(Error::TooManyArguments);
             }
-            if let (Token::Ident(name), Token::Assign) = (self.current, self.peek()?) {
-                // `name=value`
-                if args.names[..args.kw as usize].contains(&name) {
-                    return Err(Error::InvalidSyntax); // repeated keyword
+            // `f(*items)` / `f(**options)`: unpacked when called (the name
+            // `*` or `**` marks them among the keyword names)
+            if matches!(self.current, Token::Star | Token::DoubleStar) {
+                let name = if self.current == Token::Star {
+                    "*"
+                } else {
+                    "**"
+                };
+                if name == "*" && keywords {
+                    return Err(Error::InvalidSyntax);
                 }
-                self.advance()?;
                 self.advance()?;
                 self.parse_test(code)?;
                 args.names[args.kw as usize] = name;
@@ -1483,9 +1580,41 @@ impl<'a> Parser<'a> {
                 }
                 continue;
             }
-            if args.kw > 0 {
+            if let (Token::Ident(name), Token::Assign) = (self.current, self.peek()?) {
+                // `name=value`
+                if args.names[..args.kw as usize].contains(&name) && !matches!(name, "*" | "**") {
+                    return Err(Error::InvalidSyntax); // repeated keyword
+                }
+                self.advance()?;
+                self.advance()?;
+                self.parse_test(code)?;
+                args.names[args.kw as usize] = name;
+                args.kw += 1;
+                argc += 1;
+                keywords = true;
+                match self.current {
+                    Token::Comma => self.advance()?,
+                    Token::RParen => break,
+                    _ => return Err(Error::UnexpectedToken),
+                }
+                continue;
+            }
+            if keywords {
                 // A positional argument after a keyword argument
                 return Err(Error::InvalidSyntax);
+            }
+            if args.kw > 0 {
+                // A positional argument after `*items`: unnamed, in order
+                self.parse_test(code)?;
+                args.names[args.kw as usize] = "";
+                args.kw += 1;
+                argc += 1;
+                match self.current {
+                    Token::Comma => self.advance()?,
+                    Token::RParen => break,
+                    _ => return Err(Error::UnexpectedToken),
+                }
+                continue;
             }
             let start = code.len;
             self.parse_test(code)?;
@@ -1518,6 +1647,9 @@ impl<'a> Parser<'a> {
         let start = self.lexer_token_start();
         self.advance()?; // 'lambda'
         while self.current != Token::Colon {
+            if matches!(self.current, Token::Star | Token::DoubleStar) {
+                self.advance()?;
+            }
             self.expect_ident()?;
             match self.current {
                 Token::Comma => self.advance()?,
@@ -1543,13 +1675,22 @@ impl<'a> Parser<'a> {
     pub fn parse_lambda_parts(
         &mut self,
         code: &mut Code<'a>,
-    ) -> Result<([&'a str; MAX_PARAMS], usize, Expr), Error> {
+    ) -> Result<([&'a str; MAX_PARAMS], usize, u8, Expr), Error> {
         self.expect(Token::Lambda)?;
         let mut params = [""; MAX_PARAMS];
         let mut count = 0;
+        let mut star = 0;
         while self.current != Token::Colon {
             if count >= MAX_PARAMS {
                 return Err(Error::TooManyArguments);
+            }
+            match self.current {
+                Token::Star => star |= STAR_ARGS,
+                Token::DoubleStar => star |= STAR_KWARGS,
+                _ => {}
+            }
+            if matches!(self.current, Token::Star | Token::DoubleStar) {
+                self.advance()?;
             }
             params[count] = self.expect_ident()?;
             count += 1;
@@ -1559,7 +1700,7 @@ impl<'a> Parser<'a> {
         }
         self.advance()?;
         let body = self.parse_expr(code)?;
-        Ok((params, count, body))
+        Ok((params, count, star, body))
     }
 
     /// The parts of an f-string: literal text (as zero-copy `Str` items, so
@@ -2145,7 +2286,7 @@ mod tests {
             ("from a b", Error::UnexpectedToken),
             ("from a import *", Error::InvalidSyntax),
             ("x = a.", Error::InvalidSyntax),
-            ("a.b = 1", Error::InvalidSyntax),
+            ("a.b c", Error::UnexpectedToken),
             ("import a, b, c, d, e, f, g, h, i", Error::TooManyArguments),
         ] {
             let mut parser = Parser::new(src).unwrap();

@@ -80,20 +80,21 @@ flags |= 1 << 3                   # bitwise & | ^ ~ << >> and augmented assignme
 | Containers | `[1, 2]`, `(1, 2)`, `{'k': v}`, `x[i]`, `x[a:b]`, `x[k] = v`, `del x[k]`, `+`, `*`, `in`, `==`/`<`, comprehensions `[f(x) for x in it if c]` / `{k: v for ...}`, list methods `append extend insert pop remove index count clear reverse sort copy`, dict methods `get pop setdefault update keys values items clear copy` |
 | Strings | Escapes (`'\n'`, `'\x41'`, `'\u263a'`), `+`, `*`, `len()`, `s[i]`, `s[a:b]`, `in` / `not in`, `str()`, `repr()`, `int(s, base)`, `ord()`, `chr()`, `s.encode()`, and methods `upper lower strip lstrip rstrip startswith endswith find count replace split join isdigit isalpha isalnum isspace isupper islower` |
 | Bytes | `b'...'` literals with escapes, `bytes()`, `bytes(n)`, `bytes(s, 'utf-8')`, `+`, `*`, `len()`, `b[i]` (an `int`), `b[a:b]`, `in`, `==`/`<`, `hex()`, `decode()`, `startswith endswith find` |
-| Modules | `binascii` (`hexlify`, `unhexlify`), built in; plus the native modules of the firmware (e.g. `display`) |
+| Modules | built in: `binascii` (`hexlify`, `unhexlify`), `os` (files), `sys` (`path`, `version`, `platform`, `exit()`, ...), `builtins`; plus the native modules of the firmware (e.g. `display`) |
 | Literals | `42`, `1_000`, `0x1F`, `0o17`, `0b1010`, `'single'`, `"double"`, `'''triple'''`; lines join inside brackets and after `\` |
 | Operators | `+ - * / // % **`, `& \| ^ ~ << >>`, `== != < <= > >=` (chainable), `in`, `not in`, `is`, `is not`, `and or not`, `a if c else b` |
 | Assignment | `x = ...`, `a, b = b, a`, `(a, b) = ...`, `a = b = 0`, `x[k] = v`, `+= -= *= /= //= %= **= &= \|= ^= <<= >>=` (also `x[k] += v`), `del a, b`, `del x[k]` |
 | Statements | `if`/`elif`/`else`, `while`, `for x in ...` (also `for k, v in d.items()`), `break`, `continue`, `pass`, `def`, `return`; `;` between statements (`x = 1; y = 2`) |
 | Exceptions | `try`/`except`/`else`/`finally`, `except (A, B) as e`, `raise`, `raise X('msg')`, bare `raise`, `assert`; built-in classes such as `ValueError`, `KeyError`, `OSError`, `Exception` with CPython's hierarchy; `e.args`, `e.errno` |
-| Functions | `def f(a, b=1):` with default values, keyword arguments `f(1, b=2)`, `lambda x: x * 2`, functions as values (`key=len`, `handlers['up']()`) |
+| Functions | `def f(a, b=1, *args, **kwargs):`, keyword arguments `f(1, b=2)`, unpacking `f(*items, **options)`, `lambda x: x * 2`, functions as values (`key=len`, `handlers['up']()`), closures and decorators (`@logged`) |
+| Classes | `class Dog(Animal):` with `__init__`, attributes (`self.x = v`, `self.n += 1`), methods, class attributes, `@classmethod`, `@staticmethod`, `super()`, `__str__`/`__repr__`, `__enter__`/`__exit__` (`with`), `isinstance`/`type`, your own exception classes (`class SensorError(OSError)`) |
 | Calls | `print(..., sep=, end=)`, `abs`, `min`, `max`, `bool`, `len`, `list`, `tuple`, `dict`, `range`, `sorted(key=, reverse=)`, `reversed`, `sum`, `any`, `all`, `enumerate`, `zip`, `format`, `isinstance`, `type`, `hasattr`, `getattr`, `callable`, `id`, `dir`, `globals()`, your own `def` functions, and hardware functions from `HardwareBridge` |
 | Formatting | `'%5d mV' % v`, `'%s=%r' % (k, v)`, `'{:>8}'.format(s)`, `'{name}'.format(name=x)`, f-strings `f'{v:04x}'`, with fill, alignment, sign, width, `,` separators and `d x X o b c s r f %` |
 | Scope | `global a, b` in a function, to assign globals (also creates them) |
 | Modules | `import m`, `import m as x, n`, `from m import f, C as K`; `m.f(...)`, `m.CONST` for native modules written in Rust |
 
-Not supported yet: floats, sets, `*args`/`**kwargs`, closures (a lambda or `def` can't see the local variables of the
-function it's in), classes (also your own exception classes), importing `.py` files.
+Not supported yet: floats, sets, generators (`yield`), `nonlocal`, operator methods on classes (`__add__`, `__eq__`,
+`__len__`, ...), multiple inheritance, importing `.py` files.
 See [ROADMAP.md](ROADMAP.md) for what's planned.
 
 ### Arithmetic operators
@@ -179,8 +180,29 @@ blink(3, 250)
 * Parameters can have default values (`def blink(times, ms=250):`), evaluated once when `def` runs, as in Python.
   Calls can name arguments: `blink(3, ms=100)`. A missing, unknown or repeated argument raises `Error::TypeError`.
 * Functions are values: `on_press = blink`, `sorted(names, key=len)`, `actions = {'up': up, 'down': down}`, and
-  `lambda` makes small ones: `sorted(points, key=lambda p: p[1])`. Up to 16 `def` functions and lambdas exist at a
-  time (`MAX_FUNCS`); a lambda takes one slot however often it runs.
+  `lambda` makes small ones: `sorted(points, key=lambda p: p[1])`. Up to 32 `def` functions, methods and lambdas
+  exist at a time (`MAX_FUNCS`); a lambda or method takes one slot however often it's made, and the slots of ones
+  nothing refers to any more are reclaimed by the garbage collector.
+* `*args` collects extra positional arguments into a tuple, `**kwargs` extra keyword arguments into a dict, and
+  `f(*items, **options)` unpacks them in a call.
+* A function or lambda made inside a function is a **closure**: it remembers the values the enclosing function's
+  variables had when it was made (Python remembers the variables themselves; for decorators and callbacks it's the
+  same), so decorators work:
+
+```python
+def logged(fn):
+    def wrapper(*args, **kwargs):
+        result = fn(*args, **kwargs)
+        print(fn.__name__, args, '->', result)
+        return result
+    return wrapper
+
+@logged
+def area(w, h=1):
+    return w * h
+
+area(3, h=4)                                  # area (3,) -> 12
+```
 
 ```python
 v = 1234
@@ -201,14 +223,14 @@ Limits (in `src/interpreter.rs`):
 | Constant | Value | Meaning | Error |
 |----------|-------|---------|-------|
 | `MAX_VARS` | 64 | Variables: globals plus the locals of all active calls | `OutOfMemory` |
-| `MAX_FUNCS` | 16 | `def` functions | `OutOfMemory` |
+| `MAX_FUNCS` | 32 | `def` functions, methods and lambdas | `OutOfMemory` |
 | `MAX_GLOBAL_DECLS` | 16 | Names declared `global` by all active calls together | `OutOfMemory` |
 | `MAX_CALL_DEPTH` | 8 | Nested function calls, recursion included | `RecursionLimit` |
 | `MAX_NESTING` | 24 | Nested blocks (`if`/`while`/function bodies) running at once | `OutOfMemory` |
 
 Native stack use grows with each nested call (an RPN buffer and value stack per call), which is why
-`MAX_CALL_DEPTH` is small. On a 64-bit host the `Interpreter` struct is about 13 KB (including the 128-value stack
-and the 256-entry object table of the heap); on 32-bit MCUs it's smaller.
+`MAX_CALL_DEPTH` is small. On a 64-bit host the `Interpreter` struct is about 19 KB (including the 128-value stack,
+the 256-entry object table of the heap and the 32-slot function table); on 32-bit MCUs it's about two thirds of that.
 
 ### Strings
 
@@ -270,6 +292,52 @@ finally:
   unlike CPython: a `while True: try: ... except: pass` loop can still be stopped.
 * Not supported yet: your own exception classes (they need classes), exception chaining (`raise X from Y` ignores
   `Y`), and tracebacks through function calls (the line is where the exception happened).
+
+### Classes
+
+```python
+class Sensor:
+    count = 0                                   # class attribute
+
+    def __init__(self, pin, name='sensor'):
+        self.pin = pin
+        self.name = name
+        Sensor.count += 1
+
+    def read(self):
+        return adc_mv(self.pin)
+
+    def __str__(self):
+        return '%s on pin %d' % (self.name, self.pin)
+
+    @classmethod
+    def made(cls):
+        return cls.count
+
+class Battery(Sensor):
+    def __init__(self):
+        super().__init__(35, 'battery')
+
+    def read(self):
+        return super().read() * 2               # a voltage divider halves it
+
+class SensorError(OSError):                     # your own exceptions
+    pass
+
+bat = Battery()
+print(bat, bat.read(), Sensor.made(), isinstance(bat, Sensor))   # battery on pin 35 4120 1 True
+```
+
+* A class is a heap object with a dict of its attributes; an instance has a dict of its own. Single inheritance:
+  attributes are looked up in the instance, then the class and its bases. `super()` works in methods.
+* `__init__`, `__str__`, `__repr__` (also inside lists: `print([p1, p2])`), `__enter__`/`__exit__` (`with obj as x:`)
+  are called by the interpreter; other special methods (`__add__`, `__eq__`, `__len__`, `__getitem__`, ...) aren't
+  (yet).
+* Classes are defined at the top level (not inside a function). An exception class can't have `__init__`: its
+  arguments are stored as given (`e.args`).
+* The body of a `class` statement runs like a function call, so it can contain any statement: `import os` inside a
+  class makes `cls.os`, as Thonny's helper class uses it.
+* Checked against CPython like the rest (`tests/cpython/classes.py`, `closures.py`).
 
 ### Lists, tuples and dicts
 
@@ -632,7 +700,8 @@ myapp.py:2: syntax error: unexpected EOF while parsing - not uploaded
 Interpreter → MicroPython (generic)*, then pick the board's port. The file browser shows the board's files
 (*View → Files*), files open from and save to the board (*File → Save as → MicroPython device*), *Run* (F5) runs the
 editor's code on the board, *Stop* interrupts it, the shell and the variables view work. See
-[Thonny support](#thonny-support) for how this is tested. Thonny 4.x/5.x need classes, which come next.
+[Thonny support](#thonny-support) for how this is tested. **Thonny 4.x and 5.x** (from thonny.org, and pip) work the
+same way: *Tools → Options → Interpreter → MicroPython (generic)*.
 
 `tools/mpy.py` needs `pyserial` and takes `--port` (default `/dev/ttyACM0`, or `$MPY_PORT`). It exits with status 1
 when the script raises an error. `mpremote`'s file commands work too (`mpremote fs ls`, `fs cp main.py :main.py`,
@@ -703,6 +772,8 @@ os.remove('old.txt')
 | `os.size(name)` | The size in bytes (micro:bit style; Thonny uses it) |
 | `os.statvfs('/')` | `(bsize, frsize, blocks, bfree, bavail, ...)` with one block per 32 KB file slot |
 | `os.uname()`, `os.sync()` | System name tuple; `sync` does nothing (files are saved when closed) |
+| `os.getcwd()`, `os.chdir(path)` | `''` (no directories), and `chdir` accepts only `''` / `'/'` |
+| `os.mkdir()`, `os.rmdir()` | `OSError` (`EPERM`): there are no directories |
 
 * Text mode (`'r'`, `'w'`) reads and writes `str` (UTF-8); binary mode (`'rb'`, `'wb'`) `bytes`. Reads go
   straight from flash into a new string, so a whole 32 KB file can be read only if the heap has room for it; read
@@ -726,23 +797,27 @@ possible write during a replace.
 Thonny reads and saves device files by running Python helper code on the board through the raw REPL. Thonny 3.2.7
 (Ubuntu 20.04) uses strings with escapes, `bytes` and `binascii` (files travel hex-encoded), dict comprehensions,
 `print(..., sep=, end=)`, `repr()`, `globals()`, `try`/`except`, `del` and `open()`. The flat file system matches
-Thonny's "device without directories" mode: the `os` module deliberately has no `getcwd`, which is how Thonny 3.2.7
-detects it, and then it lists files with `os.listdir()` and `os.size()`. Thonny 4.x/5.x also need classes with
-`@classmethod` (their helper is a class), which is Phase 5.8 of the [ROADMAP](ROADMAP.md).
+Thonny's "device without directories" mode: `os.getcwd()` returns `''`, which is how Thonny (3.2.7 as well as 4.x
+and 5.x) detects it, and then it lists files with `os.listdir()` and `os.size()`. Thonny 4.x/5.x first load a helper
+class onto the board (imports and `try`/`except` in the class body, `@builtins.classmethod` methods calling
+`cls.builtins.print(...)`), and use `sys.path`.
 
 **How it's tested.** `tools/thonny_e2e.py` runs Thonny's *own* backend code (no GUI) against the interpreter:
 `mpy-cli --repl` speaks the same REPL protocol as the firmware, and a pseudo-terminal connects it to Thonny's serial
 connection. It checks connecting, the file browser, saving and opening a text file and a binary file with every byte
 value, the shell (statements, expressions, tracebacks), *Run*, *Stop* on an endless loop, *Stop/Restart* (soft
-reboot), the variables view, the storage info and deleting. `tools/mpremote_e2e.py` does the same with mpremote.
-Both run in CI:
+reboot), the variables view, the storage info and deleting. `tools/thonny5_e2e.py` does the same with the backend of
+Thonny 4.x/5.x (tested with 4.1.7 and 5.0.0), and `tools/mpremote_e2e.py` with mpremote. They all run in CI:
 
 ```bash
-pip install pyserial jedi mpremote
+pip install pyserial jedi asttokens mpremote
 pip download --no-deps thonny==3.2.7 -d /tmp/thonny
 python3 -m zipfile -e /tmp/thonny/thonny-3.2.7-py3-none-any.whl /tmp/thonny/src
+pip download --no-deps thonny==5.0.0 -d /tmp/thonny5
+python3 -m zipfile -e /tmp/thonny5/thonny-5.0.0-py3-none-any.whl /tmp/thonny5/src
 cargo build
 python3 tools/thonny_e2e.py /tmp/thonny/src             # add --port /dev/ttyACM0 to test a real board
+python3 tools/thonny5_e2e.py /tmp/thonny5/src
 python3 tools/mpremote_e2e.py
 ```
 

@@ -141,6 +141,8 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
         match v {
             Value::Obj(r) if self.heap.kind(r) == Kind::Exception => match self.slot(r, 0) {
                 Value::Int(c) => Some(c as u8),
+                // An exception object of a user class: its built-in root class
+                Value::Obj(class) => self.exception_root(class),
                 _ => None,
             },
             _ => None,
@@ -179,6 +181,14 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
                 Err(err) => return err,
             },
             _ if self.exc_class(v).is_some() => v,
+            Value::Obj(r)
+                if self.heap.kind(r) == Kind::Class && self.exception_root(r).is_some() =>
+            {
+                match self.instantiate(r, &[], &[]) {
+                    Ok(exc) => exc,
+                    Err(err) => return err,
+                }
+            }
             // `raise 5`: exceptions must derive from BaseException
             _ => return Error::TypeError,
         };
@@ -229,6 +239,10 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
     pub(super) fn exc_matches(&self, class: u8, spec: Value<'a>) -> Result<bool, Error> {
         match spec {
             Value::ExcClass(of) => Ok(is_subclass(class, of)),
+            // `except MyError`: the pending exception's own class must derive from it
+            Value::Obj(r) if self.heap.kind(r) == Kind::Class => Ok(self
+                .class_of(self.exc)
+                .is_some_and(|c| self.derives_from(c, r))),
             Value::Obj(r) if self.heap.kind(r) == Kind::Tuple => {
                 for i in 0..self.count(r) {
                     if self.exc_matches(class, self.slot(r, i))? {
@@ -301,6 +315,7 @@ fn write_exception(
         (Error::Exception, Value::Obj(r)) if view.kind(r) == Kind::Exception => {
             match super::containers::slot(view, r, 0) {
                 Value::Int(c) => Some((c as u8, r)),
+                Value::Obj(_) => Some((1, r)),
                 _ => None,
             }
         }
@@ -314,7 +329,13 @@ fn write_exception(
         }
         return;
     };
-    out.write_str(class_name(class));
+    match super::containers::slot(view, r, 0) {
+        Value::Obj(user) => out.write_str(view.str(match super::containers::slot(view, user, 0) {
+            Value::HStr(name) => name,
+            _ => user,
+        })),
+        _ => out.write_str(class_name(class)),
+    }
     if super::containers::count(view, r) > 1 {
         out.write_str(": ");
         let lookup = |i: u8| super::lookup_module(hw_modules, i);

@@ -593,7 +593,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
             } else {
                 kwargs
                     .iter()
-                    .find(|(k, _)| *k == name)
+                    .find(|(k, _)| self.str_of(*k) == Some(name))
                     .map(|&(_, v)| v)
                     .ok_or(Error::KeyError)?
             };

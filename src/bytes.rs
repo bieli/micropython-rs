@@ -209,6 +209,10 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
     ) -> Result<Value<'a>, Error> {
         match (module, name, args) {
             ("os", _, _) => self.os_call(name, args),
+            ("sys", "exit", _) => {
+                let class = super::exceptions::class_by_name("SystemExit").unwrap_or(0);
+                Err(self.raise_new(class, args.first().copied()))
+            }
             ("binascii", "hexlify", [v]) => {
                 let len = self.bytes_of(*v).ok_or(Error::TypeError)?.len() * 2;
                 let r = self.alloc_obj(Kind::Bytes, len)?;

@@ -82,6 +82,8 @@ pub enum Token<'a> {
     Colon,
     /// `.` in `module.name`
     Dot,
+    /// `@` (decorators)
+    At,
     /// `;` between statements on one line
     Semicolon,
     Newline,
@@ -239,6 +241,7 @@ impl<'a> Lexer<'a> {
             ':' => Token::Colon,
             ';' => Token::Semicolon,
             '.' => Token::Dot,
+            '@' => Token::At,
             '~' => Token::Tilde,
             '\n' => Token::Newline,
             '=' => self.op_or_eq(Token::Assign, Token::EqEq),
@@ -834,8 +837,8 @@ mod tests {
 
     #[test]
     fn test_unexpected_char_error() {
-        let mut lexer = Lexer::new("@");
-        assert_eq!(lexer.next_token(), Err(Error::UnexpectedChar('@')));
+        let mut lexer = Lexer::new("`");
+        assert_eq!(lexer.next_token(), Err(Error::UnexpectedChar('`')));
         let mut lexer = Lexer::new("$");
         assert_eq!(lexer.next_token(), Err(Error::UnexpectedChar('$')));
     }

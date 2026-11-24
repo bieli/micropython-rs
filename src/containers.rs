@@ -161,14 +161,18 @@ pub(crate) fn render(
             let kind = view.kind(r);
             if kind == Kind::Exception {
                 // `ValueError('bad')` (repr) or `bad` (str)
-                let class = match slot(view, r, 0) {
-                    Value::Int(c) => c as u8,
-                    _ => 0,
+                let (class, user) = match slot(view, r, 0) {
+                    Value::Int(c) => (c as u8, None),
+                    Value::Obj(c) => (1, Some(c)),
+                    _ => (0, None),
                 };
                 let n = count(view, r) - 1;
                 let key_error = super::exceptions::class_name(class) == "KeyError";
                 if repr {
-                    sink(super::exceptions::class_name(class));
+                    match user {
+                        Some(c) => render(view, modules, slot(view, c, 0), false, depth + 1, sink),
+                        None => sink(super::exceptions::class_name(class)),
+                    }
                     sink("(");
                 } else if n == 1 {
                     let arg = slot(view, r, 1);
@@ -194,6 +198,29 @@ pub(crate) fn render(
                     render(view, modules, slot(view, r, i + 1), true, depth + 1, sink);
                 }
                 sink(")");
+                return;
+            }
+            if kind == Kind::Class {
+                sink("<class '");
+                render(view, modules, slot(view, r, 0), false, depth + 1, sink);
+                sink("'>");
+                return;
+            }
+            if kind == Kind::Instance {
+                // `<Point object>` (a custom `__str__` is used by print() and str())
+                sink("<");
+                if let Value::Obj(c) = slot(view, r, 0) {
+                    render(view, modules, slot(view, c, 0), false, depth + 1, sink);
+                }
+                sink(" object>");
+                return;
+            }
+            if matches!(kind, Kind::ClassMethod | Kind::StaticMethod | Kind::Super) {
+                sink(match kind {
+                    Kind::ClassMethod => "<classmethod object>",
+                    Kind::StaticMethod => "<staticmethod object>",
+                    _ => "<super object>",
+                });
                 return;
             }
             if kind == Kind::BoundMethod {
@@ -611,7 +638,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
             } else {
                 self.globals_len
             };
-            let funcs = self.funcs.iter().flatten().filter(|f| !f.lambda).count();
+            let funcs = self.funcs.iter().flatten().filter(|f| f.named()).count();
             return Some(n + funcs);
         }
         let Value::Obj(r) = v else {
@@ -1036,14 +1063,14 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
     /// `key=` and `reverse=` of `sorted()` and `list.sort()`.
     pub(super) fn sort_options(
         &self,
-        kwargs: &[(&str, Value<'a>)],
+        kwargs: &[(Value<'a>, Value<'a>)],
     ) -> Result<(Option<Value<'a>>, bool), Error> {
         let mut options = (None, false);
         for &(name, v) in kwargs {
-            match name {
-                "key" if v != Value::None => options.0 = Some(v),
-                "key" => {}
-                "reverse" => options.1 = self.truthy(v),
+            match self.str_of(name) {
+                Some("key") if v != Value::None => options.0 = Some(v),
+                Some("key") => {}
+                Some("reverse") => options.1 = self.truthy(v),
                 _ => return Err(Error::TypeError),
             }
         }
@@ -1054,7 +1081,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
     pub(super) fn sorted(
         &mut self,
         it: Value<'a>,
-        kwargs: &[(&str, Value<'a>)],
+        kwargs: &[(Value<'a>, Value<'a>)],
     ) -> Result<Value<'a>, Error> {
         let (key, reverse) = self.sort_options(kwargs)?;
         let v = self.collect_list(it, Kind::List)?;
@@ -1323,6 +1350,16 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
         let r = match v {
             Value::HStr(r) | Value::HBytes(r) => {
                 self.heap.mark(r);
+                return;
+            }
+            Value::Func(i) => {
+                let bit = 1u32 << i;
+                if self.func_marks & bit == 0 {
+                    self.func_marks |= bit;
+                    if let Some(f) = self.funcs[i as usize] {
+                        self.mark_value(f.defaults, work, n);
+                    }
+                }
                 return;
             }
             Value::Obj(r) => r,

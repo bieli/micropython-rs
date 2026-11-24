@@ -89,7 +89,16 @@ Thonny reads and saves device files by running Python helper code on the board (
 | 5.5 | **Built-ins**: keyword arguments (`print(..., sep=, end=)`), default parameters, `lambda`, functions as values, `hasattr`/`getattr`, `globals()`, `id`, `isinstance`/`type`, `dir`, `builtins`, `%`/`format()`/f-strings | Thonny 3.2.7+ | ✅ |
 | 5.6 | **`os` and `open()`** on the flash file system: file objects (read/readline/write/with/iteration), `os.listdir/remove/rename/stat/size/statvfs/uname` | Thonny 3.2.7+, `mpremote cp/ls` | ✅ |
 | 5.7 | **Thonny 3.2.7 end to end**: connect, file list, open `main.py`, save, Run/Stop (`tools/thonny_e2e.py` with Thonny's own backend code; also `mpremote fs`; bound methods, `os.ilistdir`) | milestone | ✅ on the PC (`mpy-cli --repl`); on the board: run `tools/thonny_e2e.py --port` |
-| 5.8 | **Classes, `@classmethod`, `builtins` module** | Thonny 4.x/5.x | ⬜ |
+| 5.8 | **Classes** (inheritance, `super()`, `@classmethod`/`@staticmethod`, `__str__`/`__enter__`, own exceptions), closures and decorators, `*args`/`**kwargs`, `sys`, `os.getcwd` | Thonny 4.x/5.x | ✅ (`tools/thonny5_e2e.py`: Thonny 4.1.7 and 5.0.0) |
+
+**Phase 5 is done on the PC:** Thonny 3.2.7, 4.1.7 and 5.0.0 and mpremote run against the interpreter through
+`mpy-cli --repl` (same REPL protocol as the firmware), in CI. **Still to do on a board:** flash the firmware and run
+`tools/thonny_e2e.py --port` / `tools/thonny5_e2e.py --port` (the board wasn't connected while 5.2–5.8 were built;
+the firmware builds, and 5.1 was tested on a TTGO). Every language feature is checked against CPython
+(`tests/cpython/*.py`, run by `cargo test`).
+
+Left for later (documented in the README): floats, sets, generators, `nonlocal`, operator methods (`__add__`,
+`__eq__`, ...), multiple inheritance, importing `.py` files, `bytearray`, step slices (`a[::2]`).
 
 Found while building 5.1:
 

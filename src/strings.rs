@@ -47,6 +47,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
     /// inside reachable containers are reachable too.
     pub(super) fn collect(&mut self) {
         self.heap.begin_mark();
+        self.func_marks = 0;
         let mut work = [ObjRef::from_index(0); crate::heap::MAX_OBJECTS];
         let mut n = 0;
         for i in 0..self.nvars {
@@ -57,18 +58,31 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
             self.mark_value(self.stack[i], &mut work, &mut n);
             self.trace(&mut work, &mut n);
         }
-        for v in [self.exc, self.handling] {
+        for v in [
+            self.exc,
+            self.handling,
+            self.method_class,
+            self.method_self,
+            self.closure_env,
+            self.next_env,
+        ] {
             self.mark_value(v, &mut work, &mut n);
             self.trace(&mut work, &mut n);
         }
-        // Default values of functions
+        // `def` functions are reachable by name (with their default values);
+        // lambdas and methods only if something refers to them
         for i in 0..self.funcs.len() {
-            if let Some(f) = self.funcs[i] {
-                self.mark_value(f.defaults, &mut work, &mut n);
+            if self.funcs[i].is_some_and(|f| f.named()) {
+                self.mark_value(Value::Func(i as u8), &mut work, &mut n);
                 self.trace(&mut work, &mut n);
             }
         }
         self.heap.sweep();
+        for (i, f) in self.funcs.iter_mut().enumerate() {
+            if self.func_marks & (1 << i) == 0 {
+                *f = None;
+            }
+        }
     }
 
     /// A string literal: zero-copy unless it contains escape sequences.
@@ -298,8 +312,19 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
         if Self::is_str(v) && !repr {
             return Ok(v); // strings are immutable: str(s) is s
         }
+        if let Some(custom) = self.custom_str(v, repr) {
+            return custom; // `__str__` / `__repr__` of a class
+        }
+        if self.holds_instances(v, 0) {
+            return self.container_str(v);
+        }
         if let Value::Func(f) = v {
             return self.function_repr(f);
+        }
+        if self.obj_kind(v) == Some(Kind::Closure) {
+            if let Value::Obj(r) = v {
+                return self.stringify(self.slot(r, 0), repr);
+            }
         }
         if v == Value::Globals {
             let d = self.globals_dict()?;
@@ -334,6 +359,62 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
         Ok(Value::HStr(dst))
     }
 
+    /// True if a list, tuple or dict contains instances (at any depth), whose
+    /// `__repr__` must run when it's printed.
+    fn holds_instances(&self, v: Value<'a>, depth: usize) -> bool {
+        let Value::Obj(r) = v else {
+            return false;
+        };
+        let slots = match self.heap.kind(r) {
+            Kind::List | Kind::Tuple => self.count(r),
+            Kind::Dict => 2 * self.count(r),
+            _ => return false,
+        };
+        depth < 8
+            && (0..slots).any(|i| {
+                let e = self.slot(r, i);
+                self.obj_kind(e) == Some(Kind::Instance) || self.holds_instances(e, depth + 1)
+            })
+    }
+
+    /// `repr()` of a container with instances in it: built from the
+    /// `repr()` of every element (which runs their `__repr__`).
+    fn container_str(&mut self, v: Value<'a>) -> Result<Value<'a>, Error> {
+        let Value::Obj(r) = v else {
+            return Err(Error::TypeError);
+        };
+        let kind = self.heap.kind(r);
+        let n = self.count(r);
+        let base = self.sp;
+        let result = (|| {
+            let (open, close) = match kind {
+                Kind::List => ("[", "]"),
+                Kind::Tuple => ("(", if n == 1 { ",)" } else { ")" }),
+                _ => ("{", "}"),
+            };
+            self.push(Value::Str(open))?;
+            for i in 0..n {
+                if i > 0 {
+                    self.push(Value::Str(", "))?;
+                }
+                if kind == Kind::Dict {
+                    let key = self.stringify(self.slot(r, 2 * i), true)?;
+                    self.push(key)?;
+                    self.push(Value::Str(": "))?;
+                    let val = self.stringify(self.slot(r, 2 * i + 1), true)?;
+                    self.push(val)?;
+                } else {
+                    let e = self.stringify(self.slot(r, i), true)?;
+                    self.push(e)?;
+                }
+            }
+            self.push(Value::Str(close))?;
+            self.join_pieces(base)
+        })();
+        self.sp = base;
+        result
+    }
+
     /// `<function name>` (Python adds an address, which means nothing here).
     fn function_repr(&mut self, f: u8) -> Result<Value<'a>, Error> {
         let name = match self.funcs[f as usize] {
@@ -356,6 +437,20 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
 
     /// Writes `v` as `print()` shows it (`repr == false`) or as the REPL does.
     pub(super) fn write_value(&mut self, v: Value<'a>, repr: bool) {
+        if let (Some(Kind::Closure), Value::Obj(r)) = (self.obj_kind(v), v) {
+            return self.write_value(self.slot(r, 0), repr);
+        }
+        if self.obj_kind(v) == Some(Kind::Instance) || self.holds_instances(v, 0) {
+            let base = self.sp;
+            if let Some(Ok(text)) = self.custom_str(v, repr) {
+                if self.push(text).is_ok() {
+                    self.write_value(text, false);
+                    self.sp = base;
+                    return;
+                }
+            }
+            self.sp = base;
+        }
         if let Value::Func(f) = v {
             let name = match self.funcs[f as usize] {
                 Some(func) if !func.lambda => func.name,
