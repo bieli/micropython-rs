@@ -23,3 +23,4 @@ multiple values
 unexpected keyword
 too many
 no kwargs for len
+(1, 1, (), []) (1, 2, (3, 4), [('k', 5)]) (7, 1, (), [('z', 0)])

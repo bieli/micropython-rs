@@ -1059,8 +1059,9 @@ impl<'a> Parser<'a> {
                 self.advance()?;
                 self.parse_test(code)?;
                 ndefaults += 1;
-            } else if ndefaults > 0 {
+            } else if marker == 0 && ndefaults > 0 {
                 // A parameter without a default after one with a default
+                // (`*args` and `**kwargs` never have one)
                 return Err(Error::InvalidSyntax);
             }
 

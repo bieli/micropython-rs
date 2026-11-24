@@ -89,7 +89,7 @@ Phase 3 status:
 Phase 4 follow-ups found while building it:
 
 * ✅ `str()`, string concatenation and formatting (5.1, 5.5).
-* ✅ Importing `.py` files as modules (6.3). Still open: a `machine` module with `Pin` objects.
+* ✅ Importing `.py` files as modules (6.3), and a `machine` module with `Pin` objects (7.1).
 * ✅ A file system: a flat file system in a `vfs` partition (`src/flatfs.rs`, `tools/mpy.py ls/put/get/rm`), with
   `open()` / `os` for scripts (5.6), so `mpremote cp`/`ls` and Thonny's file browser work.
 * Raw-paste mode for faster uploads (plain raw mode works).
@@ -159,8 +159,33 @@ Phase 5's heap made `bytes` possible, which the bus APIs of Phase 3 were waiting
   method chains with `**kwargs` ran out of variable slots), and `MAX_NESTING` from 24 to 40, raising
   `RecursionError` like the stack guard instead of `MemoryError`.
 
-Open after Phase 6: a `machine` module with `Pin`/`I2C`/`UART`/`SPI` objects (needs native classes), `bytearray`
+Open after Phase 6 (the `machine` module is done in 7.1): `bytearray`
 (in-place buffers), packages (`import a.b`), and testing against real sensors (an MPU6050 on I²C, a GPS on UART).
+
+## Phase 7: MicroPython compatibility (developer experience)
+
+| # | Feature | Why | Status |
+|---|---------|-----|--------|
+| 7.1 | **`machine` module**: `Pin`, `ADC`, `PWM`, `I2C`/`SoftI2C`, `UART`, `SPI`/`SoftSPI`, `WDT`, `reset`, `freq`, `unique_id`, written in Python (`micropython-esp32/modules/machine.py`) and built in as a frozen module (`Interpreter::with_frozen_modules`) | Code from MicroPython tutorials runs unchanged | ✅ on a TTGO T-Display (`scripts/machine_demo.py`) |
+| 7.2 | Raw-paste mode | Faster uploads from Thonny and mpremote | ⬜ |
+| 7.3 | Feature levels (`minimal`, `medium`, `full`) for the core library and the firmware | Smaller builds and less RAM for small chips | ⬜ |
+
+Done for 7.1:
+
+* New in the interpreter: frozen modules (a `machine.py` on the file system comes first, as in MicroPython),
+  hardware functions as values (`f = pin_write`, `reset = reset`; the script's own functions shadow them),
+  `__call__` (`led()`, `led(1)`), and `MAX_FUNCS` 64 (the module takes 43 slots; 6 KB more stack on the ESP32).
+* New in the firmware: open-drain pins (`OUT_OD`, `OUT_OD_PULLUP`), `pwm_u16` (16-bit duty, for `duty_u16` and
+  servo pulses in `duty_ns`), `i2c_init(sda, scl, freq)`, `unique_id()` (the MAC address), `cpu_freq()`.
+* Tested on the PC against a mock board that logs every hardware call (`tests/machine_module.rs`), and on the TTGO:
+  blinking, the BOOT button, ADC, PWM, I²C scan, UART `readline()` and SPI over loopback wires, the watchdog.
+* Found while writing it: a parameter with a default followed by `*args` or `**kwargs` (`def f(a, b=1, **kw)`) was a
+  syntax error (fixed, in `tests/cpython/functions.py` now), and `I2C(...)` hung the board: the old I2C driver was
+  dropped after the new one was made, which reset the peripheral under it.
+* Still missing: `Pin.irq`, `Timer`, `RTC`, `Signal`, the `*_into` methods (need `bytearray`), `time.sleep(0.5)`
+  (floats), keyword-only parameters (`def f(*, x)`), and unpacking into attributes (`self.a, self.b = a, b`). One
+  bus per kind (I²C, UART, SPI). A method call takes 1.2 ms (`pin_write` 0.27 ms); the CPU runs at esp-hal's
+  default 80 MHz, and 240 MHz would make all scripts up to 3× faster.
 
 ## Recommended order
 

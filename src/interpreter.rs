@@ -46,12 +46,12 @@ use crate::ast_parser::{
     STAR_ARGS, STAR_KWARGS,
 };
 use crate::heap::{Heap, Kind, ObjRef};
-use crate::{Arg, Error, FileSystem, HardwareBridge, Module, NoHardware, Output};
+use crate::{Arg, Error, FileSystem, HardwareBridge, HwFn, Module, NoHardware, Output};
 
 /// Variable slots, shared by globals and the locals of active function calls.
 pub const MAX_VARS: usize = 128;
 /// Number of `def` functions that can exist at the same time.
-pub const MAX_FUNCS: usize = 32;
+pub const MAX_FUNCS: usize = 64;
 /// Maximum depth of nested user function calls (recursion included).
 pub const MAX_CALL_DEPTH: usize = 8;
 /// `global` names declared by all active function calls together.
@@ -217,11 +217,13 @@ pub struct Interpreter<'a, O: Output, H: HardwareBridge = NoHardware> {
     closure_env: Value<'a>,
     next_env: Value<'a>,
     /// Reachable function slots during a collection (bit per slot).
-    func_marks: u32,
+    func_marks: u64,
     /// Lowest native stack address scripts may reach (`set_stack_floor`).
     stack_floor: usize,
     /// Memory for the source of imported `.py` modules (`with_module_memory`).
     module_memory: Option<&'a mut [u8]>,
+    /// `.py` modules built into the application (`with_frozen_modules`).
+    frozen: &'a [(&'a str, &'a str)],
     /// Imported `.py` modules by name (a dict), like `sys.modules`.
     py_modules: Value<'a>,
     /// The dict of the module whose code runs (`None`: the main script), and
@@ -280,6 +282,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
             func_marks: 0,
             stack_floor: 0,
             module_memory: None,
+            frozen: &[],
             py_modules: Value::None,
             module_env: Value::None,
             module_top: false,
@@ -316,6 +319,21 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
     pub fn with_module_memory(mut self, memory: &'a mut [u8]) -> Self {
         self.module_memory = Some(memory);
         self
+    }
+
+    /// Python modules built into the application, as `(name, source)` pairs
+    /// (e.g. `("machine", include_str!("machine.py"))`): `import name` runs the
+    /// source like a `name.py` file, but without reading it into the module
+    /// memory. Like MicroPython's frozen modules, a `name.py` on the file
+    /// system comes first.
+    pub fn with_frozen_modules(mut self, modules: &'a [(&'a str, &'a str)]) -> Self {
+        self.frozen = modules;
+        self
+    }
+
+    /// Like `with_frozen_modules`, on an interpreter that already exists.
+    pub fn set_frozen_modules(&mut self, modules: &'a [(&'a str, &'a str)]) {
+        self.frozen = modules;
     }
 
     /// Like `with_module_memory`, on an interpreter that already exists.
@@ -1739,6 +1757,19 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
                     .ok_or(err)
             })
             .or_else(|err| {
+                // A hardware function as a value: `f = pin_write`, `reset = reset`
+                // (after the script's own functions, which shadow it)
+                self.hw
+                    .as_ref()
+                    .and_then(|hw| hw.functions().iter().position(|f| f.name == name))
+                    .filter(|&i| i < HW_FUNCS as usize)
+                    .map(|i| Value::NativeFn {
+                        module: HW_FUNCS,
+                        func: i as u8,
+                    })
+                    .ok_or(err)
+            })
+            .or_else(|err| {
                 exceptions::class_by_name(name)
                     .map(Value::ExcClass)
                     .or_else(|| builtins::builtin_by_name(name).map(Value::Builtin))
@@ -2352,6 +2383,13 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
                 self.call_bound(r, args, kwargs)
             }
             Value::Obj(r) if self.heap.kind(r) == Kind::Class => self.instantiate(r, args, kwargs),
+            // An object whose class defines `__call__`: `pin()`, `pin(1)`
+            Value::Obj(r) if self.heap.kind(r) == Kind::Instance => {
+                match self.call_dunder_kw(f, "__call__", args, kwargs) {
+                    Some(result) => result,
+                    None => Err(Error::TypeError),
+                }
+            }
             Value::Obj(r) if self.heap.kind(r) == Kind::Closure => {
                 self.next_env = self.slot(r, 1);
                 let result = self.call_value(self.slot(r, 0), args, kwargs);
@@ -2615,11 +2653,11 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
             Ok(f @ (Value::NativeFn { .. } | Value::Func(_) | Value::ExcClass(_))) => {
                 return self.call_value(f, args, kwargs);
             }
-            // `w = f.write; w(data)`, `p = Point(1, 2)`
+            // `w = f.write; w(data)`, `p = Point(1, 2)`, `led(1)` (`__call__`)
             Ok(f @ Value::Obj(r))
                 if matches!(
                     self.heap.kind(r),
-                    Kind::BoundMethod | Kind::Class | Kind::Closure
+                    Kind::BoundMethod | Kind::Class | Kind::Closure | Kind::Instance
                 ) =>
             {
                 return self.call_value(f, args, kwargs);
@@ -2767,6 +2805,16 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
         func: u8,
         args: &[Value<'a>],
     ) -> Result<Value<'a>, Error> {
+        if module == HW_FUNCS {
+            let spec = *hw_tables(&self.hw)
+                .1
+                .get(func as usize)
+                .ok_or(Error::UnknownIdentifier)?;
+            if args.len() < spec.min_args as usize || args.len() > spec.max_args as usize {
+                return Err(Error::TypeError);
+            }
+            return self.call_bridge(None, spec.name, args, spec.returns_bytes);
+        }
         let m = self.module(module).ok_or(Error::UnknownIdentifier)?;
         let (module_name, spec) = (m.name, m.functions[func as usize]);
         if args.len() < spec.min_args as usize || args.len() > spec.max_args as usize {
@@ -2936,6 +2984,30 @@ const CORE_MODULES: &[Module] = &[
 ];
 
 /// Module number `i` among the core modules and then `hw` (the bridge's).
+/// Module number of the bridge's plain functions (`pin_write` as a value):
+/// `Value::NativeFn { module: HW_FUNCS, func }` indexes `functions()`.
+const HW_FUNCS: u8 = u8::MAX;
+
+/// The bridge's modules and plain functions.
+fn hw_tables<'h, H: HardwareBridge>(hw: &'h Option<&mut H>) -> (&'h [Module], &'h [HwFn]) {
+    match hw {
+        Some(hw) => (hw.modules(), hw.functions()),
+        None => (&[], &[]),
+    }
+}
+
+/// Names for rendering (`strings::ModuleLookup`): a module's name and functions.
+fn lookup_names<'m>(
+    modules: &'m [Module],
+    funcs: &'m [HwFn],
+    i: u8,
+) -> Option<(&'static str, &'m [HwFn])> {
+    if i == HW_FUNCS {
+        return Some(("", funcs));
+    }
+    lookup_module(modules, i).map(|m| (m.name, m.functions))
+}
+
 fn lookup_module(hw: &[Module], i: u8) -> Option<Module> {
     let i = i as usize;
     match CORE_MODULES.get(i) {
@@ -3745,7 +3817,7 @@ print(fact(7), fib(7))
         let code = core::mem::size_of::<Code<'_>>();
         let parser = core::mem::size_of::<Parser<'_>>();
         std::println!("interp={} code={} parser={}", interp, code, parser);
-        assert!(interp <= 24576, "Interpreter is {} bytes", interp);
+        assert!(interp <= 34816, "Interpreter is {} bytes", interp);
         assert!(code <= 1600, "Code is {} bytes", code);
         assert!(parser <= 128, "Parser is {} bytes", parser);
     }
@@ -3858,6 +3930,93 @@ print(fact(7), fib(7))
         fn constants(&self) -> &[(&'static str, i64)] {
             &[("HIGH", 1), ("LOW", 0), ("LED", 2)]
         }
+    }
+
+    #[test]
+    fn test_hw_functions_as_values() {
+        let mut out = MockOut::new();
+        let mut hw = TableHardware {
+            last_text: [0; 16],
+            text_len: 0,
+            pins: [0; 4],
+        };
+        let mut heap = [0u8; 4096];
+        let mut vm = Interpreter::with_hardware(&mut out, &mut hw).with_heap(&mut heap);
+        vm.eval(
+            "f = pin_write\nf(1, 7)\nprint(f, pin_read(1), callable(f), f == pin_write)\n\
+             def apply(g, *a):\n    return g(*a)\nprint(apply(pin_read, 1), [h(1) for h in [pin_read]])\n\
+             d = {'w': pin_write}\nd['w'](2, 9)\nprint(pin_read(2), type(f).__name__)",
+        )
+        .unwrap();
+        // Argument counts are still checked; keyword arguments aren't taken
+        assert_eq!(vm.eval("f(1)"), Err(Error::TypeError));
+        assert_eq!(vm.eval("f(1, value=2)"), Err(Error::TypeError));
+        // The script's own functions shadow hardware ones, also inside methods
+        vm.eval(
+            "def pin_read(p):\n    return 42\nclass C:\n    def m(self):\n        return pin_read(1)\n\
+             print(pin_read(1), C().m(), f)",
+        )
+        .unwrap();
+        let _ = vm;
+        assert_eq!(
+            out.as_str(),
+            "<function pin_write> 7 True True\n7 [7]\n9 builtin_function_or_method\n42 42 <function pin_write>\n"
+        );
+    }
+
+    #[test]
+    fn test_call_dunder() {
+        let mut out = MockOut::new();
+        let text = run_ok(
+            "class Pin:\n    def __init__(self, n):\n        self.n = n\n        self.v = 0\n\
+             \x20   def __call__(self, v=None, scale=1):\n        if v is None:\n            return self.v\n\
+             \x20       self.v = v * scale\np = Pin(2)\np(5)\nprint(p(), p(3, scale=10), p())\n\
+             class Plain:\n    pass\ntry:\n    Plain()()\nexcept TypeError:\n    print('not callable')\n",
+            &mut out,
+        );
+        assert_eq!(text, "5 None 30\nnot callable\n");
+    }
+
+    #[test]
+    fn test_frozen_modules() {
+        const FROZEN: &[(&str, &str)] = &[
+            ("blinker", "COUNT = 2\ndef twice(x):\n    return x * COUNT\nclass K:\n    def go(self):\n        return twice(5)\n"),
+            ("shadowed", "WHERE = 'frozen'\n"),
+        ];
+        let mut flash = std::vec![0u8; 4 * crate::flatfs::SLOT_SIZE as usize];
+        let files = RefCell::new(
+            crate::flatfs::FlatFs::mount(crate::flatfs::RamFlash::new(&mut flash)).unwrap(),
+        );
+        crate::FileSystem::create(&mut *files.borrow_mut(), "shadowed.py", false).unwrap();
+        crate::FileSystem::write_file(&mut *files.borrow_mut(), 1, b"WHERE = 'file'\n").unwrap();
+        crate::FileSystem::close_file(&mut *files.borrow_mut(), 1).unwrap();
+
+        let mut out = MockOut::new();
+        let mut heap = [0u8; 4096];
+        let mut memory = [0u8; 64];
+        let mut vm = Interpreter::new(&mut out)
+            .with_heap(&mut heap)
+            .with_frozen_modules(FROZEN);
+        // Frozen modules need neither files nor module memory
+        vm.eval(
+            "import blinker\nfrom blinker import K\nprint(blinker.twice(4), K().go(), blinker)",
+        )
+        .unwrap();
+        vm.eval("import shadowed\nprint(shadowed.WHERE)").unwrap();
+        // A file of the same name comes first (on a new interpreter)
+        let mut out2 = MockOut::new();
+        let mut heap2 = [0u8; 4096];
+        let mut vm2 = Interpreter::new(&mut out2)
+            .with_heap(&mut heap2)
+            .with_files(&files)
+            .with_module_memory(&mut memory)
+            .with_frozen_modules(FROZEN);
+        vm2.eval("import shadowed, blinker\nprint(shadowed.WHERE, blinker.COUNT)")
+            .unwrap();
+        assert_eq!(vm2.eval("import nothing"), Err(Error::ImportError));
+        let _ = (vm, vm2);
+        assert_eq!(out.as_str(), "8 10 <module 'blinker'>\nfrozen\n");
+        assert_eq!(out2.as_str(), "file 2\n");
     }
 
     #[test]

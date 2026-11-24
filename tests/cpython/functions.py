@@ -65,3 +65,11 @@ try:
     len([1], key=1)
 except TypeError:
     print('no kwargs for len')
+
+
+# Defaults followed by *args / **kwargs
+def options(a, b=1, *rest, **kw):
+    return a, b, rest, sorted(kw.items())
+
+
+print(options(1), options(1, 2, 3, 4, k=5), options(a=7, z=0))

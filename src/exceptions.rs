@@ -292,23 +292,23 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
     /// Writes the last line of a Python traceback for `err` to `out`:
     /// `ValueError: bad value` (or just the class name).
     pub fn write_exception(&self, err: Error, out: &mut dyn Output) {
-        write_exception(&self.heap.view(), self.hw_modules(), self.exc, err, out);
+        let (hw_modules, hw_funcs) = super::hw_tables(&self.hw);
+        write_exception(&self.heap.view(), hw_modules, hw_funcs, self.exc, err, out);
     }
 
     /// Like `write_exception`, to the interpreter's own `Output` (e.g. for
     /// a REPL, after it printed `Traceback (most recent call last):`).
     pub fn print_exception(&mut self, err: Error) {
-        let hw_modules: &[crate::Module] = match &self.hw {
-            Some(hw) => hw.modules(),
-            None => &[],
-        };
-        write_exception(&self.heap.view(), hw_modules, self.exc, err, &mut *self.out);
+        let (hw_modules, hw_funcs) = super::hw_tables(&self.hw);
+        let view = self.heap.view();
+        write_exception(&view, hw_modules, hw_funcs, self.exc, err, &mut *self.out);
     }
 }
 
 fn write_exception(
     view: &HeapView<'_>,
     hw_modules: &[crate::Module],
+    hw_funcs: &[crate::HwFn],
     exc: Value<'_>,
     err: Error,
     out: &mut dyn Output,
@@ -340,7 +340,7 @@ fn write_exception(
     }
     if super::containers::count(view, r) > 1 {
         out.write_str(": ");
-        let lookup = |i: u8| super::lookup_module(hw_modules, i);
+        let lookup = |i: u8| super::lookup_names(hw_modules, hw_funcs, i);
         super::containers::render(view, &lookup, exc, false, 0, &mut |p| out.write_str(p));
     }
 }

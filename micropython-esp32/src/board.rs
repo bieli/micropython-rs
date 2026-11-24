@@ -13,7 +13,7 @@ use esp_hal::{
     gpio::{AnyPin, DriveMode, Flex, InputConfig, Level, OutputConfig, Pull},
     i2c::master::{Config as I2cConfig, I2c},
     ledc::{
-        channel::{self, ChannelIFace},
+        channel::{self, ChannelHW, ChannelIFace},
         timer::{self, TimerIFace},
         LSGlobalClkSource, Ledc, LowSpeed,
     },
@@ -34,6 +34,9 @@ pub const OUT: i64 = 1;
 pub const IN: i64 = 2;
 pub const IN_PULLUP: i64 = 3;
 pub const IN_PULLDOWN: i64 = 4;
+/// Open-drain output (drives low, floats high), and the same with the pull-up.
+pub const OUT_OD: i64 = 5;
+pub const OUT_OD_PULLUP: i64 = 6;
 
 /// `reset_cause()` results, with MicroPython's `machine` module values.
 pub const PWRON_RESET: i64 = 1;
@@ -81,7 +84,7 @@ macro_rules! board_functions {
             micropython_rs::HwFn::new("ticks_ms", "", "Milliseconds since boot"),
             micropython_rs::HwFn::new("ticks_us", "", "Microseconds since boot"),
             micropython_rs::HwFn::new("ticks_diff", "new, old", "new - old"),
-            micropython_rs::HwFn::new("pin_mode", "pin, mode", "mode: OUT, IN, IN_PULLUP, IN_PULLDOWN"),
+            micropython_rs::HwFn::new("pin_mode", "pin, mode", "mode: OUT, IN, IN_PULLUP, IN_PULLDOWN, OUT_OD, OUT_OD_PULLUP"),
             micropython_rs::HwFn::new("pin_write", "pin, value", "Set an output pin to 0 or 1"),
             micropython_rs::HwFn::new("pin_read", "pin", "Read a pin: 0 or 1"),
             micropython_rs::HwFn::new("pin_toggle", "pin", "Invert an output pin"),
@@ -89,7 +92,9 @@ macro_rules! board_functions {
             micropython_rs::HwFn::with_args("adc_mv", 1, 2, "pin, [samples]", "Calibrated millivolts, averaged (default 16 samples)"),
             micropython_rs::HwFn::new("adc_vref", "", "ADC reference voltage from eFuse, mV"),
             micropython_rs::HwFn::new("pwm", "pin, freq, duty", "PWM output, duty in percent (0-100)"),
+            micropython_rs::HwFn::new("pwm_u16", "pin, freq, duty", "PWM output, duty 0-65535"),
             micropython_rs::HwFn::new("pwm_stop", "pin", "Stop PWM on a pin"),
+            micropython_rs::HwFn::with_args("i2c_init", 2, 3, "sda, scl, [freq]", "Move the I2C bus (default 21, 22 at 100 kHz)"),
             micropython_rs::HwFn::new("i2c_probe", "addr", "True if a device answers at addr"),
             micropython_rs::HwFn::new("i2c_scan", "", "Addresses of the devices on the bus (bytes)").returning_bytes(),
             micropython_rs::HwFn::new("i2c_write", "addr, data", "Send bytes; returns how many"),
@@ -112,6 +117,8 @@ macro_rules! board_functions {
             micropython_rs::HwFn::new("reset", "", "Restart the board"),
             micropython_rs::HwFn::new("reset_cause", "", "PWRON_RESET, WDT_RESET, SOFT_RESET, ..."),
             micropython_rs::HwFn::new("stack_peak", "", "Most stack bytes used since the last call"),
+            micropython_rs::HwFn::new("unique_id", "", "The chip's MAC address (6 bytes)").returning_bytes(),
+            micropython_rs::HwFn::new("cpu_freq", "", "CPU clock in Hz"),
             $($extra),*
         ]
     };
@@ -126,6 +133,8 @@ macro_rules! board_constants {
             ("IN", $crate::board::IN),
             ("IN_PULLUP", $crate::board::IN_PULLUP),
             ("IN_PULLDOWN", $crate::board::IN_PULLDOWN),
+            ("OUT_OD", $crate::board::OUT_OD),
+            ("OUT_OD_PULLUP", $crate::board::OUT_OD_PULLUP),
             ("HIGH", 1),
             ("LOW", 0),
             ("PWRON_RESET", $crate::board::PWRON_RESET),
@@ -168,7 +177,8 @@ pub struct Board<'d> {
     adc39: AdcPin<GPIO39<'d>, ADC1<'d>>,
     ledc: Ledc<'d>,
     pwm_pins: [Option<u8>; PWM_SLOTS],
-    i2c: I2c<'d, Blocking>,
+    /// The I2C bus (`None` only while `i2c_init` replaces it).
+    i2c: Option<I2c<'d, Blocking>>,
     /// UART1 and SPI3, once a script has set them up (`uart_init`, `spi_init`).
     uart: Option<Uart<'static, Blocking>>,
     spi: Option<Spi<'static, Blocking>>,
@@ -212,7 +222,7 @@ impl<'d> Board<'d> {
             adc39,
             ledc,
             pwm_pins: [None; PWM_SLOTS],
-            i2c,
+            i2c: Some(i2c),
             uart: None,
             spi: None,
             rtc: Rtc::new(p.lpwr),
@@ -253,14 +263,32 @@ impl<'d> Board<'d> {
                 self.adc_mv(int(0)?, samples).map(Some)
             }
             "adc_vref" => Ok(Some(adc_vref_mv() as i64)),
-            "pwm" => self
+            "pwm" => {
+                // Percent, as a 16-bit fraction (100 % = 65535)
+                let pct = int(2)?;
+                if !(0..=100).contains(&pct) {
+                    return Err(Error::ValueError);
+                }
+                self.pwm(pin_number(int(0)?)?, int(1)?, (pct * 65535 + 50) / 100)
+                    .map(|()| None)
+            }
+            "pwm_u16" => self
                 .pwm(pin_number(int(0)?)?, int(1)?, int(2)?)
                 .map(|()| None),
+            "i2c_init" => {
+                let freq = match args.get(2) {
+                    Some(f) => f.int()?,
+                    None => 100_000,
+                };
+                self.i2c_init(pin_number(int(0)?)?, pin_number(int(1)?)?, freq)
+                    .map(|()| None)
+            }
+            "cpu_freq" => Ok(Some(esp_hal::clock::CpuClock::default() as i64 * 1_000_000)),
             "pwm_stop" => self.pwm_stop(pin_number(int(0)?)?).map(|()| None),
             "i2c_probe" => Ok(Some(self.i2c_probe(i2c_addr(int(0)?)?) as i64)),
             "i2c_write" => {
                 let data = args[1].bytes()?;
-                self.i2c
+                self.bus()?
                     .write(i2c_addr(int(0)?)?, data)
                     .map_err(|_| Error::IoError)?;
                 Ok(Some(data.len() as i64))
@@ -325,7 +353,7 @@ impl<'d> Board<'d> {
             }
             "i2c_write_reg" => {
                 let bytes = [byte(int(1)?)?, byte(int(2)?)?];
-                self.i2c
+                self.bus()?
                     .write(i2c_addr(int(0)?)?, &bytes)
                     .map_err(|_| Error::IoError)?;
                 Ok(None)
@@ -372,6 +400,11 @@ impl<'d> Board<'d> {
                 .ok_or(Error::ValueError)
         };
         match name {
+            "unique_id" => {
+                let mac = esp_hal::efuse::Efuse::mac_address();
+                out[..mac.len()].copy_from_slice(&mac);
+                Ok(mac.len())
+            }
             "i2c_scan" => {
                 let mut n = 0;
                 for addr in 0x08..0x78 {
@@ -384,14 +417,14 @@ impl<'d> Board<'d> {
             }
             "i2c_read" => {
                 let n = count(int(1)?)?;
-                self.i2c
+                self.bus()?
                     .read(i2c_addr(int(0)?)?, &mut out[..n])
                     .map_err(|_| Error::IoError)?;
                 Ok(n)
             }
             "i2c_write_read" => {
                 let n = count(int(2)?)?;
-                self.i2c
+                self.bus()?
                     .write_read(i2c_addr(int(0)?)?, args[1].bytes()?, &mut out[..n])
                     .map_err(|_| Error::IoError)?;
                 Ok(n)
@@ -467,6 +500,43 @@ impl<'d> Board<'d> {
             .with_tx(tx)
             .with_rx(rx);
         self.uart = Some(uart);
+        Ok(())
+    }
+
+    /// `i2c_init(sda, scl, freq)`: the I2C bus on other pins or at another
+    /// speed. Its boot pins (21, 22) are always allowed, others must be.
+    fn i2c_init(&mut self, sda: u8, scl: u8, freq: i64) -> Result<(), Error> {
+        let freq = u32::try_from(freq)
+            .ok()
+            .filter(|f| (1_000..=1_000_000).contains(f));
+        let freq = freq.ok_or(Error::ValueError)?;
+        if sda == scl {
+            return Err(Error::ValueError);
+        }
+        let mut pin = |p: u8| {
+            if p == I2C_SDA || p == I2C_SCL {
+                // SAFETY: the boot I2C pins belong to this bus (never in the
+                // allowlist, so no other driver has them)
+                Ok(unsafe { AnyPin::steal(p) })
+            } else {
+                self.take_pin(p)
+            }
+        };
+        let (sda, scl) = (pin(sda)?, pin(scl)?);
+        // The old driver goes first: dropping it resets the peripheral, which
+        // would stop a new driver made before
+        self.i2c = None;
+        // SAFETY: the previous I2C0 driver was dropped just above, so this
+        // is the only one
+        let i2c0 = unsafe { esp_hal::peripherals::I2C0::steal() };
+        let i2c = I2c::new(
+            i2c0,
+            I2cConfig::default().with_frequency(Rate::from_hz(freq)),
+        )
+        .map_err(|_| Error::ValueError)?
+        .with_sda(sda)
+        .with_scl(scl);
+        self.i2c = Some(i2c);
         Ok(())
     }
 
@@ -556,12 +626,19 @@ impl<'d> Board<'d> {
             .get_or_insert_with(|| (Flex::new(unsafe { AnyPin::steal(pin) }), PinMode::Input));
 
         let pull = match mode {
-            OUT => {
+            OUT | OUT_OD | OUT_OD_PULLUP => {
                 // GPIO34-39 are input-only on the ESP32
                 if pin >= 34 {
                     return Err(Error::ValueError);
                 }
-                flex.0.apply_output_config(&OutputConfig::default());
+                let config = match mode {
+                    OUT => OutputConfig::default(),
+                    OUT_OD => OutputConfig::default().with_drive_mode(DriveMode::OpenDrain),
+                    _ => OutputConfig::default()
+                        .with_drive_mode(DriveMode::OpenDrain)
+                        .with_pull(Pull::Up),
+                };
+                flex.0.apply_output_config(&config);
                 flex.0.set_output_enable(true);
                 // Keep the input buffer on so `pin_read` returns the output level
                 flex.0.set_input_enable(true);
@@ -629,9 +706,10 @@ impl<'d> Board<'d> {
         Ok(raw_to_mv(raw as u32, adc_vref_mv()) as i64)
     }
 
+    /// PWM on `pin` with `duty` as a 16-bit fraction (0 = off, 65535 = on).
     fn pwm(&mut self, pin: u8, freq: i64, duty: i64) -> Result<(), Error> {
         self.check_allowed(pin)?;
-        if pin >= 34 || !(1..=40_000_000).contains(&freq) || !(0..=100).contains(&duty) {
+        if pin >= 34 || !(1..=40_000_000).contains(&freq) || !(0..=65535).contains(&duty) {
             return Err(Error::ValueError);
         }
         let slot = match self.pwm_pins.iter().position(|&p| p == Some(pin)) {
@@ -660,7 +738,7 @@ impl<'d> Board<'d> {
 
         // Use the finest duty resolution the frequency allows
         let mut timer = self.ledc.timer::<LowSpeed>(timer_number);
-        let configured = DUTY_RESOLUTIONS.iter().any(|&duty_bits| {
+        let bits = DUTY_RESOLUTIONS.iter().find(|&&duty_bits| {
             timer
                 .configure(timer::config::Config {
                     duty: duty_bits,
@@ -669,9 +747,7 @@ impl<'d> Board<'d> {
                 })
                 .is_ok()
         });
-        if !configured {
-            return Err(Error::ValueError);
-        }
+        let bits = *bits.ok_or(Error::ValueError)? as u32;
 
         // The hardware keeps running after the driver objects are dropped
         let mut channel = self
@@ -680,10 +756,13 @@ impl<'d> Board<'d> {
         channel
             .configure(channel::config::Config {
                 timer: &timer,
-                duty_pct: duty as u8,
+                duty_pct: 0,
                 drive_mode: DriveMode::PushPull,
             })
             .map_err(|_| Error::IoError)?;
+        // The duty in the timer's resolution: 2^bits steps (2^bits = always on)
+        let steps = 1u64 << bits;
+        channel.set_duty_hw(((duty as u64 * steps + 32767) / 65535) as u32);
         self.pwm_pins[slot] = Some(pin);
         Ok(())
     }
@@ -711,12 +790,16 @@ impl<'d> Board<'d> {
         self.pins[pin as usize] = Some((flex, PinMode::Output));
     }
 
+    fn bus(&mut self) -> Result<&mut I2c<'d, Blocking>, Error> {
+        self.i2c.as_mut().ok_or(Error::IoError)
+    }
+
     fn i2c_probe(&mut self, addr: u8) -> bool {
-        self.i2c.write(addr, &[]).is_ok()
+        self.bus().is_ok_and(|bus| bus.write(addr, &[]).is_ok())
     }
 
     fn i2c_read(&mut self, addr: i64, reg: i64, buf: &mut [u8]) -> Result<(), Error> {
-        self.i2c
+        self.bus()?
             .write_read(i2c_addr(addr)?, &[byte(reg)?], buf)
             .map_err(|_| Error::IoError)
     }

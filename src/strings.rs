@@ -15,10 +15,12 @@
 use super::containers::render;
 use super::{Interpreter, Value};
 use crate::heap::{Kind, ObjRef};
-use crate::{Error, HardwareBridge, Module, Output};
+use crate::{Error, HardwareBridge, HwFn, Output};
 
-/// Looks up a module by index (core modules first, then the bridge's).
-pub(crate) type ModuleLookup<'m> = &'m dyn Fn(u8) -> Option<Module>;
+/// The names of a module by index (core modules first, then the bridge's;
+/// `HW_FUNCS` is the bridge's plain functions, with an empty module name):
+/// the module's name and its function table.
+pub(crate) type ModuleLookup<'m> = &'m dyn Fn(u8) -> Option<(&'static str, &'m [HwFn])>;
 
 impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
     /// The text of a string value.
@@ -353,21 +355,15 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
             self.sp = base;
             return result;
         }
-        let hw_modules: &[Module] = match &self.hw {
-            Some(hw) => hw.modules(),
-            None => &[],
-        };
-        let lookup = |i: u8| super::lookup_module(hw_modules, i);
+        let (hw_modules, hw_funcs) = super::hw_tables(&self.hw);
+        let lookup = |i: u8| super::lookup_names(hw_modules, hw_funcs, i);
         let mut len = 0;
         render(&self.heap.view(), &lookup, v, repr, 0, &mut |p| {
             len += p.len()
         });
         let dst = self.alloc_obj(Kind::Str, len)?;
-        let hw_modules: &[Module] = match &self.hw {
-            Some(hw) => hw.modules(),
-            None => &[],
-        };
-        let lookup = |i: u8| super::lookup_module(hw_modules, i);
+        let (hw_modules, hw_funcs) = super::hw_tables(&self.hw);
+        let lookup = |i: u8| super::lookup_names(hw_modules, hw_funcs, i);
         // `dst` is the newest object, so everything `v` refers to is below it
         let (view, out) = self.heap.view_and_dst(dst);
         let mut at = 0;
@@ -491,11 +487,8 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
             self.sp = base;
             return;
         }
-        let hw_modules: &[Module] = match &self.hw {
-            Some(hw) => hw.modules(),
-            None => &[],
-        };
-        let lookup = |i: u8| super::lookup_module(hw_modules, i);
+        let (hw_modules, hw_funcs) = super::hw_tables(&self.hw);
+        let lookup = |i: u8| super::lookup_names(hw_modules, hw_funcs, i);
         let out = &mut *self.out;
         render(&self.heap.view(), &lookup, v, repr, 0, &mut |p| {
             out.write_str(p)
@@ -985,19 +978,18 @@ pub(crate) fn write_plain(
             }
         }
         Value::Module(m) => {
-            let name = modules(m).map_or("?", |m| m.name);
+            let name = modules(m).map_or("?", |m| m.0);
             for part in ["<module '", name, "'>"] {
                 sink(part);
             }
         }
         Value::NativeFn { module, func } => {
             let (m, f) = modules(module).map_or(("?", "?"), |m| {
-                (
-                    m.name,
-                    m.functions.get(func as usize).map_or("?", |f| f.name),
-                )
+                (m.0, m.1.get(func as usize).map_or("?", |f| f.name))
             });
-            for part in ["<function ", m, ".", f, ">"] {
+            // A plain hardware function has no module: `<function pin_write>`
+            let dot = if m.is_empty() { "" } else { "." };
+            for part in ["<function ", m, dot, f, ">"] {
                 sink(part);
             }
         }

@@ -44,7 +44,16 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
                 return Ok(module);
             }
         }
-        let source = self.load_source(name)?;
+        // `name.py` from the file system, else a frozen module of that name
+        let source = match self.load_source(name) {
+            Err(Error::ImportError) => self
+                .frozen
+                .iter()
+                .find(|(n, _)| *n == name)
+                .map(|&(_, source)| source)
+                .ok_or(Error::ImportError)?,
+            other => other?,
+        };
 
         // The module object: (name, dict), cached before its code runs (so an
         // import cycle gets the half-made module, like Python)

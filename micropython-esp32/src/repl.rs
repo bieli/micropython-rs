@@ -148,6 +148,13 @@ pub fn run<O: Output, H: HardwareBridge>(
     }
 }
 
+/// Python modules built into the firmware (frozen): imported like files,
+/// without using the module memory. A file of the same name comes first.
+static FROZEN_MODULES: &[(&str, &str)] = &[
+    #[cfg(feature = "machine")]
+    ("machine", include_str!("../modules/machine.py")),
+];
+
 /// A new interpreter for a session. Out of line: building it (from parts
 /// made by value) takes temporary copies of its 15 KB, which would otherwise
 /// stay in `run`'s frame, under every script, for good. The REPL then only
@@ -167,6 +174,7 @@ fn new_interpreter<'a, O: Output, H: HardwareBridge>(
         vm.set_files(files);
         vm.set_module_memory(module_memory);
     }
+    vm.set_frozen_modules(FROZEN_MODULES);
     vm.set_abort_flag(&ABORT);
     // Deep recursion raises RecursionError instead of overflowing the stack
     vm.set_stack_floor(Some(stack_floor()));

@@ -223,14 +223,14 @@ Limits (in `src/interpreter.rs`):
 | Constant | Value | Meaning | Error |
 |----------|-------|---------|-------|
 | `MAX_VARS` | 128 | Variables: globals plus the locals of all active calls | `OutOfMemory` |
-| `MAX_FUNCS` | 32 | `def` functions, methods and lambdas | `OutOfMemory` |
+| `MAX_FUNCS` | 64 | `def` functions, methods and lambdas (the firmware's `machine` module takes 43) | `OutOfMemory` |
 | `MAX_GLOBAL_DECLS` | 16 | Names declared `global` by all active calls together | `OutOfMemory` |
 | `MAX_CALL_DEPTH` | 8 | Nested function calls, recursion included | `RecursionLimit` |
 | `MAX_NESTING` | 40 | Nested blocks (`if`/`while`/function bodies) running at once | `RecursionLimit` |
 
 Native stack use grows with each nested call (an RPN buffer and parser state per call, about 7.8 KB on the ESP32,
 see [Stack budget](#stack-budget-measured-on-the-esp32)), which is why `MAX_CALL_DEPTH` is small. On a 64-bit host the `Interpreter` struct is about 22 KB (including the 128 variable
-slots, the 128-value stack, the 256-entry object table of the heap and the 32-slot function table); on the ESP32 it's 14 960 bytes.
+slots, the 128-value stack, the 256-entry object table of the heap and the 32-slot function table); on the ESP32 it's about 21 KB.
 
 ### Strings
 
@@ -460,22 +460,23 @@ include everything below the script: `main`, the REPL and `eval()`.
 
 | Code | Peak stack |
 |------|-----------:|
-| A statement at the top level (`x = 1`) | 35 KB |
+| A statement at the top level (`x = 1`) | 42 KB |
 | Each further Python call (`def` function or method) | + 7.8 KB |
 | Each nested block (`if`, `for`, `while`, `try`, `with`) | + 1.6 KB |
-| Recursion until `RecursionError` (`MAX_CALL_DEPTH` = 8 calls) | 107 KB |
-| Methods with `with`, `try`, `*args`/`**kwargs`, f-strings, comprehensions, until `RecursionError` | 136 KB |
-| **Worst case found**: 4 nested blocks per call, until `RecursionError` (`MAX_NESTING` = 40) | **147 KB** |
+| Recursion until `RecursionError` (`MAX_CALL_DEPTH` = 8 calls) | 114 KB |
+| Methods with `with`, `try`, `*args`/`**kwargs`, f-strings, comprehensions, until `RecursionError` | 142 KB |
+| **Worst case found**: 4 nested blocks per call, until `RecursionError` (`MAX_NESTING` = 40) | **153 KB** |
 
 The main stack is 181 KB (what the 520 KB of RAM leaves after statics, the REPL's buffers in `dram2` and esp-hal), so
-the interpreter's limits stop scripts about 22 KB above the stack guard's floor (181 − 16 KB margin): the guard is the
-second line of defense. Of the 35 KB at the top level, `main` takes 11 KB (the board's drivers, a 4 KB SPI buffer and
-the flash driver's 4 KB buffer), the REPL 16 KB (the 15 KB `Interpreter` struct, built out of line so that no
-temporary copy of it stays on the stack), and `eval()` with the call of `stack_peak()` itself the remaining 8 KB. `make report` lists the
+the interpreter's limits stop scripts about 16 KB above the stack guard's floor (181 − 16 KB margin): the guard is the
+second line of defense. Of the 42 KB at the top level, `main` takes 11 KB (the board's drivers, a 4 KB SPI buffer and
+the flash driver's 4 KB buffer), the REPL 23 KB (the 21 KB `Interpreter` struct, built out of line so that no
+temporary copy of it stays on the stack; 6 KB of it are the 64 function slots), and `eval()` with the call of
+`stack_peak()` itself the remaining 8 KB. `make report` lists the
 biggest stack frames of a build.
 
-On another MCU, budget about 35 KB for `eval()` plus 8 KB per call level you allow, or lower `MAX_CALL_DEPTH`
-and `MAX_NESTING` and set the stack floor. Keep the `Interpreter` (15 KB on 32-bit targets) in one place: build it
+On another MCU, budget about 42 KB for `eval()` plus 8 KB per call level you allow, or lower `MAX_CALL_DEPTH`
+and `MAX_NESTING` and set the stack floor. Keep the `Interpreter` (21 KB on 32-bit targets) in one place: build it
 with `new()`/`with_hardware()` and the `set_` methods rather than moving it through the `with_` builders.
 
 **No `unsafe` code.** The core library is `#![forbid(unsafe_code)]` (except the `link_section` attribute of the
@@ -940,6 +941,7 @@ terminal against it on a PC without a board.
 | [`scripts/button.py`](micropython-esp32/scripts/button.py) | Counting button presses with a pull-up and debouncing, timed with `ticks_ms` |
 | [`scripts/pwm_fade.py`](micropython-esp32/scripts/pwm_fade.py) | Fading an LED, and a 50 Hz servo pulse |
 | [`scripts/i2c_scan.py`](micropython-esp32/scripts/i2c_scan.py) | Scanning the I²C bus, and reading registers with `i2c_write_read` |
+| [`scripts/machine_demo.py`](micropython-esp32/scripts/machine_demo.py) | `from machine import Pin, ADC, PWM, I2C, UART, SPI, WDT`: the `machine` module, checked with two jumper wires |
 | [`scripts/stack_budget.py`](micropython-esp32/scripts/stack_budget.py) | How much native stack calls, blocks and recursion take (`stack_peak()`) |
 | [`scripts/bus_loopback.py`](micropython-esp32/scripts/bus_loopback.py) | UART and SPI checked with one jumper wire each (TX to RX, MOSI to MISO) |
 | [`scripts/adc.py`](micropython-esp32/scripts/adc.py) | Averaging ADC samples and converting them to millivolts |
@@ -1035,27 +1037,72 @@ ADC2, so ADC1 readings (GPIO32–39) came out mirrored (`4095 - value`; an uncon
 
 ### Hardware API
 
-The names follow MicroPython's `time` and `machine` modules, as flat functions (there's no `machine` module or `Pin` object yet).
+The names follow MicroPython's `time` and `machine` modules, as flat functions. The [`machine` module](#the-machine-module)
+wraps them in MicroPython's classes (`Pin`, `ADC`, `PWM`, `I2C`, `UART`, `SPI`, `WDT`).
 Pins are plain GPIO numbers.
 
 | Area | Functions | Notes |
 |------|-----------|-------|
 | Time | `sleep_ms(ms)`, `sleep_us(us)`, `ticks_ms()`, `ticks_us()`, `ticks_diff(new, old)` | `delay_ms(ms)` is an alias of `sleep_ms`. Ticks count from boot as 64-bit values and don't wrap |
-| GPIO | `pin_mode(pin, mode)`, `pin_write(pin, value)`, `pin_read(pin)`, `pin_toggle(pin)` | Modes: `OUT`, `IN`, `IN_PULLUP`, `IN_PULLDOWN`. `pin_write` on an unconfigured pin makes it an output; `pin_read` on one makes it an input. Outputs read back their own level |
+| GPIO | `pin_mode(pin, mode)`, `pin_write(pin, value)`, `pin_read(pin)`, `pin_toggle(pin)` | Modes: `OUT`, `IN`, `IN_PULLUP`, `IN_PULLDOWN`, `OUT_OD` (open drain), `OUT_OD_PULLUP`. `pin_write` on an unconfigured pin makes it an output; `pin_read` on one makes it an input. Outputs read back their own level |
 | ADC | `adc_read(pin)`, `adc_mv(pin, [samples])`, `adc_vref()` | `adc_read`: raw 12-bit value (0–4095, 11 dB attenuation) on GPIO34, 36 and 39. `adc_mv`: millivolts, averaged over `samples` readings (default 16), calibrated with the chip's eFuse reference voltage (`adc_vref()`, e.g. 1135 mV). See [ADC accuracy](#adc-accuracy) |
-| PWM | `pwm(pin, freq, duty)`, `pwm_stop(pin)` | `duty` in percent (0–100). Up to 4 pins at once, each with its own frequency (LEDC timers 0–3). The duty resolution adapts to the frequency (14 bits at 50 Hz for servos). `pwm_stop` leaves the pin as a low output |
-| I²C | `i2c_scan()`, `i2c_write(addr, data)`, `i2c_read(addr, n)`, `i2c_write_read(addr, data, n)`, `i2c_probe(addr)`, `i2c_read_reg(addr, reg)`, `i2c_read_reg16(addr, reg)`, `i2c_write_reg(addr, reg, value)` | 100 kHz on SDA = GPIO21, SCL = GPIO22. `i2c_scan()` returns the addresses as `bytes` (`for a in i2c_scan(): print(hex(a))`). `data` is `bytes` (or a `str`); reads return `bytes`, up to 512 at a time. `i2c_write_read` writes (e.g. a register number) and reads back without a stop in between. 16-bit reads are big-endian. A device that doesn't answer raises `OSError` |
+| PWM | `pwm(pin, freq, duty)`, `pwm_u16(pin, freq, duty)`, `pwm_stop(pin)` | `duty` in percent (0–100), or for `pwm_u16` as 0–65535 (MicroPython's `duty_u16`). Up to 4 pins at once, each with its own frequency (LEDC timers 0–3). The duty resolution adapts to the frequency (14 bits at 50 Hz for servos). `pwm_stop` leaves the pin as a low output |
+| I²C | `i2c_init(sda, scl, [freq])`, `i2c_scan()`, `i2c_write(addr, data)`, `i2c_read(addr, n)`, `i2c_write_read(addr, data, n)`, `i2c_probe(addr)`, `i2c_read_reg(addr, reg)`, `i2c_read_reg16(addr, reg)`, `i2c_write_reg(addr, reg, value)` | 100 kHz on SDA = GPIO21, SCL = GPIO22 at boot; `i2c_init` moves the bus to other allowed pins or changes the speed (1 kHz – 1 MHz). `i2c_scan()` returns the addresses as `bytes` (`for a in i2c_scan(): print(hex(a))`). `data` is `bytes` (or a `str`); reads return `bytes`, up to 512 at a time. `i2c_write_read` writes (e.g. a register number) and reads back without a stop in between. 16-bit reads are big-endian. A device that doesn't answer raises `OSError` |
 | UART | `uart_init(tx, rx, [baud])`, `uart_write(data)`, `uart_read([n], [timeout_ms])`, `uart_any()` | UART1 on any two allowed pins, default 115 200 baud (300 to 5 000 000). `uart_write` returns the bytes sent; `uart_read` waits until `n` bytes (default 512) or `timeout_ms` (default 100) and returns what came, possibly `b''`; `uart_any()` counts the bytes waiting. Ctrl-C stops a wait. `uart_init` again changes pins or speed |
 | SPI | `spi_init(sck, mosi, miso, [khz], [mode])`, `spi_write(data)`, `spi_transfer(data)`, `spi_read(n, [fill])` | SPI3 master, default 1000 kHz (10 to 40 000) and mode 0 (0–3). Chip select is yours: a GPIO with `pin_write`. `spi_transfer` returns the bytes read while sending; `spi_read` sends `fill` (default 0) |
 | Watchdog | `wdt_enable(timeout_ms)`, `wdt_feed()`, `wdt_disable()` | The RTC watchdog resets the whole board when it isn't fed in time. `sleep_ms` feeds it automatically every 100 ms |
-| System | `reset()`, `reset_cause()`, `stack_peak()` | `reset_cause()` returns `PWRON_RESET`, `HARD_RESET`, `WDT_RESET`, `DEEPSLEEP_RESET` or `SOFT_RESET` (MicroPython's values). The firmware also prints the reset reason at boot. `stack_peak()`: the most bytes of the main stack used since its previous call (or boot), see [Stack budget](#stack-budget-measured-on-the-esp32) |
+| System | `reset()`, `reset_cause()`, `stack_peak()`, `unique_id()`, `cpu_freq()` | `reset_cause()` returns `PWRON_RESET`, `HARD_RESET`, `WDT_RESET`, `DEEPSLEEP_RESET` or `SOFT_RESET` (MicroPython's values). The firmware also prints the reset reason at boot. `stack_peak()`: the most bytes of the main stack used since its previous call (or boot), see [Stack budget](#stack-budget-measured-on-the-esp32). `unique_id()`: the chip's MAC address (6 bytes). `cpu_freq()`: 80 000 000 (esp-hal's default clock) |
 | Battery (`tft` only) | `battery_mv([samples])` | Battery voltage in mV: switches on the TTGO's divider (`ADC_EN`, GPIO14), reads GPIO34, doubles it, switches the divider off |
 | TFT (`tft` only) | `cls()`, `color(r, g, b)`, `text(x, y, s)`, `rect(x, y, w, h)`, `backlight(on)` | `color` sets the text and fill color (0–255 per channel). `text` and `rect` draw at pixel positions. `WIDTH` and `HEIGHT` are 240 and 135 |
+
+#### The `machine` module
+
+MicroPython's hardware classes, so code from MicroPython tutorials runs unchanged:
+
+```python
+from machine import Pin, ADC, PWM, I2C, UART
+import time
+
+led = Pin(2, Pin.OUT)
+button = Pin(0, Pin.IN, Pin.PULL_UP)
+while button.value():               # until the BOOT button is pressed
+    led.value(not led.value())
+    time.sleep_ms(250)
+
+adc = ADC(Pin(34), atten=ADC.ATTN_11DB)
+print(adc.read_u16(), adc.read_uv())             # 0-65535, calibrated microvolts
+servo = PWM(Pin(13), freq=50, duty_ns=1500000)   # 1.5 ms pulses
+i2c = I2C(0, scl=Pin(22), sda=Pin(21), freq=400000)
+print(i2c.scan(), i2c.readfrom_mem(0x68, 0x75, 1))
+gps = UART(2, baudrate=9600, tx=17, rx=26, timeout=1000)
+print(gps.readline())
+```
+
+It's Python ([`modules/machine.py`](micropython-esp32/modules/machine.py)) on top of the functions above, built into
+the firmware as a *frozen module* (`Interpreter::with_frozen_modules`): imported like a file, without using the module
+memory. A `machine.py` on the board's file system comes first, as in MicroPython. Cargo feature `machine` (on by default).
+
+| Class | Supported |
+|-------|-----------|
+| `Pin(id, mode, pull, value=)` | `Pin.IN`, `Pin.OUT`, `Pin.OPEN_DRAIN`, `Pin.PULL_UP`, `Pin.PULL_DOWN`; `value([v])`, `on()`, `off()`, `toggle()`, `init(...)`, `pin()` / `pin(v)` |
+| `ADC(pin, atten=)` | `read_u16()`, `read()` (12-bit), `read_uv()` (calibrated), `atten()`, `width()`; only `ATTN_11DB` and `WIDTH_12BIT` (others raise `ValueError`) |
+| `PWM(pin, freq=, duty=, duty_u16=, duty_ns=)` | `freq([f])`, `duty([0-1023])`, `duty_u16([0-65535])`, `duty_ns([ns])`, `init(...)`, `deinit()`; up to 4 pins |
+| `I2C(id, scl=, sda=, freq=)`, `SoftI2C(scl, sda, freq=)` | `scan()`, `readfrom()`, `writeto()`, `readfrom_mem()`, `writeto_mem()` (also `addrsize=16`); one bus (pins default to 22 and 21) |
+| `UART(id, baudrate, tx=, rx=, timeout=)` | `write()`, `read([n])` (`None` when nothing came), `readline()`, `any()`, `init(...)`; id 1 or 2 (UART0 is the REPL), one at a time, 8N1 only; `UART(2)` defaults to tx 17, rx 16 |
+| `SPI(id, baudrate, polarity=, phase=, sck=, mosi=, miso=)`, `SoftSPI` | `read(n, [write])`, `write()`, `init(...)`; one bus, 8 bits MSB first; MicroPython's default pins for ids 1 and 2 |
+| `WDT(timeout=)` | `feed()` |
+| functions | `reset()`, `reset_cause()` and its constants, `unique_id()`, `freq()` (80 MHz, fixed), `lightsleep(ms)` (waits) |
+
+Not there yet: `Pin.irq`, `Timer`, `RTC`, `Signal`, and the `*_into` methods (`readinto`, `write_readinto`,
+`readfrom_mem_into`), which need `bytearray`. `time.sleep(0.5)` needs floats: use `time.sleep_ms(500)`. The module
+takes 43 of the 64 function slots (`MAX_FUNCS`), and each method call runs Python code: `led.value(1)` takes 1.2 ms
+on the ESP32, `pin_write(2, 1)` 0.27 ms. Fine for blinking, sensors and buses, too slow for bit-banging.
 
 #### Modules
 
 | Module | Builds | Contents |
 |--------|--------|----------|
+| `machine` | both | MicroPython's hardware classes, see [The `machine` module](#the-machine-module) |
 | `time` | both | `sleep(s)`, `sleep_ms(ms)`, `sleep_us(us)`, `ticks_ms()`, `ticks_us()`, `ticks_diff(new, old)`, with MicroPython's names, so `import time; time.sleep_ms(100)` works as on MicroPython |
 | `display` | `tft` | Drawing on the 240 × 135 TFT. See below |
 | `buttons` | both | Debounced button events with short and long presses. TTGO: `LEFT` = GPIO0, `RIGHT` = GPIO35; generic build: `LEFT` = BOOT button (GPIO0) |

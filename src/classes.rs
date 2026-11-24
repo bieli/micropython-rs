@@ -417,6 +417,22 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
         Some(self.call_with_first(f, obj, args, &[]))
     }
 
+    /// Like `call_dunder`, with keyword arguments.
+    pub(super) fn call_dunder_kw(
+        &mut self,
+        obj: Value<'a>,
+        name: &str,
+        args: &[Value<'a>],
+        kwargs: Kwargs<'_, 'a>,
+    ) -> Option<Result<Value<'a>, Error>> {
+        let inst = self.as_instance(obj)?;
+        let class = self.as_class(self.slot(inst, I_CLASS))?;
+        let f @ Value::Func(_) = self.class_lookup(class, name)? else {
+            return None;
+        };
+        Some(self.call_with_first(f, obj, args, kwargs))
+    }
+
     /// `str(obj)` / `repr(obj)` through `__str__` / `__repr__`, if defined.
     #[inline(never)]
     pub(super) fn custom_str(

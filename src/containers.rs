@@ -1363,7 +1363,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
                 return;
             }
             Value::Func(i) => {
-                let bit = 1u32 << i;
+                let bit = 1u64 << i;
                 if self.func_marks & bit == 0 {
                     self.func_marks |= bit;
                     if let Some(f) = self.funcs[i as usize] {
