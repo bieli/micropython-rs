@@ -22,17 +22,24 @@
 mod builtins;
 #[path = "bytes.rs"]
 mod bytes;
-#[path = "classes.rs"]
+// Optional parts: without their feature, a small stub with the same entry
+// points takes the place of the real code (which then isn't in the binary),
+// and its features raise `Error::NotEnabled`.
+#[cfg_attr(feature = "classes", path = "classes.rs")]
+#[cfg_attr(not(feature = "classes"), path = "off/classes.rs")]
 mod classes;
 #[path = "containers.rs"]
 mod containers;
 #[path = "exceptions.rs"]
 mod exceptions;
-#[path = "files.rs"]
+#[cfg_attr(feature = "files", path = "files.rs")]
+#[cfg_attr(not(feature = "files"), path = "off/files.rs")]
 mod files;
-#[path = "format.rs"]
+#[cfg_attr(feature = "format", path = "format.rs")]
+#[cfg_attr(not(feature = "format"), path = "off/format.rs")]
 mod format;
-#[path = "modules.rs"]
+#[cfg_attr(feature = "modules", path = "modules.rs")]
+#[cfg_attr(not(feature = "modules"), path = "off/modules.rs")]
 mod modules;
 #[path = "strings.rs"]
 mod strings;
@@ -48,20 +55,34 @@ use crate::ast_parser::{
 use crate::heap::{Heap, Kind, ObjRef};
 use crate::{Arg, Error, FileSystem, HardwareBridge, HwFn, Module, NoHardware, Output};
 
+// The limits grow with the feature level (`full` > `medium` > `minimal`):
+// they size the `Interpreter` struct, i.e. its RAM.
+
 /// Variable slots, shared by globals and the locals of active function calls.
-pub const MAX_VARS: usize = 128;
+pub const MAX_VARS: usize = level(48, 96, 128);
 /// Number of `def` functions that can exist at the same time.
-pub const MAX_FUNCS: usize = 64;
+pub const MAX_FUNCS: usize = level(16, 32, 64);
 /// Maximum depth of nested user function calls (recursion included).
-pub const MAX_CALL_DEPTH: usize = 8;
+pub const MAX_CALL_DEPTH: usize = level(6, 8, 8);
 /// `global` names declared by all active function calls together.
-pub const MAX_GLOBAL_DECLS: usize = 16;
+pub const MAX_GLOBAL_DECLS: usize = level(8, 16, 16);
 /// Maximum nesting of blocks (`if`/`while`/function bodies) being run at once.
-pub const MAX_NESTING: usize = 40;
+pub const MAX_NESTING: usize = level(24, 40, 40);
 /// Values in flight: the operands of every expression being evaluated,
 /// including those of the calling functions. They are roots for the garbage
 /// collector, which is why there is one shared stack instead of one per call.
-pub const VALUE_STACK: usize = 128;
+pub const VALUE_STACK: usize = level(64, 128, 128);
+
+/// The value of a limit for the feature level being built.
+const fn level(minimal: usize, medium: usize, full: usize) -> usize {
+    if cfg!(feature = "full") {
+        full
+    } else if cfg!(feature = "medium") {
+        medium
+    } else {
+        minimal
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Value<'a> {
@@ -972,6 +993,9 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
         };
         if ctx.in_func || ctx.in_class {
             return Err(Error::InvalidSyntax); // classes are defined at the top level
+        }
+        if run && !cfg!(feature = "classes") {
+            return Err(Error::NotEnabled);
         }
         if !run {
             self.exec_body(parser, indent, false, class_ctx, code)?;
@@ -2977,9 +3001,12 @@ fn bridge_args<'v>(
 
 /// Modules built into the interpreter, numbered before the bridge's modules.
 const CORE_MODULES: &[Module] = &[
+    #[cfg(feature = "stdlib")]
     bytes::BINASCII,
     builtins::BUILTINS_MODULE,
+    #[cfg(feature = "files")]
     files::OS,
+    #[cfg(feature = "stdlib")]
     builtins::SYS_MODULE,
 ];
 
@@ -3767,9 +3794,9 @@ def fib(n):
         return n
     return fib(n - 1) + fib(n - 2)
 
-print(fact(7), fib(7))
+print(fact(6), fib(6))
 "#;
-        assert_output(src, "5040 13\n");
+        assert_output(src, "720 8\n");
 
         let (err, line) = run_err("def forever(n):\n    return forever(n + 1)\nforever(0)");
         assert_eq!((err, line), (Error::RecursionLimit, Some(2)));
@@ -3953,8 +3980,8 @@ print(fact(7), fib(7))
         assert_eq!(vm.eval("f(1, value=2)"), Err(Error::TypeError));
         // The script's own functions shadow hardware ones, also inside methods
         vm.eval(
-            "def pin_read(p):\n    return 42\nclass C:\n    def m(self):\n        return pin_read(1)\n\
-             print(pin_read(1), C().m(), f)",
+            "def pin_read(p):\n    return 42\ndef outer():\n    def m():\n        return pin_read(1)\n    return m()\n\
+             print(pin_read(1), outer(), f)",
         )
         .unwrap();
         let _ = vm;
@@ -3965,6 +3992,7 @@ print(fact(7), fib(7))
     }
 
     #[test]
+    #[cfg(feature = "classes")]
     fn test_call_dunder() {
         let mut out = MockOut::new();
         let text = run_ok(
@@ -3978,6 +4006,7 @@ print(fact(7), fib(7))
     }
 
     #[test]
+    #[cfg(all(feature = "modules", feature = "files"))]
     fn test_frozen_modules() {
         const FROZEN: &[(&str, &str)] = &[
             ("blinker", "COUNT = 2\ndef twice(x):\n    return x * COUNT\nclass K:\n    def go(self):\n        return twice(5)\n"),
@@ -4062,6 +4091,14 @@ print(fact(7), fib(7))
         assert_eq!(hw.total_delay_ms, 1);
     }
 
+    /// `help()`'s list of the interpreter's own modules, in this build.
+    const CORE_NAMES: &str = match (cfg!(feature = "stdlib"), cfg!(feature = "files")) {
+        (true, true) => "binascii builtins os sys",
+        (true, false) => "binascii builtins sys",
+        (false, true) => "builtins os",
+        (false, false) => "builtins",
+    };
+
     #[test]
     fn test_help() {
         let mut out = MockOut::new();
@@ -4077,10 +4114,11 @@ print(fact(7), fib(7))
             out.as_str(),
             "Built-in:\n  print(...)\n  help()\n  abs(x), min(a, b, ...), max(a, b, ...)\n  len(s), str(x), repr(x), int(x, [base]), ord(c), chr(n), bytes(x), bool(x)\n  list(x), tuple(x), dict(x), range(...), sorted(x), reversed(x), sum(x),\n  any(x), all(x), enumerate(x), zip(a, b), format(x, spec)\n  isinstance(x, t), type(x), hasattr(x, name), getattr(x, name, [default]),\n  callable(x), id(x), dir([x]), globals(), help('modules')\n\
              Script functions:\n  blink(times, ms)\n\
-             Modules (import them, then help(module)):\n  binascii builtins os sys\n\
+             Modules (import them, then help(module)):\n  CORE\n\
              Hardware:\n  pin_write(pin, value) - Set an output pin\n  pin_read(pin) - Read a pin\n  \
              text(s, [x, y]) - Show text\n  ticks_ms()\n\
              Constants:\n  HIGH LOW LED\n"
+                .replace("CORE", CORE_NAMES)
         );
 
         // Without hardware: built-ins and the core modules
@@ -4089,7 +4127,8 @@ print(fact(7), fib(7))
         assert_eq!(
             out.as_str(),
             "Built-in:\n  print(...)\n  help()\n  abs(x), min(a, b, ...), max(a, b, ...)\n  len(s), str(x), repr(x), int(x, [base]), ord(c), chr(n), bytes(x), bool(x)\n  list(x), tuple(x), dict(x), range(...), sorted(x), reversed(x), sum(x),\n  any(x), all(x), enumerate(x), zip(a, b), format(x, spec)\n  isinstance(x, t), type(x), hasattr(x, name), getattr(x, name, [default]),\n  callable(x), id(x), dir([x]), globals(), help('modules')\n\
-             Modules (import them, then help(module)):\n  binascii builtins os sys\n"
+             Modules (import them, then help(module)):\n  CORE\n"
+                .replace("CORE", CORE_NAMES)
         );
     }
 
@@ -4331,7 +4370,8 @@ print(gfx == g, gfx == clock, f == gfx.pixel)
             .eval("help()")
             .unwrap();
         assert!(out.as_str().ends_with(
-            "Modules (import them, then help(module)):\n  binascii builtins os sys gfx clock\n"
+            &"Modules (import them, then help(module)):\n  CORE gfx clock\n"
+                .replace("CORE", CORE_NAMES)
         ));
     }
 
@@ -4582,6 +4622,7 @@ print(outer(), count)
     }
 
     #[test]
+    #[cfg(feature = "stdlib")]
     fn test_binascii_module() {
         assert_output(
             "import binascii\nprint(binascii.hexlify(b'\\x00\\x10\\xfe'), binascii.unhexlify(b'48656c6c6f'))\n\
@@ -4619,28 +4660,37 @@ print(outer(), count)
     /// into the `.out` file next to them (`make cpython-expected` updates them).
     #[test]
     fn test_cpython_conformance() {
+        // Each script with the features it needs (the feature levels)
         macro_rules! case {
             ($name:literal) => {
+                case!($name, true)
+            };
+            ($name:literal, $enabled:expr) => {
                 (
                     $name,
                     include_str!(concat!("../tests/cpython/", $name, ".py")),
                     include_str!(concat!("../tests/cpython/", $name, ".out")),
+                    $enabled,
                 )
             };
         }
-        for (name, src, expected) in [
+        let medium = cfg!(all(feature = "classes", feature = "format"));
+        for (name, src, expected, enabled) in [
             case!("builtins_values"),
-            case!("bytes"),
-            case!("classes"),
-            case!("closures"),
+            case!("bytes", cfg!(feature = "stdlib")),
+            case!("classes", medium),
+            case!("closures", medium),
             case!("containers"),
             case!("exceptions"),
-            case!("files"),
-            case!("formatting"),
+            case!("files", cfg!(feature = "files")),
+            case!("formatting", medium),
             case!("functions"),
-            case!("modules"),
-            case!("readme_examples"),
+            case!("modules", cfg!(all(feature = "files", feature = "modules"))),
+            case!("readme_examples", medium),
         ] {
+            if !enabled {
+                continue;
+            }
             let (out, result) = run_with_files(src, 64 * 1024);
             assert_eq!(result, Ok(()), "{}.py, output so far:\n{}", name, out);
             assert_eq!(out, expected, "{}.py", name);
@@ -4824,6 +4874,7 @@ print(outer(), count)
     // ---- 6.3 importing .py modules ------------------------------------------
 
     #[test]
+    #[cfg(all(feature = "modules", feature = "files"))]
     fn test_module_memory_limits() {
         let mut flash = std::vec![0u8; 4 * crate::flatfs::SLOT_SIZE as usize];
         let files = RefCell::new(
@@ -4855,6 +4906,7 @@ print(outer(), count)
     // ---- 5.8 classes and closures -----------------------------------------
 
     #[test]
+    #[cfg(feature = "classes")]
     fn test_function_slots_are_collected() {
         // Every run of a class statement makes its methods again, and every
         // call of `make` a new closure: unreachable ones must free their slots
@@ -4891,15 +4943,16 @@ print(outer(), count)
             assert!(room < 4 * 1024 * 1024, "no floor works");
         }
         // ...stops deep recursion with a RecursionError that can be caught
-        vm.eval("try:\n    f(7)\nexcept RecursionError:\n    print('caught')\nprint(f(0))")
+        vm.eval("try:\n    f(5)\nexcept RecursionError:\n    print('caught')\nprint(f(0))")
             .unwrap();
         vm.set_stack_floor(None);
-        vm.eval("print(f(7))").unwrap();
+        vm.eval("print(f(5))").unwrap();
         let _ = vm;
         assert_eq!(out.as_str(), "caught\n[[[[1]]]]\n[[[[1]]]]\n");
     }
 
     #[test]
+    #[cfg(feature = "classes")]
     fn test_class_errors() {
         for (src, err) in [
             ("def f():\n    class C:\n        pass", Error::InvalidSyntax),
@@ -4928,6 +4981,7 @@ print(outer(), count)
     // ---- 5.6 files ---------------------------------------------------------
 
     #[test]
+    #[cfg(feature = "files")]
     fn test_os_module_specifics() {
         let (out, result) = run_with_files(
             "import os\nf = open('a.py', 'w')\nf.write('x = 1')\nf.close()\n\
@@ -4964,6 +5018,7 @@ print(outer(), count)
     }
 
     #[test]
+    #[cfg(feature = "files")]
     fn test_file_written_across_evals_and_collections() {
         // Thonny 3.2.7 writes a file with one `eval` per block; the file
         // object lives in a variable while the heap is collected in between
@@ -5087,6 +5142,7 @@ print(outer(), count)
     }
 
     #[test]
+    #[cfg(feature = "stdlib")]
     fn test_gc_with_bytes() {
         // hexlify/unhexlify round trips in a small heap: the inputs must
         // survive the collections that the outputs cause

@@ -500,6 +500,14 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
         result
     }
 
+    /// The value for a string key of a dict (namespaces: modules, classes,
+    /// closures), or `None`.
+    pub(super) fn dict_get_str(&self, dict: ObjRef, name: &str) -> Option<Value<'a>> {
+        (0..self.count(dict))
+            .find(|&i| self.str_of(self.slot(dict, 2 * i)) == Some(name))
+            .map(|i| self.slot(dict, 2 * i + 1))
+    }
+
     pub(super) fn dict_remove(&mut self, r: ObjRef, i: usize) {
         let n = self.count(r);
         let from = HEADER + (i + 1) * 2 * SLOT;

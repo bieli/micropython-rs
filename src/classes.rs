@@ -83,13 +83,6 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
         false
     }
 
-    /// The value of `name` in a dict object (keys are strings here).
-    pub(super) fn dict_get_str(&self, dict: ObjRef, name: &str) -> Option<Value<'a>> {
-        (0..self.count(dict))
-            .find(|&i| self.str_of(self.slot(dict, 2 * i)) == Some(name))
-            .map(|i| self.slot(dict, 2 * i + 1))
-    }
-
     /// `name` in a class or its bases.
     fn class_lookup(&self, class: ObjRef, name: &str) -> Option<Value<'a>> {
         let mut c = class;

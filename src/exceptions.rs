@@ -106,6 +106,7 @@ fn error_class(err: Error) -> u8 {
         Error::AttributeError => "AttributeError",
         Error::IndexError => "IndexError",
         Error::KeyError => "KeyError",
+        Error::NotEnabled => "NotImplementedError",
     };
     class_by_name(name).unwrap_or(RUNTIME_ERROR)
 }

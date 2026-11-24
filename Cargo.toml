@@ -15,6 +15,25 @@ name = "mpy-cli"
 path = "src/main.rs"
 
 [features]
+default = ["full"]
+
+# Feature levels: each includes the one before (see README, "Feature levels").
+# minimal: ints, strings, bytes, lists/tuples/dicts, exceptions, `def`,
+#   lambdas, closures, native and hardware modules. Smallest tables.
+minimal = []
+# medium: + classes, string formatting (`%`, `str.format`, f-strings, `hex()`)
+medium = ["minimal", "classes", "format"]
+# full: + files (`open`, `os`), importing `.py` and frozen modules, `sys` and
+#   `binascii`: everything Thonny and mpremote need. Largest tables.
+full = ["medium", "files", "modules", "stdlib"]
+
+# The parts the levels are made of (can also be chosen one by one)
+classes = []
+format = []
+files = []
+modules = ["classes"]
+stdlib = []
+
 # Put the interpreter's hot loop (lexer, parser, evaluator) into the
 # `.rwtext` section: on the ESP32 that's internal RAM (IRAM), which runs it
 # without flash cache misses. Only for targets whose linker script has it.

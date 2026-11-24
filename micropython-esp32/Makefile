@@ -14,7 +14,12 @@ PORT_FLAG    := $(if $(PORT),--port $(PORT),)
 # Optional Cargo features (e.g., make flash FEATURES=tft for the LilyGO TTGO T-Display);
 # leave empty to build the generic ESP32 firmware (serial console + GPIO2 LED)
 FEATURES     ?=
-FEATURES_FLAG := $(if $(FEATURES),--features $(FEATURES),)
+
+# The interpreter's feature level: full (default: everything, Thonny, the
+# machine module), medium (classes and formatting) or minimal (smallest)
+LEVEL        ?= full
+comma        := ,
+FEATURES_FLAG := --no-default-features --features $(LEVEL)$(if $(FEATURES),$(comma)$(FEATURES))
 
 # Optional Python script to embed (e.g., make flash SCRIPT=scripts/blink.py), relative to this
 # directory; leave empty for the board's demo (scripts/demo.py or scripts/ttgo_demo.py)

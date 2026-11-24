@@ -218,15 +218,15 @@ A `while` loop keeps a copy of the parser (96 bytes) from its header and jumps b
 A `def` stores a parser copy that points at its body. A block that doesn't run is still parsed, so syntax errors are always reported.
 The trade-off is speed: loop bodies are parsed again on every pass. The planned bytecode compiler will remove that cost.
 
-Limits (in `src/interpreter.rs`):
+Limits (in `src/interpreter.rs`), for the `full` [feature level](#feature-levels) (`minimal` / `medium` in brackets):
 
 | Constant | Value | Meaning | Error |
 |----------|-------|---------|-------|
-| `MAX_VARS` | 128 | Variables: globals plus the locals of all active calls | `OutOfMemory` |
-| `MAX_FUNCS` | 64 | `def` functions, methods and lambdas (the firmware's `machine` module takes 43) | `OutOfMemory` |
-| `MAX_GLOBAL_DECLS` | 16 | Names declared `global` by all active calls together | `OutOfMemory` |
-| `MAX_CALL_DEPTH` | 8 | Nested function calls, recursion included | `RecursionLimit` |
-| `MAX_NESTING` | 40 | Nested blocks (`if`/`while`/function bodies) running at once | `RecursionLimit` |
+| `MAX_VARS` | 128 (48 / 96) | Variables: globals plus the locals of all active calls | `OutOfMemory` |
+| `MAX_FUNCS` | 64 (16 / 32) | `def` functions, methods and lambdas (the firmware's `machine` module takes 43) | `OutOfMemory` |
+| `MAX_GLOBAL_DECLS` | 16 (8 / 16) | Names declared `global` by all active calls together | `OutOfMemory` |
+| `MAX_CALL_DEPTH` | 8 (6 / 8) | Nested function calls, recursion included | `RecursionLimit` |
+| `MAX_NESTING` | 40 (24 / 40) | Nested blocks (`if`/`while`/function bodies) running at once | `RecursionLimit` |
 
 Native stack use grows with each nested call (an RPN buffer and parser state per call, about 7.8 KB on the ESP32,
 see [Stack budget](#stack-budget-measured-on-the-esp32)), which is why `MAX_CALL_DEPTH` is small. On a 64-bit host the `Interpreter` struct is about 22 KB (including the 128 variable
@@ -528,6 +528,39 @@ fn run_script() {
 }
 ```
 
+### Feature levels
+
+The core library comes in three levels, chosen with Cargo features. `full` is the default; each level includes the
+one before:
+
+| Level | Python | Limits (functions / variables / call depth) |
+|-------|--------|---------------------------------------------|
+| `minimal` | ints, bools, `None`, strings, bytes, lists, tuples, dicts, comprehensions, `if`/`while`/`for`, `def` with defaults and keyword arguments, `lambda`, closures, decorators, exceptions, native modules and hardware functions, `builtins` | 16 / 48 / 6 |
+| `medium` | + classes (`class`, `super()`, `@classmethod`, `__str__`, `__call__`, your own exceptions), string formatting (`%`, `str.format`, f-strings, `format()`, `hex()`/`bin()`/`oct()`) | 32 / 96 / 8 |
+| `full` | + files (`open()`, `os`), importing `.py` files and frozen modules, `sys`, `binascii`: everything Thonny and mpremote need | 64 / 128 / 8 |
+
+```toml
+micropython-rs = { path = "...", default-features = false, features = ["medium"] }
+# or only the parts you need:
+micropython-rs = { path = "...", default-features = false, features = ["minimal", "format"] }
+```
+
+The parts are `classes`, `format`, `files`, `modules` and `stdlib`. Without a part, its code isn't compiled
+in (a small stub takes its place), and using it raises `NotImplementedError: not enabled in this build`;
+`import os` / `import sys` raise `ImportError`. The API stays the same at every level (`with_files`,
+`with_frozen_modules` and so on just have nothing to do), so an application builds against any of them.
+
+The ESP32 firmware (`make flash LEVEL=minimal`), measured on the generic build and a TTGO T-Display:
+
+| `LEVEL` | Interpreter code | App image | Interpreter in RAM | Stack for a top-level statement | Recursion until `RecursionError` |
+|---------|-----------------:|----------:|-------------------:|--------------------------------:|--------------------------------:|
+| `minimal` | 140.7 KB | 258 KB | 10.0 KB | 29 KB | 85 KB (6 calls) |
+| `medium` | 158.2 KB | 278 KB | 15.5 KB | 35 KB | 108 KB (8 calls) |
+| `full` (default) | 172.6 KB + 9 KB `machine.py` | 304 KB | 22.7 KB | 42 KB | 114 KB (8 calls) |
+
+"Interpreter in RAM" is the REPL's stack frame, which holds the `Interpreter` struct; its tables shrink with the
+level. Speed is the same at every level. Thonny, mpremote's file commands and the `machine` module need `full`.
+
 ### Connecting hardware (`HardwareBridge`)
 
 Hardware functions come from a `HardwareBridge`. All its methods have defaults, so implement only what you need:
@@ -708,6 +741,7 @@ make flash SCRIPT=scripts/blink.py           # run your own script
 make flash FEATURES=tft SCRIPT=scripts/help.py
 make flash PORT=/dev/ttyUSB0                 # pick a serial port explicitly
 make flash FEATURES=tft CPU_MHZ=240          # 3x faster scripts (more current)
+make flash LEVEL=minimal                     # smallest interpreter: no classes, formatting or files
 
 make build                                   # build only
 make report                                  # memory of the last build: regions, stack, biggest frames
@@ -719,6 +753,7 @@ make clean                                   # remove build artifacts
 | Make variable | Default | Meaning |
 |---------------|---------|---------|
 | `FEATURES` | *(empty)* | Cargo features passed as `--features ...` (e.g. `tft`) |
+| `LEVEL` | `full` | The interpreter's [feature level](#feature-levels): `full` (everything: Thonny, `machine`), `medium` (classes, formatting) or `minimal` (smallest) |
 | `CPU_MHZ` | `80` | CPU clock: `80` (least current, for batteries), `160` or `240` (scripts run 2× / 3× faster). Fixed in the firmware, `machine.freq()` reports it |
 | `SCRIPT` | *(empty: the board's demo)* | Python file to embed, relative to `micropython-esp32/`. It must be inside the repository, because the Docker build only sees the repository |
 | `ERASE_FILES` | *(empty)* | Files on the board survive `make flash`. `ERASE_FILES=1` deletes them all (then the embedded `SCRIPT` runs at boot, as no `main.py` is left); `make erase-files` does the same without flashing |

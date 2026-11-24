@@ -1,6 +1,8 @@
 //! The firmware's frozen `machine` module (micropython-esp32/modules/machine.py)
 //! against a mock board that logs every hardware call: MicroPython-style code
-//! must turn into the right firmware functions.
+//! must turn into the right firmware functions. (It needs the `full` level's
+//! frozen modules and classes, like the firmware's `machine` feature.)
+#![cfg(all(feature = "modules", feature = "classes", feature = "format"))]
 
 use micropython_rs::{Arg, Error, HardwareBridge, HwFn, Interpreter, Output};
 use std::fmt::Write;

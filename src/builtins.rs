@@ -82,6 +82,7 @@ pub(crate) const BUILTINS_MODULE: crate::Module = crate::Module {
 /// `import sys`: `path`, `version`, `version_info`, `platform`,
 /// `byteorder`, `maxsize`, `argv`, `modules` (see `Interpreter::sys_attr`)
 /// and `exit()`.
+#[cfg(feature = "stdlib")]
 pub(crate) const SYS_MODULE: crate::Module = crate::Module {
     name: "sys",
     doc: "System information (path, version, platform, ...), exit()",

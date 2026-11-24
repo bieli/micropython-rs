@@ -110,6 +110,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
     /// A new heap string with the bytes of `parts` (strings) one after another.
     /// The strings `stack[base..sp]` joined into a new heap string (they
     /// stay on the stack, rooted, while it's allocated).
+    #[cfg_attr(not(feature = "format"), allow(dead_code))] // f-strings use it
     pub(super) fn concat_stack(&mut self, base: usize) -> Result<Value<'a>, Error> {
         let mut len = 0;
         for i in base..self.sp {

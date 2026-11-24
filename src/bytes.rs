@@ -9,10 +9,13 @@
 
 use super::{Interpreter, Value};
 use crate::heap::Kind;
-use crate::{Error, HardwareBridge, HwFn, Module, Output};
+use crate::{Error, HardwareBridge, Output};
+#[cfg(feature = "stdlib")]
+use crate::{HwFn, Module};
 
 /// `import binascii`: hex conversion, used by tools such as Thonny to move
 /// file contents over the serial port.
+#[cfg(feature = "stdlib")]
 pub(crate) const BINASCII: Module = Module {
     name: "binascii",
     doc: "Hex conversion of bytes",

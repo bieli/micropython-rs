@@ -51,6 +51,9 @@ pub enum Error {
     IndexError,
     /// A dict has no such key.
     KeyError,
+    /// The feature isn't in this build's feature level (e.g. `class` in a
+    /// `minimal` build). Python sees a `NotImplementedError`.
+    NotEnabled,
     /// A Python exception from `raise` (or an error re-raised by `raise`):
     /// `Interpreter::write_exception` prints its class and message.
     Exception,
@@ -79,6 +82,7 @@ impl Error {
             Error::AttributeError => "no such attribute",
             Error::IndexError => "index out of range",
             Error::KeyError => "key not found",
+            Error::NotEnabled => "not enabled in this build",
             Error::Exception => "",
         }
     }

@@ -39,6 +39,9 @@ jobs:
       - name: Run Makefile (Tests, Coverage >= 30%, and Embedded Build)
         run: make all
 
+      - name: Feature levels minimal and medium (lints, tests, no_std build)
+        run: make levels
+
       # Real tools against `mpy-cli --repl` on a pseudo-terminal (same REPL
       # protocol as the ESP32 firmware)
       - name: End-to-end tests with Thonny 3.2.7 and 5.0's backends and mpremote
@@ -61,7 +64,7 @@ jobs:
   # stack shrinks below 128 KB or one function takes over 32 KB of it (the
   # board-only problems of Phase 5 would have failed both)
   firmware:
-    name: ESP32 firmware (${{ matrix.board }}), size and stack report
+    name: ESP32 firmware (${{ matrix.board }}, ${{ matrix.level }}), size and stack report
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -69,8 +72,13 @@ jobs:
         include:
           - board: generic
             features: ""
+            level: full
           - board: TTGO T-Display
             features: tft
+            level: full
+          - board: generic
+            features: ""
+            level: minimal
 
     steps:
       - name: Checkout repository
@@ -80,13 +88,13 @@ jobs:
         uses: actions/cache@v4
         with:
           path: micropython-esp32/target
-          key: firmware-${{ matrix.features }}-${{ hashFiles('micropython-esp32/Cargo.lock', 'micropython-esp32/rust-toolchain.toml') }}
-          restore-keys: firmware-${{ matrix.features }}-
+          key: firmware-${{ matrix.features }}-${{ matrix.level }}-${{ hashFiles('micropython-esp32/Cargo.lock', 'micropython-esp32/rust-toolchain.toml') }}
+          restore-keys: firmware-${{ matrix.features }}-${{ matrix.level }}-
 
       - name: Build the firmware
         working-directory: micropython-esp32
         run: >
-          make build FEATURES=${{ matrix.features }}
+          make build FEATURES=${{ matrix.features }} LEVEL=${{ matrix.level }}
           DOCKER_FLAGS="--user root -e RUSTUP_HOME=/home/esp/.rustup -e CARGO_HOME=/home/esp/.cargo"
 
       - name: Memory report
