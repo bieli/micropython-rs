@@ -343,6 +343,11 @@ pub enum Stmt<'a> {
     DelNames(Targets<'a>),
     /// `del x[key]`: `target` leaves the container and the key.
     DelItem(Expr),
+    /// Header `with <expr>:` or `with <expr> as name:`
+    With {
+        expr: Expr,
+        name: Option<&'a str>,
+    },
     /// Header `try:`
     Try,
     /// Header `except:`, `except <classes>:` or `except <classes> as name:`
@@ -423,6 +428,7 @@ impl Stmt<'_> {
                 | Stmt::For { .. }
                 | Stmt::Def { .. }
                 | Stmt::Try
+                | Stmt::With { .. }
                 | Stmt::Except { .. }
                 | Stmt::Finally
         )
@@ -597,6 +603,18 @@ impl<'a> Parser<'a> {
                 self.advance()?;
                 self.expect(Token::Colon)?;
                 return Ok(Some(stmt));
+            }
+            Token::With => {
+                self.advance()?;
+                let expr = self.parse_expr(code)?;
+                let name = if self.current == Token::As {
+                    self.advance()?;
+                    Some(self.expect_ident()?)
+                } else {
+                    None
+                };
+                self.expect(Token::Colon)?;
+                return Ok(Some(Stmt::With { expr, name }));
             }
             Token::Except => {
                 self.advance()?;

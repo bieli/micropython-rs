@@ -26,6 +26,7 @@ use micropython_rs::flatfs::{FsError, Writer};
 
 use crate::serial_input::wait_byte;
 use crate::storage::Files;
+use core::cell::RefCell;
 use crate::ABORT;
 
 /// Bytes of REPL input (and the boot script) kept per session.
@@ -65,7 +66,7 @@ pub fn run<O: Output, H: HardwareBridge>(
     out: &mut O,
     hw: &mut H,
     boot: &BootScript,
-    files: &mut Option<Files>,
+    files: Option<&RefCell<Files>>,
 ) -> ! {
     let memory = ARENA_MEMORY.init([0; ARENA_SIZE]);
     let heap = HEAP_MEMORY.init([0; HEAP_SIZE]);
@@ -73,8 +74,14 @@ pub fn run<O: Output, H: HardwareBridge>(
     let mut run_boot_script = true;
 
     loop {
+        let vm = Interpreter::with_hardware(&mut *out, &mut *hw).with_heap(&mut heap[..]);
+        // Scripts get the flash files too: `open()` and the `os` module
+        let vm = match files {
+            Some(files) => vm.with_files(files),
+            None => vm,
+        };
         let mut repl = Repl {
-            vm: Interpreter::with_hardware(&mut *out, &mut *hw).with_heap(&mut heap[..]),
+            vm,
             arena: Arena::new(&mut memory[..]),
             history: None,
         };
@@ -82,13 +89,13 @@ pub fn run<O: Output, H: HardwareBridge>(
 
         // Like MicroPython, a soft reset in the raw REPL skips main.py
         if run_boot_script {
-            repl.run_boot_script(boot, files.as_mut());
+            repl.run_boot_script(boot, files);
         }
 
         loop {
             mode = match mode {
                 Mode::Normal => repl.normal_mode(),
-                Mode::Raw => repl.raw_mode(files.as_mut()),
+                Mode::Raw => repl.raw_mode(files),
                 Mode::SoftReset(_) => unreachable!(),
             };
             if let Mode::SoftReset(raw) = mode {
@@ -186,8 +193,9 @@ impl<'a, O: Output, H: HardwareBridge> Repl<'a, O, H> {
         self.vm.output().write_str(s);
     }
 
-    fn run_boot_script(&mut self, boot: &BootScript, files: Option<&mut Files>) {
-        let saved = files.map(|fs| fs.read(MAIN_FILE, self.arena.free_space()));
+    fn run_boot_script(&mut self, boot: &BootScript, files: Option<&RefCell<Files>>) {
+        // Borrowed only to read main.py: the script may use the files itself
+        let saved = files.map(|fs| fs.borrow_mut().read(MAIN_FILE, self.arena.free_space()));
         let source = match saved {
             Some(Ok(len)) => {
                 self.arena.pending = len;
@@ -440,7 +448,7 @@ impl<'a, O: Output, H: HardwareBridge> Repl<'a, O, H> {
     /// MicroPython's raw REPL: input isn't echoed; Ctrl-D runs it and the
     /// reply is `OK`, the output, `\x04`, the error text, `\x04`, `>`.
     /// The framing goes to the serial port only, never to a display.
-    fn raw_mode(&mut self, mut files: Option<&mut Files>) -> Mode {
+    fn raw_mode(&mut self, files: Option<&RefCell<Files>>) -> Mode {
         print!("raw REPL; CTRL-B to exit\r\n>");
         self.arena.clear();
         let mut overflow = false;
@@ -470,7 +478,7 @@ impl<'a, O: Output, H: HardwareBridge> Repl<'a, O, H> {
                         self.arena.clear();
                         Err(RawError::Python(Error::OutOfMemory))
                     } else {
-                        self.run_raw(files.as_deref_mut(), &mut upload)
+                        self.run_raw(files, &mut upload)
                     };
                     overflow = false;
                     print!("\x04");
@@ -502,14 +510,16 @@ impl<'a, O: Output, H: HardwareBridge> Repl<'a, O, H> {
     /// Runs a raw-REPL program, or a `#@` file command from `tools/mpy.py`.
     fn run_raw(
         &mut self,
-        files: Option<&mut Files>,
+        files: Option<&RefCell<Files>>,
         upload: &mut Option<Writer>,
     ) -> Result<(), RawError> {
         if !self.arena.pending().starts_with(b"#@") {
             let source = self.arena.commit().map_err(RawError::Python)?;
             return self.eval(source, false).map_err(RawError::Python);
         }
-        let result = self.file_command(files, upload);
+        // A file command: no script runs meanwhile, so the files can be borrowed
+        let mut files = files.map(|fs| fs.borrow_mut());
+        let result = self.file_command(files.as_deref_mut(), upload);
         self.arena.clear();
         result
     }

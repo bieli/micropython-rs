@@ -124,7 +124,8 @@ fn main() -> ! {
     // Set up serial input first: it resets UART0, which drops unsent output
     serial_input::init(peripherals.UART0, peripherals.GPIO3);
     print_reset_reason();
-    let mut files = storage::mount(peripherals.FLASH);
+    // Shared by the REPL's file commands and the scripts (`open()`, `os`)
+    let files = storage::mount(peripherals.FLASH).map(core::cell::RefCell::new);
 
     let mut board = Board::new(board_peripherals!(peripherals), GENERIC_PINS);
     // Most DevKits only have the BOOT button (GPIO0) as a user button: LEFT
@@ -132,7 +133,7 @@ fn main() -> ! {
     let mut out = micropython_esp32::serial_console::EspSerialOut;
     let mut hw = GenericHardware { board, buttons };
 
-    repl::run(&mut out, &mut hw, &BOOT_SCRIPT, &mut files)
+    repl::run(&mut out, &mut hw, &BOOT_SCRIPT, files.as_ref())
 }
 
 // ---------------------------------------------------------------------------
@@ -284,7 +285,8 @@ fn main() -> ! {
     // Set up serial input first: it resets UART0, which drops unsent output
     serial_input::init(peripherals.UART0, peripherals.GPIO3);
     print_reset_reason();
-    let mut files = storage::mount(peripherals.FLASH);
+    // Shared by the REPL's file commands and the scripts (`open()`, `os`)
+    let files = storage::mount(peripherals.FLASH).map(core::cell::RefCell::new);
 
     let spi = init_ttgo_spi(peripherals.SPI2, peripherals.GPIO18, peripherals.GPIO19);
     let cs = make_output_pin(peripherals.GPIO5, Level::High);
@@ -305,7 +307,7 @@ fn main() -> ! {
         console: &console,
     };
 
-    repl::run(&mut out, &mut hw, &BOOT_SCRIPT, &mut files)
+    repl::run(&mut out, &mut hw, &BOOT_SCRIPT, files.as_ref())
 }
 
 // ---------------------------------------------------------------------------

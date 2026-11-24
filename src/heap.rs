@@ -47,6 +47,8 @@ pub enum Kind {
     /// An exception instance: laid out like a tuple of its class number
     /// followed by its arguments.
     Exception,
+    /// A file object (see `interpreter/files.rs`), laid out like a tuple.
+    File,
 }
 
 impl Kind {
@@ -54,7 +56,7 @@ impl Kind {
     pub const fn is_container(self) -> bool {
         matches!(
             self,
-            Kind::List | Kind::Tuple | Kind::Dict | Kind::Exception
+            Kind::List | Kind::Tuple | Kind::Dict | Kind::Exception | Kind::File
         )
     }
 }

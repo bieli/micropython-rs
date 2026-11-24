@@ -6,6 +6,7 @@ pub mod heap;
 pub mod interpreter;
 pub mod lexer;
 
+pub use flatfs::FileSystem;
 pub use interpreter::Interpreter;
 pub use interpreter::Value;
 

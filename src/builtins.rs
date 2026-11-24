@@ -30,6 +30,7 @@ const NAMES: &[&str] = &[
     "function",
     "builtin_function_or_method",
     "module",
+    "TextIOWrapper",
     // functions
     "print",
     "len",
@@ -56,8 +57,9 @@ const NAMES: &[&str] = &[
     "globals",
     "help",
     "format",
+    "open",
 ];
-const FIRST_FUNCTION: u8 = 12;
+const FIRST_FUNCTION: u8 = 13;
 /// Types that can't be called (`NoneType()`, `function()`, `module()`).
 const FIRST_UNCALLABLE_TYPE: u8 = 8;
 
@@ -111,6 +113,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
                 Kind::List => "list",
                 Kind::Tuple => "tuple",
                 Kind::Dict => "dict",
+                Kind::File => "TextIOWrapper",
                 _ => "range",
             },
             Value::Globals => "dict",
@@ -167,6 +170,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
         }
         match obj {
             Value::Module(m) => Ok(self.module_attr(m, name).ok()),
+            Value::Obj(_) if self.file_attr(obj, name).is_some() => Ok(self.file_attr(obj, name)),
             Value::Obj(_) if self.exc_class(obj).is_some() => match self.exc_attr(obj, name) {
                 Ok(v) => Ok(Some(v)),
                 Err(Error::AttributeError) => Ok(None),

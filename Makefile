@@ -35,7 +35,7 @@ build-embedded:
 
 # Regenerate the expected output of the CPython conformance scripts (needs python3)
 cpython-expected:
-	for f in tests/cpython/*.py; do python3 -W ignore "$$f" > "$${f%.py}.out"; done
+	cd tests/cpython && for f in *.py; do python3 -W ignore "$$f" > "$${f%.py}.out"; done
 
 # Remove build artifacts
 clean:

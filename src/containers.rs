@@ -196,6 +196,12 @@ pub(crate) fn render(
                 sink(")");
                 return;
             }
+            if kind == Kind::File {
+                sink("<file ");
+                render(view, modules, slot(view, r, 0), true, depth + 1, sink);
+                sink(">");
+                return;
+            }
             if kind == Kind::Range {
                 let (start, stop, step) = range_parts(view, r);
                 let mut buf = [0u8; 20];
@@ -286,7 +292,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
     }
 
     /// Writes a value that is already in stored form (see `stored`).
-    fn set_slot(&mut self, r: ObjRef, i: usize, v: Value<'a>) {
+    pub(super) fn set_slot(&mut self, r: ObjRef, i: usize, v: Value<'a>) {
         let at = HEADER + i * SLOT;
         self.heap.bytes_mut(r)[at..at + SLOT].copy_from_slice(&encode(v));
     }
@@ -794,6 +800,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
                     }
                     Kind::Dict => (i < self.count(r)).then(|| self.slot(r, 2 * i)),
                     Kind::List | Kind::Tuple => (i < self.count(r)).then(|| self.slot(r, i)),
+                    Kind::File => return self.file_next_line(r),
                     _ => return Err(Error::TypeError),
                 };
                 *state += 1;

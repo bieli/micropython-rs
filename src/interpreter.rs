@@ -26,11 +26,14 @@ mod bytes;
 mod containers;
 #[path = "exceptions.rs"]
 mod exceptions;
+#[path = "files.rs"]
+mod files;
 #[path = "format.rs"]
 mod format;
 #[path = "strings.rs"]
 mod strings;
 
+use core::cell::RefCell;
 use core::cmp::Ordering as CmpOrdering;
 use core::sync::atomic::{AtomicBool, Ordering};
 
@@ -38,7 +41,7 @@ use crate::ast_parser::{
     BinOp, CmpOp, Code, Expr, Item, Parser, Stmt, Targets, MAX_CALL_ARGS, MAX_PARAMS, MAX_TARGETS,
 };
 use crate::heap::{Heap, Kind, ObjRef};
-use crate::{Arg, Error, HardwareBridge, Module, NoHardware, Output};
+use crate::{Arg, Error, FileSystem, HardwareBridge, Module, NoHardware, Output};
 
 /// Variable slots, shared by globals and the locals of active function calls.
 pub const MAX_VARS: usize = 64;
@@ -172,6 +175,8 @@ pub struct Interpreter<'a, O: Output, H: HardwareBridge = NoHardware> {
     exc: Value<'a>,
     /// The exception the innermost running `except` block handles.
     handling: Value<'a>,
+    /// Files for `open()` and the `os` module (see `with_files`).
+    files: Option<&'a RefCell<dyn FileSystem + 'a>>,
 }
 
 impl<'a, O: Output> Interpreter<'a, O, NoHardware> {
@@ -209,6 +214,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
             sp: 0,
             exc: Value::None,
             handling: Value::None,
+            files: None,
         }
     }
 
@@ -217,6 +223,14 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
     /// operations raise `Error::OutOfMemory`.
     pub fn with_heap(mut self, memory: &'a mut [u8]) -> Self {
         self.heap = Heap::new(memory);
+        self
+    }
+
+    /// Gives scripts a file system: `open()` and the `os` module. The
+    /// application can use it too between `eval` calls (a `RefCell`, so it's
+    /// borrowed only while the interpreter works with files).
+    pub fn with_files(mut self, files: &'a RefCell<dyn FileSystem + 'a>) -> Self {
+        self.files = Some(files);
         self
     }
 
@@ -617,6 +631,9 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
                 return Err(Error::InvalidSyntax)
             }
             Stmt::Try => return self.exec_try(parser, indent, run, ctx, code),
+            Stmt::With { expr, name } => {
+                return self.exec_with(expr, name, parser, indent, run, ctx, code)
+            }
             Stmt::Raise(expr) => {
                 if run {
                     return Err(match expr {
@@ -764,6 +781,56 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
             }
         }
         Ok(flow)
+    }
+
+    /// `with open(...) as f:`: the file is closed when the body ends, also
+    /// after an error or a `return`.
+    #[allow(clippy::too_many_arguments)]
+    fn exec_with(
+        &mut self,
+        expr: Expr,
+        name: Option<&'a str>,
+        parser: &mut Parser<'a>,
+        indent: u32,
+        run: bool,
+        ctx: Ctx,
+        code: &mut Code<'a>,
+    ) -> Result<Flow<'a>, Error> {
+        if !run {
+            return self.exec_body(parser, indent, false, ctx, code);
+        }
+        let val = self.eval_expr(code, expr)?;
+        if !matches!(self.obj_kind(val), Some(Kind::File)) {
+            // Context managers other than files would need classes
+            return Err(Error::TypeError);
+        }
+        let base = self.sp;
+        self.push(val)?;
+        if let Some(name) = name {
+            self.set_var(name, val)?;
+        }
+        let outcome = self.run_clause(parser, indent, true, ctx, code);
+        let line = self.error_line.take();
+        // Keep a pending exception (and a return value) while closing
+        let (pending_exc, flow_val) = (
+            self.exc,
+            match outcome {
+                Ok(Ok(Flow::Return(v))) => v,
+                _ => Value::None,
+            },
+        );
+        let close = self
+            .push(pending_exc)
+            .and_then(|()| self.push(flow_val))
+            .and_then(|()| self.close_if_file(val));
+        self.sp = base;
+        self.exc = pending_exc;
+        let outcome = outcome?;
+        if outcome.is_err() {
+            self.error_line = line;
+        }
+        close?;
+        outcome
     }
 
     /// `try:` and its `except` / `else` / `finally` clauses.
@@ -1100,7 +1167,17 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
         } else {
             (self.find_in(self.scope_start()..self.nvars, name), false)
         };
-        let i = i.ok_or(Error::UnknownIdentifier)?;
+        let Some(i) = i else {
+            // `del f` of a `def` function (functions are global names)
+            let at_top = self.call_depth == 0 || global;
+            let slot = self
+                .funcs
+                .iter()
+                .position(|f| at_top && f.is_some_and(|f| !f.lambda && f.name == name))
+                .ok_or(Error::UnknownIdentifier)?;
+            self.funcs[slot] = None;
+            return Ok(());
+        };
         self.vars.copy_within(i + 1..self.nvars, i);
         self.nvars -= 1;
         if global || (self.call_depth > 0 && i < self.globals_len) {
@@ -1816,9 +1893,12 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
             Value::Globals => self.globals_view(attr, args),
             Value::Str(_) | Value::HStr(_) => self.str_method(receiver, attr, args),
             Value::Bytes(_) | Value::HBytes(_) => self.bytes_method(receiver, attr, args),
-            Value::Obj(_) => self
-                .container_method(receiver, attr, args)
-                .unwrap_or(Err(Error::AttributeError)),
+            Value::Obj(_) => match self.file_method(receiver, attr, args) {
+                Some(result) => result,
+                None => self
+                    .container_method(receiver, attr, args)
+                    .unwrap_or(Err(Error::AttributeError)),
+            },
             _ => Err(Error::AttributeError),
         }
     }
@@ -1937,6 +2017,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
             return Err(Error::TypeError); // the other built-ins have no keyword arguments
         }
         match (name, args) {
+            ("open", _) => return self.open(args),
             ("format", [v]) => return self.stringify(*v, false),
             ("format", [v, spec]) => return self.format_builtin(*v, *spec),
             _ => {}
@@ -2189,7 +2270,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
 }
 
 /// Modules built into the interpreter, numbered before the bridge's modules.
-const CORE_MODULES: &[Module] = &[bytes::BINASCII, builtins::BUILTINS_MODULE];
+const CORE_MODULES: &[Module] = &[bytes::BINASCII, builtins::BUILTINS_MODULE, files::OS];
 
 /// Module number `i` among the core modules and then `hw` (the bridge's).
 fn lookup_module(hw: &[Module], i: u8) -> Option<Module> {
@@ -3172,7 +3253,7 @@ print(fact(7), fib(7))
             out.as_str(),
             "Built-in:\n  print(...)\n  help()\n  abs(x), min(a, b, ...), max(a, b, ...)\n  len(s), str(x), repr(x), int(x, [base]), ord(c), chr(n), bytes(x), bool(x)\n  list(x), tuple(x), dict(x), range(...), sorted(x), reversed(x), sum(x),\n  any(x), all(x), enumerate(x), zip(a, b), format(x, spec)\n  isinstance(x, t), type(x), hasattr(x, name), getattr(x, name, [default]),\n  callable(x), id(x), dir([x]), globals(), help('modules')\n\
              Script functions:\n  blink(times, ms)\n\
-             Modules (import them, then help(module)):\n  binascii builtins\n\
+             Modules (import them, then help(module)):\n  binascii builtins os\n\
              Hardware:\n  pin_write(pin, value) - Set an output pin\n  pin_read(pin) - Read a pin\n  \
              text(s, [x, y]) - Show text\n  ticks_ms()\n\
              Constants:\n  HIGH LOW LED\n"
@@ -3184,7 +3265,7 @@ print(fact(7), fib(7))
         assert_eq!(
             out.as_str(),
             "Built-in:\n  print(...)\n  help()\n  abs(x), min(a, b, ...), max(a, b, ...)\n  len(s), str(x), repr(x), int(x, [base]), ord(c), chr(n), bytes(x), bool(x)\n  list(x), tuple(x), dict(x), range(...), sorted(x), reversed(x), sum(x),\n  any(x), all(x), enumerate(x), zip(a, b), format(x, spec)\n  isinstance(x, t), type(x), hasattr(x, name), getattr(x, name, [default]),\n  callable(x), id(x), dir([x]), globals(), help('modules')\n\
-             Modules (import them, then help(module)):\n  binascii builtins\n"
+             Modules (import them, then help(module)):\n  binascii builtins os\n"
         );
     }
 
@@ -3426,7 +3507,7 @@ print(gfx == g, gfx == clock, f == gfx.pixel)
             .eval("help()")
             .unwrap();
         assert!(out.as_str().ends_with(
-            "Modules (import them, then help(module)):\n  binascii builtins gfx clock\n"
+            "Modules (import them, then help(module)):\n  binascii builtins os gfx clock\n"
         ));
     }
 
@@ -3622,6 +3703,21 @@ print(outer(), count)
         assert_eval_err("'a' < 1", Error::TypeError);
     }
 
+    /// Runs a script with a heap and an 8-file file system in RAM.
+    fn run_with_files(src: &str, heap_size: usize) -> (std::string::String, Result<(), Error>) {
+        let mut flash = std::vec![0u8; 8 * crate::flatfs::SLOT_SIZE as usize];
+        let files = RefCell::new(
+            crate::flatfs::FlatFs::mount(crate::flatfs::RamFlash::new(&mut flash)).unwrap(),
+        );
+        let mut out = MockOut::new();
+        let mut mem = std::vec![0u8; heap_size];
+        let mut vm = Interpreter::new(&mut out)
+            .with_heap(&mut mem)
+            .with_files(&files);
+        let result = vm.eval(src);
+        (out.as_str().into(), result)
+    }
+
     /// Runs `src` with a heap of `size` bytes; returns output and heap stats.
     fn run_with_heap(src: &str, size: usize) -> (std::string::String, Result<(), Error>, u32) {
         let mut out = MockOut::new();
@@ -3710,11 +3806,12 @@ print(outer(), count)
             case!("bytes"),
             case!("containers"),
             case!("exceptions"),
+            case!("files"),
             case!("formatting"),
             case!("functions"),
             case!("readme_examples"),
         ] {
-            let (out, result, _) = run_with_heap(src, 64 * 1024);
+            let (out, result) = run_with_files(src, 64 * 1024);
             assert_eq!(result, Ok(()), "{}.py, output so far:\n{}", name, out);
             assert_eq!(out, expected, "{}.py", name);
         }
@@ -3802,6 +3899,73 @@ print(outer(), count)
         // A list growing past the heap fails cleanly
         let (_, result, _) = run_with_heap("a = []\nwhile True:\n    a.append(1)", 512);
         assert_eq!(result, Err(Error::OutOfMemory));
+    }
+
+    // ---- 5.6 files ---------------------------------------------------------
+
+    #[test]
+    fn test_os_module_specifics() {
+        let (out, result) = run_with_files(
+            "import os\nf = open('a.py', 'w')\nf.write('x = 1')\nf.close()\n\
+             print(os.size('a.py'), os.listdir('/'), os.listdir('.'), os.stat('/')[0] == 0o040000)\n\
+             print(os.statvfs('/')[2:4], os.uname()[0], open('/a.py').read())\n\
+             try:\n    os.listdir('sub')\nexcept OSError as e:\n    print(e)\n\
+             try:\n    open('bad name!', 'w')\nexcept OSError as e:\n    print(e.errno)\n\
+             # opening a second file for writing saves the first one\n\
+             f1 = open('one.txt', 'w')\nf1.write('1')\nf2 = open('two.txt', 'w')\n\
+             print(os.listdir())\n\
+             try:\n    f1.write('more')\nexcept OSError as e:\n    print(e)\n\
+             f2.close()\nprint(sorted(os.listdir()), open('one.txt').read())",
+            8192,
+        );
+        assert_eq!(result, Ok(()), "{}", out);
+        assert_eq!(
+            out,
+            "5 ['a.py'] ['a.py'] True\n(8, 7) micropython-rs x = 1\n\
+             [Errno 2] no such file\n22\n['a.py', 'one.txt']\n\
+             [Errno 9] file not open for writing\n['a.py', 'one.txt', 'two.txt'] 1\n"
+        );
+
+        // Without a file system: OSError (ENODEV)
+        let (err, _) = run_err("import os\ntry:\n    os.listdir()\nexcept OSError as e:\n    raise ValueError(e.errno)");
+        assert_eq!(err, Error::Exception);
+        let mut out = MockOut::new();
+        let mut heap = [0u8; 2048];
+        let mut vm = Interpreter::new(&mut out).with_heap(&mut heap);
+        assert_eq!(
+            vm.eval("try:\n    open('x')\nexcept OSError as e:\n    print(e.errno)"),
+            Ok(())
+        );
+        assert_eq!(out.as_str(), "19\n");
+    }
+
+    #[test]
+    fn test_file_written_across_evals_and_collections() {
+        // Thonny 3.2.7 writes a file with one `eval` per block; the file
+        // object lives in a variable while the heap is collected in between
+        let mut flash = std::vec![0u8; 4 * crate::flatfs::SLOT_SIZE as usize];
+        let files = RefCell::new(
+            crate::flatfs::FlatFs::mount(crate::flatfs::RamFlash::new(&mut flash)).unwrap(),
+        );
+        let mut out = MockOut::new();
+        let mut heap = [0u8; 1024];
+        let mut vm = Interpreter::new(&mut out)
+            .with_heap(&mut heap)
+            .with_files(&files);
+        vm.eval("__thonny_written = 0\n__thonny_fp = open('main.py', 'wb')")
+            .unwrap();
+        vm.eval("from binascii import unhexlify as __thonny_unhex\ndef __W(x):\n    global __thonny_written\n    __thonny_written += __thonny_fp.write(__thonny_unhex(x))\n    __thonny_fp.flush()")
+            .unwrap();
+        for _ in 0..20 {
+            vm.eval("__W(b'7072696e7428313233290a')").unwrap(); // print(123)\n
+            vm.eval("junk = [str(i) * 5 for i in range(10)]").unwrap();
+        }
+        vm.eval("print(__thonny_written)\ntry:\n    del __W\n    __thonny_fp.close()\n    del __thonny_fp\nexcept:\n    pass")
+            .unwrap();
+        vm.eval("with open('main.py') as f:\n    lines = f.readlines()\nprint(len(lines), lines[0].strip())")
+            .unwrap();
+        assert!(vm.heap_stats().3 > 0);
+        assert_eq!(out.as_str(), "220\n20 print(123)\n");
     }
 
     // ---- 5.4 exceptions ---------------------------------------------------

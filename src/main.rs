@@ -1,4 +1,6 @@
+use micropython_rs::flatfs::{FlatFs, RamFlash, SLOT_SIZE};
 use micropython_rs::{Interpreter, Output};
+use std::cell::RefCell;
 use std::{env, fs, process};
 
 struct StdoutSink;
@@ -37,7 +39,13 @@ fn main() {
     let mut out = StdoutSink;
     // Objects created at runtime (strings, lists, ...) live here
     let mut heap = vec![0u8; 256 * 1024];
-    let mut vm = Interpreter::new(&mut out).with_heap(&mut heap);
+    // `open()` and `os` work on a file system in RAM (gone when the script ends),
+    // with as many files as the ESP32's flash partition holds
+    let mut flash = vec![0u8; 30 * SLOT_SIZE as usize];
+    let files = RefCell::new(FlatFs::mount(RamFlash::new(&mut flash)).expect("RAM file system"));
+    let mut vm = Interpreter::new(&mut out)
+        .with_heap(&mut heap)
+        .with_files(&files);
 
     if let Err(err) = vm.eval(&script) {
         // Like Python: the traceback goes to stderr

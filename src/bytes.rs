@@ -208,6 +208,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
         args: &[Value<'a>],
     ) -> Result<Value<'a>, Error> {
         match (module, name, args) {
+            ("os", _, _) => self.os_call(name, args),
             ("binascii", "hexlify", [v]) => {
                 let len = self.bytes_of(*v).ok_or(Error::TypeError)?.len() * 2;
                 let r = self.alloc_obj(Kind::Bytes, len)?;

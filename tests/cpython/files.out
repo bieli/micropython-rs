@@ -1,0 +1,25 @@
+9 9 7
+True
+'line one\nline two\nzażółć\n'
+'line one\n' 'line two\n' 18
+'zażó' 'łć\n'
+'' ''
+> line one
+> line two
+> zażółć
+['line one\n', 'line two\n', 'zażółć\n']
+['line one', 'line two', 'zażółć', 'appended', '']
+3 3
+b'\x00\x01\xff\x00\x00\x00' 6 255
+6 38 True
+['t_data.bin', 't_notes.txt']
+['t_moved.bin', 't_notes.txt']
+b'\x00\x01' b'\xff\x00\x00\x00' b''
+missing: 2
+remove missing: 2
+closed file
+fail inside with True
+partial
+line one
+bad mode
+[]

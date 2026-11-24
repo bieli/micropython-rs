@@ -64,6 +64,8 @@ pub enum FsError {
     Corrupt,
     /// The region is smaller than one slot.
     NoRegion,
+    /// Writing to a file that's closed (or was replaced by another open file).
+    NotOpen,
 }
 
 impl FsError {
@@ -79,6 +81,7 @@ impl FsError {
             FsError::BadName => "bad file name (use A-Z a-z 0-9 . _ -, max 40 chars)",
             FsError::Corrupt => "file corrupted (checksum mismatch)",
             FsError::NoRegion => "no file system partition",
+            FsError::NotOpen => "file not open for writing",
         }
     }
 }
@@ -133,6 +136,10 @@ pub struct FlatFs<F: Flash> {
     next_generation: u32,
     /// Slot to try first for the next write (round robin for wear leveling).
     cursor: u32,
+    /// The file a script has open for writing (see `FileSystem`), and the
+    /// token its file object holds.
+    open: Option<Writer>,
+    open_token: u32,
 }
 
 impl<F: Flash> FlatFs<F> {
@@ -148,6 +155,8 @@ impl<F: Flash> FlatFs<F> {
             slots,
             next_generation: 1,
             cursor: 0,
+            open: None,
+            open_token: 0,
         };
 
         let mut newest = (0, 0); // (generation, slot)
@@ -383,6 +392,10 @@ impl<F: Flash> FlatFs<F> {
     fn free_slot(&mut self) -> Result<u32, FsError> {
         for i in 0..self.slots {
             let slot = (self.cursor + i) % self.slots;
+            // A file being written looks unused, but its slot is taken
+            if self.open.as_ref().is_some_and(|w| w.slot == slot) {
+                continue;
+            }
             if let Slot::Unused { .. } = self.slot(slot)? {
                 return Ok(slot);
             }
@@ -446,6 +459,158 @@ const FNV_START: u32 = 0x811C_9DC5;
 fn fnv1a(hash: u32, data: &[u8]) -> u32 {
     data.iter()
         .fold(hash, |h, &b| (h ^ b as u32).wrapping_mul(0x0100_0193))
+}
+
+/// What the interpreter needs from a file system (the `os` module and
+/// `open()`): object safe, so the interpreter doesn't depend on the flash
+/// type. One file can be open for writing at a time.
+pub trait FileSystem {
+    /// Calls `f(name, size)` for every file.
+    fn list(&mut self, f: &mut dyn FnMut(&str, u32)) -> Result<(), FsError>;
+    /// Size of a file, or `None` if it doesn't exist.
+    fn file_size(&mut self, name: &str) -> Result<Option<u32>, FsError>;
+    /// Reads from `offset`; returns the number of bytes read (0 at the end).
+    fn read_at(&mut self, name: &str, offset: u32, buf: &mut [u8]) -> Result<usize, FsError>;
+    /// Starts writing `name` (with `append`, after its current content).
+    /// The new version replaces the old one at `close_file`. A file still
+    /// open for writing is saved first. Returns a token for the file.
+    fn create(&mut self, name: &str, append: bool) -> Result<u32, FsError>;
+    fn write_file(&mut self, token: u32, data: &[u8]) -> Result<(), FsError>;
+    /// Saves the file (a token that's no longer open is ignored).
+    fn close_file(&mut self, token: u32) -> Result<(), FsError>;
+    fn remove(&mut self, name: &str) -> Result<(), FsError>;
+    fn rename(&mut self, from: &str, to: &str) -> Result<(), FsError>;
+    /// `(files, slots)`; every file takes one slot of `MAX_FILE_SIZE` bytes.
+    fn usage(&mut self) -> Result<(u32, u32), FsError>;
+}
+
+impl<F: Flash> FileSystem for FlatFs<F> {
+    fn list(&mut self, f: &mut dyn FnMut(&str, u32)) -> Result<(), FsError> {
+        FlatFs::list(self, |info| f(info.name(), info.size))
+    }
+
+    fn file_size(&mut self, name: &str) -> Result<Option<u32>, FsError> {
+        Ok(self.find(name)?.map(|info| info.size))
+    }
+
+    fn read_at(&mut self, name: &str, offset: u32, buf: &mut [u8]) -> Result<usize, FsError> {
+        let file = self.find(name)?.ok_or(FsError::NotFound)?;
+        FlatFs::read_at(self, &file, offset, buf)
+    }
+
+    fn create(&mut self, name: &str, append: bool) -> Result<u32, FsError> {
+        if let Some(w) = self.open.take() {
+            self.finish(w)?;
+        }
+        let mut w = self.begin(name)?;
+        if append {
+            // Copy the current content (still readable: it's replaced only at `finish`)
+            if let Some(old) = self.find(name)? {
+                let mut chunk = [0u8; WRITE_CHUNK];
+                let mut at = 0;
+                loop {
+                    let n = FlatFs::read_at(self, &old, at, &mut chunk)?;
+                    if n == 0 {
+                        break;
+                    }
+                    self.append(&mut w, &chunk[..n])?;
+                    at += n as u32;
+                }
+            }
+        }
+        self.open = Some(w);
+        self.open_token = self.open_token.wrapping_add(1).max(1);
+        Ok(self.open_token)
+    }
+
+    fn write_file(&mut self, token: u32, data: &[u8]) -> Result<(), FsError> {
+        let mut w = match self.open.take() {
+            Some(w) if token == self.open_token => w,
+            other => {
+                self.open = other;
+                return Err(FsError::NotOpen);
+            }
+        };
+        let result = self.append(&mut w, data);
+        self.open = Some(w);
+        result
+    }
+
+    fn close_file(&mut self, token: u32) -> Result<(), FsError> {
+        if token != self.open_token {
+            return Ok(());
+        }
+        match self.open.take() {
+            Some(w) => self.finish(w),
+            None => Ok(()),
+        }
+    }
+
+    fn remove(&mut self, name: &str) -> Result<(), FsError> {
+        FlatFs::remove(self, name)
+    }
+
+    fn rename(&mut self, from: &str, to: &str) -> Result<(), FsError> {
+        let old = self.find(from)?.ok_or(FsError::NotFound)?;
+        if from == to {
+            return Ok(());
+        }
+        // A copy under the new name, then the old name is removed
+        let mut w = self.begin(to)?;
+        let mut chunk = [0u8; WRITE_CHUNK];
+        let mut at = 0;
+        loop {
+            let n = FlatFs::read_at(self, &old, at, &mut chunk)?;
+            if n == 0 {
+                break;
+            }
+            self.append(&mut w, &chunk[..n])?;
+            at += n as u32;
+        }
+        self.finish(w)?;
+        FlatFs::remove(self, from)
+    }
+
+    fn usage(&mut self) -> Result<(u32, u32), FsError> {
+        FlatFs::usage(self)
+    }
+}
+
+/// Flash in RAM: for tests, and for running scripts with files on a PC.
+pub struct RamFlash<'m> {
+    mem: &'m mut [u8],
+}
+
+impl<'m> RamFlash<'m> {
+    /// `mem.len()` should be a multiple of `SLOT_SIZE`; it's erased (0xFF).
+    pub fn new(mem: &'m mut [u8]) -> Self {
+        mem.fill(0xFF);
+        Self { mem }
+    }
+}
+
+impl Flash for RamFlash<'_> {
+    fn size(&self) -> u32 {
+        self.mem.len() as u32
+    }
+
+    fn read(&mut self, offset: u32, buf: &mut [u8]) -> Result<(), FsError> {
+        let o = offset as usize;
+        buf.copy_from_slice(&self.mem[o..o + buf.len()]);
+        Ok(())
+    }
+
+    fn write(&mut self, offset: u32, data: &[u8]) -> Result<(), FsError> {
+        for (dst, src) in self.mem[offset as usize..].iter_mut().zip(data) {
+            *dst &= src; // like NOR flash: bits only go from 1 to 0
+        }
+        Ok(())
+    }
+
+    fn erase(&mut self, offset: u32, len: u32) -> Result<(), FsError> {
+        self.mem[offset as usize..(offset + len) as usize].fill(0xFF);
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -524,6 +689,44 @@ mod tests {
         let n = fs.read(name, &mut buf).unwrap();
         buf.truncate(n);
         buf
+    }
+
+    #[test]
+    fn test_file_system_trait_streams_and_renames() {
+        let mut mem = vec![0u8; (4 * SLOT_SIZE) as usize];
+        let mut fs = FlatFs::mount(super::RamFlash::new(&mut mem)).unwrap();
+        let fs: &mut dyn FileSystem = &mut fs;
+        let t = fs.create("a.txt", false).unwrap();
+        fs.write_file(t, b"hello ").unwrap();
+        fs.write_file(t, b"world").unwrap();
+        // Not visible until closed
+        assert_eq!(fs.file_size("a.txt"), Ok(None));
+        fs.close_file(t).unwrap();
+        assert_eq!(fs.write_file(t, b"x"), Err(FsError::NotOpen));
+        assert_eq!(fs.file_size("a.txt"), Ok(Some(11)));
+        let mut buf = [0u8; 5];
+        assert_eq!(fs.read_at("a.txt", 6, &mut buf), Ok(5));
+        assert_eq!(&buf, b"world");
+
+        // Appending; opening a second file saves the first
+        let t1 = fs.create("a.txt", true).unwrap();
+        fs.write_file(t1, b"!").unwrap();
+        let t2 = fs.create("b.txt", false).unwrap();
+        assert_eq!(fs.write_file(t1, b"?"), Err(FsError::NotOpen));
+        fs.close_file(t1).unwrap(); // stale token: ignored
+        fs.close_file(t2).unwrap();
+        assert_eq!(fs.file_size("a.txt"), Ok(Some(12)));
+        assert_eq!(fs.file_size("b.txt"), Ok(Some(0)));
+
+        fs.rename("a.txt", "c.txt").unwrap();
+        assert_eq!(fs.file_size("a.txt"), Ok(None));
+        let mut names = std::vec::Vec::new();
+        fs.list(&mut |name, size| names.push((std::string::String::from(name), size)))
+            .unwrap();
+        names.sort();
+        assert_eq!(names, [("b.txt".into(), 0), ("c.txt".into(), 12)]);
+        assert_eq!(fs.rename("nope", "x"), Err(FsError::NotFound));
+        assert_eq!(fs.usage(), Ok((2, 4)));
     }
 
     #[test]

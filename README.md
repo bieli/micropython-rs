@@ -675,7 +675,43 @@ calculator.py 4780
 * Files survive `make flash`; `make flash ERASE_FILES=1` or `make erase-files` deletes them all.
 * A `main.py` saved by older firmware (in the `nvs` partition) is moved into the file system at the first boot.
 * If the firmware is flashed without `partitions.csv` (no `vfs` partition), it says so at boot and runs without files.
-* Scripts can't open files yet (`open()`, `os`); that's the next step towards Thonny support (see below).
+* Scripts use the same files with `open()` and the `os` module (below).
+
+**Files in Python scripts:**
+
+```python
+import os
+with open('log.txt', 'a') as f:                 # 'r', 'w', 'a', plus 'b' for bytes
+    f.write('%d mV\n' % adc_mv(36))
+with open('log.txt') as f:
+    for line in f:                              # also f.read([n]), f.readline(), f.readlines()
+        print(line.strip())
+print(os.listdir(), os.stat('log.txt')[6], os.size('log.txt'))
+os.rename('log.txt', 'old.txt')
+os.remove('old.txt')
+```
+
+| Function | What it does |
+|----------|--------------|
+| `open(name, mode='r')` | A file object: `read([n])`, `readline()`, `readlines()`, `write(s)` (returns the count), `close()`, `flush()`, `tell()`, `seek(pos)`, `for line in f`, `with`; attributes `name`, `closed`, `mode` |
+| `os.listdir([path])` | All file names (`path` can only be `''`, `'/'` or `'.'`: there are no directories) |
+| `os.remove(name)`, `os.rename(old, new)` | Delete / rename a file |
+| `os.stat(name)` | `(mode, 0, 0, 0, 0, 0, size, 0, 0, 0)`, like MicroPython |
+| `os.size(name)` | The size in bytes (micro:bit style; Thonny uses it) |
+| `os.statvfs('/')` | `(bsize, frsize, blocks, bfree, bavail, ...)` with one block per 32 KB file slot |
+| `os.uname()`, `os.sync()` | System name tuple; `sync` does nothing (files are saved when closed) |
+
+* Text mode (`'r'`, `'w'`) reads and writes `str` (UTF-8); binary mode (`'rb'`, `'wb'`) `bytes`. Reads go
+  straight from flash into a new string, so a whole 32 KB file can be read only if the heap has room for it; read
+  big files in parts (`f.read(512)`) or line by line.
+* Writing streams to flash; the new version replaces the old one when the file is closed (crash safe, see above).
+  **One file can be open for writing at a time**: opening a second one saves and closes the first. A file that is
+  never closed isn't saved, so use `with`.
+* Errors are `OSError` with the usual numbers: `[Errno 2] no such file` (`e.errno == 2`), 22 for a bad name, 27
+  for a file over 32 KB, 28 when all 30 slots are taken.
+* On a PC, `mpy-cli` gives scripts a file system in RAM with the same rules (it's gone when the script ends).
+* Embedding: `Interpreter::with_files(&RefCell<dyn FileSystem>)`; `flatfs::FlatFs` implements `FileSystem` for any
+  `Flash`, and `flatfs::RamFlash` keeps one in RAM.
 
 The file system itself is hardware-independent code in the core library
 ([`src/flatfs.rs`](src/flatfs.rs)): any board provides a `Flash` implementation (read, write into erased flash,
@@ -686,8 +722,9 @@ possible write during a replace.
 20.04) needs strings with escape sequences, `bytes`, a dict comprehension, `print(..., sep=, end=)`, `repr()`,
 `try`/`except`, `del`, `open()` file objects and `binascii`; Thonny 4.x/5.x additionally need classes,
 `@classmethod`, exception classes, list comprehensions and slicing. The flat file system matches Thonny's
-"device without directories" mode, so supporting those language features is what's left. Done so far: strings,
-`repr()`, slicing, `bytes` and `binascii` (see [ROADMAP.md](ROADMAP.md), Phase 5).
+"device without directories" mode (the `os` module deliberately has no `getcwd`, which is how Thonny 3.2.7 detects
+it). All of the Thonny 3.2.7 list is done; the end-to-end test with Thonny is next (see [ROADMAP.md](ROADMAP.md),
+Phase 5).
 
 ### Example scripts
 
