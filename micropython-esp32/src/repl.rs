@@ -26,8 +26,8 @@ use micropython_rs::flatfs::{FsError, Writer};
 
 use crate::serial_input::wait_byte;
 use crate::storage::Files;
-use core::cell::RefCell;
 use crate::ABORT;
+use core::cell::RefCell;
 
 /// Bytes of REPL input (and the boot script) kept per session.
 pub const ARENA_SIZE: usize = 32 * 1024;
@@ -54,7 +54,10 @@ static mut BUFFERS: core::mem::MaybeUninit<Buffers> = core::mem::MaybeUninit::un
 /// The buffers, zeroed; can be taken only once.
 fn take_buffers() -> &'static mut Buffers {
     static TAKEN: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
-    assert!(!TAKEN.swap(true, Ordering::Relaxed), "REPL buffers taken twice");
+    assert!(
+        !TAKEN.swap(true, Ordering::Relaxed),
+        "REPL buffers taken twice"
+    );
     // SAFETY: this is the only reference to BUFFERS (taken once, checked
     // above), and the memory is zeroed in place before it's used as arrays
     // of bytes (zeroed in place: building `[0; N]` would use the stack)
@@ -117,19 +120,12 @@ pub fn run<O: Output, H: HardwareBridge>(
     let mut run_boot_script = true;
 
     loop {
+        let mut vm = new_interpreter(out, hw, heap, files, module_memory);
         let mut repl = Repl {
-            vm: Interpreter::with_hardware(&mut *out, &mut *hw).with_heap(&mut heap[..]),
+            vm: &mut vm,
             arena: Arena::new(&mut memory[..]),
             history: None,
         };
-        // Scripts get the flash files too: `open()` and the `os` module
-        if let Some(files) = files {
-            repl.vm.set_files(files);
-            repl.vm.set_module_memory(&mut module_memory[..]);
-        }
-        repl.vm.set_abort_flag(&ABORT);
-        // Deep recursion raises RecursionError instead of overflowing the stack
-        repl.vm.set_stack_floor(Some(stack_floor()));
 
         // Like MicroPython, a soft reset in the raw REPL skips main.py
         if run_boot_script {
@@ -150,6 +146,31 @@ pub fn run<O: Output, H: HardwareBridge>(
             }
         }
     }
+}
+
+/// A new interpreter for a session. Out of line: building it (from parts
+/// made by value) takes temporary copies of its 15 KB, which would otherwise
+/// stay in `run`'s frame, under every script, for good. The REPL then only
+/// borrows it, so it isn't moved again.
+#[inline(never)]
+fn new_interpreter<'a, O: Output, H: HardwareBridge>(
+    out: &'a mut O,
+    hw: &'a mut H,
+    heap: &'a mut [u8],
+    files: Option<&'a RefCell<Files>>,
+    module_memory: &'a mut [u8],
+) -> Interpreter<'a, O, H> {
+    let mut vm = Interpreter::with_hardware(out, hw);
+    vm.set_heap(heap);
+    // Scripts get the flash files too: `open()` and the `os` module
+    if let Some(files) = files {
+        vm.set_files(files);
+        vm.set_module_memory(module_memory);
+    }
+    vm.set_abort_flag(&ABORT);
+    // Deep recursion raises RecursionError instead of overflowing the stack
+    vm.set_stack_floor(Some(stack_floor()));
+    vm
 }
 
 #[derive(Clone, Copy)]
@@ -215,8 +236,8 @@ impl<'a> Arena<'a> {
     }
 }
 
-struct Repl<'a, O: Output, H: HardwareBridge> {
-    vm: Interpreter<'a, O, H>,
+struct Repl<'r, 'a, O: Output, H: HardwareBridge> {
+    vm: &'r mut Interpreter<'a, O, H>,
     arena: Arena<'a>,
     /// Last single line that ran, for the up-arrow key.
     history: Option<&'a str>,
@@ -232,7 +253,7 @@ impl<O: Output> core::fmt::Write for Fmt<'_, O> {
     }
 }
 
-impl<'a, O: Output, H: HardwareBridge> Repl<'a, O, H> {
+impl<'a, O: Output, H: HardwareBridge> Repl<'_, 'a, O, H> {
     fn write(&mut self, s: &str) {
         self.vm.output().write_str(s);
     }

@@ -12,11 +12,6 @@ use esp_hal::{
     delay::Delay,
     gpio::{AnyPin, DriveMode, Flex, InputConfig, Level, OutputConfig, Pull},
     i2c::master::{Config as I2cConfig, I2c},
-    spi::{
-        master::{Config as SpiConfig, Spi},
-        Mode as SpiMode,
-    },
-    uart::{Config as UartConfig, Uart},
     ledc::{
         channel::{self, ChannelIFace},
         timer::{self, TimerIFace},
@@ -24,7 +19,12 @@ use esp_hal::{
     },
     peripherals::{ADC1, GPIO21, GPIO22, GPIO34, GPIO36, GPIO39, I2C0, LEDC, LPWR},
     rtc_cntl::{Rtc, RwdtStage, RwdtStageAction, SocResetReason},
+    spi::{
+        master::{Config as SpiConfig, Spi},
+        Mode as SpiMode,
+    },
     time::{Duration, Instant, Rate},
+    uart::{Config as UartConfig, Uart},
     Blocking,
 };
 use micropython_rs::{Arg, Error, HwFn, Module};
@@ -111,6 +111,7 @@ macro_rules! board_functions {
             micropython_rs::HwFn::new("wdt_disable", "", "Turn the watchdog off"),
             micropython_rs::HwFn::new("reset", "", "Restart the board"),
             micropython_rs::HwFn::new("reset_cause", "", "PWRON_RESET, WDT_RESET, SOFT_RESET, ..."),
+            micropython_rs::HwFn::new("stack_peak", "", "Most stack bytes used since the last call"),
             $($extra),*
         ]
     };
@@ -300,7 +301,11 @@ impl<'d> Board<'d> {
                     Some(m) => m.int()?,
                     None => 0,
                 };
-                let pins = [pin_number(int(0)?)?, pin_number(int(1)?)?, pin_number(int(2)?)?];
+                let pins = [
+                    pin_number(int(0)?)?,
+                    pin_number(int(1)?)?,
+                    pin_number(int(2)?)?,
+                ];
                 self.spi_init(pins, khz, mode).map(|()| None)
             }
             "spi_write" => {
@@ -346,13 +351,19 @@ impl<'d> Board<'d> {
             }
             "reset" => esp_hal::system::software_reset(),
             "reset_cause" => Ok(Some(reset_cause())),
+            "stack_peak" => Ok(Some(crate::stack::peak_and_repaint() as i64)),
             _ => Err(Error::UnknownIdentifier),
         }
     }
 
     /// Board functions that return bytes (`i2c_read`, `uart_read`, ...):
     /// they fill `out` and return how many bytes they have.
-    pub fn call_bytes(&mut self, name: &str, args: &[Arg<'_>], out: &mut [u8]) -> Result<usize, Error> {
+    pub fn call_bytes(
+        &mut self,
+        name: &str,
+        args: &[Arg<'_>],
+        out: &mut [u8],
+    ) -> Result<usize, Error> {
         let int = |i: usize| args[i].int();
         let count = |n: i64| -> Result<usize, Error> {
             usize::try_from(n)
@@ -392,7 +403,9 @@ impl<'d> Board<'d> {
                 let uart = self.uart.as_mut().ok_or(Error::IoError)?;
                 let mut got = 0;
                 loop {
-                    got += uart.read_buffered(&mut out[got..n]).map_err(|_| Error::IoError)?;
+                    got += uart
+                        .read_buffered(&mut out[got..n])
+                        .map_err(|_| Error::IoError)?;
                     if got == n || now_ms() >= deadline {
                         return Ok(got);
                     }
@@ -440,7 +453,9 @@ impl<'d> Board<'d> {
     /// `uart_init(tx, rx, baud)`: UART1 on any two allowed pins (the same
     /// pin for both is a loopback: the UART receives what it sends).
     fn uart_init(&mut self, tx: u8, rx: u8, baud: i64) -> Result<(), Error> {
-        let baud = u32::try_from(baud).ok().filter(|b| (300..=5_000_000).contains(b));
+        let baud = u32::try_from(baud)
+            .ok()
+            .filter(|b| (300..=5_000_000).contains(b));
         let baud = baud.ok_or(Error::ValueError)?;
         self.uart = None; // the old driver goes first: only one at a time
         let (tx, rx) = (self.take_pin(tx)?, self.take_pin(rx)?);
@@ -458,7 +473,9 @@ impl<'d> Board<'d> {
     /// `spi_init(sck, mosi, miso, khz, mode)`: SPI3 as master (SPI2 drives
     /// the TTGO's display). Chip select is up to the script (`pin_write`).
     fn spi_init(&mut self, [sck, mosi, miso]: [u8; 3], khz: i64, mode: i64) -> Result<(), Error> {
-        let khz = u32::try_from(khz).ok().filter(|k| (10..=40_000).contains(k));
+        let khz = u32::try_from(khz)
+            .ok()
+            .filter(|k| (10..=40_000).contains(k));
         let khz = khz.ok_or(Error::ValueError)?;
         let mode = match mode {
             0 => SpiMode::_0,
@@ -468,7 +485,11 @@ impl<'d> Board<'d> {
             _ => return Err(Error::ValueError),
         };
         self.spi = None;
-        let (sck, mosi, miso) = (self.take_pin(sck)?, self.take_pin(mosi)?, self.take_pin(miso)?);
+        let (sck, mosi, miso) = (
+            self.take_pin(sck)?,
+            self.take_pin(mosi)?,
+            self.take_pin(miso)?,
+        );
         // SAFETY: the previous SPI3 driver was dropped just above
         let spi3 = unsafe { esp_hal::peripherals::SPI3::steal() };
         let config = SpiConfig::default()

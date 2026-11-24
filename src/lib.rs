@@ -1,4 +1,8 @@
 #![no_std]
+// No `unsafe` code in the interpreter. The `iram` feature's only difference is
+// the `link_section` attribute on hot functions, which the lint counts as
+// unsafe: every build without it (tests, CI, clippy) proves the rest.
+#![cfg_attr(not(feature = "iram"), forbid(unsafe_code))]
 
 pub mod ast_parser;
 pub mod flatfs;

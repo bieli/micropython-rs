@@ -7,6 +7,7 @@ pub mod buttons;
 pub mod repl;
 pub mod serial_console;
 pub mod serial_input;
+pub mod stack;
 pub mod storage;
 
 /// Set by Ctrl-C on the serial port; stops the running script

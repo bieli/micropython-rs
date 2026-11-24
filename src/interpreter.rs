@@ -290,8 +290,15 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
     /// strings built with `+`, `str()` or escape sequences. Without one, those
     /// operations raise `Error::OutOfMemory`.
     pub fn with_heap(mut self, memory: &'a mut [u8]) -> Self {
-        self.heap = Heap::new(memory);
+        self.set_heap(memory);
         self
+    }
+
+    /// Like `with_heap`, on an interpreter that already exists. (The `with_`
+    /// builders move the interpreter, which can leave copies of it in the
+    /// caller's stack frame; the `set_` methods change it in place.)
+    pub fn set_heap(&mut self, memory: &'a mut [u8]) {
+        self.heap = Heap::new(memory);
     }
 
     /// Gives scripts a file system: `open()` and the `os` module. The

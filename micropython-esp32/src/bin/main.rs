@@ -137,6 +137,8 @@ fn main() -> ! {
     let mut out = micropython_esp32::serial_console::EspSerialOut;
     let mut hw = GenericHardware { board, buttons };
 
+    // From here on, `stack_peak()` can tell how deep the stack went
+    micropython_esp32::stack::paint();
     repl::run(&mut out, &mut hw, &BOOT_SCRIPT, files.as_ref())
 }
 
@@ -315,6 +317,8 @@ fn main() -> ! {
         console: &console,
     };
 
+    // From here on, `stack_peak()` can tell how deep the stack went
+    micropython_esp32::stack::paint();
     repl::run(&mut out, &mut hw, &BOOT_SCRIPT, files.as_ref())
 }
 

@@ -228,9 +228,9 @@ Limits (in `src/interpreter.rs`):
 | `MAX_CALL_DEPTH` | 8 | Nested function calls, recursion included | `RecursionLimit` |
 | `MAX_NESTING` | 40 | Nested blocks (`if`/`while`/function bodies) running at once | `RecursionLimit` |
 
-Native stack use grows with each nested call (an RPN buffer and value stack per call), which is why
-`MAX_CALL_DEPTH` is small. On a 64-bit host the `Interpreter` struct is about 22 KB (including the 128 variable
-slots, the 128-value stack, the 256-entry object table of the heap and the 32-slot function table); on 32-bit MCUs it's about two thirds of that.
+Native stack use grows with each nested call (an RPN buffer and parser state per call, about 7.8 KB on the ESP32,
+see [Stack budget](#stack-budget-measured-on-the-esp32)), which is why `MAX_CALL_DEPTH` is small. On a 64-bit host the `Interpreter` struct is about 22 KB (including the 128 variable
+slots, the 128-value stack, the 256-entry object table of the heap and the 32-slot function table); on the ESP32 it's 14 960 bytes.
 
 ### Strings
 
@@ -451,6 +451,37 @@ and expression, so deep recursion or deeply nested code raises `RecursionError` 
 script can catch. The margin is for what runs below the last check: hardware drivers, flash writes, interrupts. The
 ESP32 firmware takes the bottom from esp-hal's linker script (`_stack_end_cpu0`) and keeps 16 KB.
 
+#### Stack budget (measured on the ESP32)
+
+Measured on a TTGO T-Display (release build, `FEATURES=tft`) with
+[`scripts/stack_budget.py`](micropython-esp32/scripts/stack_budget.py). The firmware fills the unused stack with a
+pattern at boot; `stack_peak()` returns the deepest point since its previous call and fills it again. The figures
+include everything below the script: `main`, the REPL and `eval()`.
+
+| Code | Peak stack |
+|------|-----------:|
+| A statement at the top level (`x = 1`) | 35 KB |
+| Each further Python call (`def` function or method) | + 7.8 KB |
+| Each nested block (`if`, `for`, `while`, `try`, `with`) | + 1.6 KB |
+| Recursion until `RecursionError` (`MAX_CALL_DEPTH` = 8 calls) | 107 KB |
+| Methods with `with`, `try`, `*args`/`**kwargs`, f-strings, comprehensions, until `RecursionError` | 136 KB |
+| **Worst case found**: 4 nested blocks per call, until `RecursionError` (`MAX_NESTING` = 40) | **147 KB** |
+
+The main stack is 181 KB (what the 520 KB of RAM leaves after statics, the REPL's buffers in `dram2` and esp-hal), so
+the interpreter's limits stop scripts about 22 KB above the stack guard's floor (181 − 16 KB margin): the guard is the
+second line of defense. Of the 35 KB at the top level, `main` takes 11 KB (the board's drivers, a 4 KB SPI buffer and
+the flash driver's 4 KB buffer), the REPL 16 KB (the 15 KB `Interpreter` struct, built out of line so that no
+temporary copy of it stays on the stack), and `eval()` with the call of `stack_peak()` itself the remaining 8 KB. `make report` lists the
+biggest stack frames of a build.
+
+On another MCU, budget about 35 KB for `eval()` plus 8 KB per call level you allow, or lower `MAX_CALL_DEPTH`
+and `MAX_NESTING` and set the stack floor. Keep the `Interpreter` (15 KB on 32-bit targets) in one place: build it
+with `new()`/`with_hardware()` and the `set_` methods rather than moving it through the `with_` builders.
+
+**No `unsafe` code.** The core library is `#![forbid(unsafe_code)]` (except the `link_section` attribute of the
+`iram` feature, which the lint counts as unsafe; every other build proves the rest). The firmware's `unsafe` is in
+the board code: re-acquiring peripherals, the stack painting and the static buffers.
+
 **Speed on the ESP32 (`iram` feature).** The firmware enables the core library's `iram` feature, which puts the
 interpreter's hot loop (lexer, parser, statement and expression evaluation, about 40 KB) into the `.rwtext` section,
 i.e. the ESP32's internal instruction RAM. Running from flash, the loop missed the 32 KB flash cache all the time:
@@ -663,6 +694,7 @@ make flash FEATURES=tft SCRIPT=scripts/help.py
 make flash PORT=/dev/ttyUSB0                 # pick a serial port explicitly
 
 make build                                   # build only
+make report                                  # memory of the last build: regions, stack, biggest frames
 make monitor                                 # serial monitor only (CTRL+R reset, CTRL+C exit)
 make erase-files                             # delete all files on the board (keeps the firmware)
 make clean                                   # remove build artifacts
@@ -908,6 +940,7 @@ terminal against it on a PC without a board.
 | [`scripts/button.py`](micropython-esp32/scripts/button.py) | Counting button presses with a pull-up and debouncing, timed with `ticks_ms` |
 | [`scripts/pwm_fade.py`](micropython-esp32/scripts/pwm_fade.py) | Fading an LED, and a 50 Hz servo pulse |
 | [`scripts/i2c_scan.py`](micropython-esp32/scripts/i2c_scan.py) | Scanning the I²C bus, and reading registers with `i2c_write_read` |
+| [`scripts/stack_budget.py`](micropython-esp32/scripts/stack_budget.py) | How much native stack calls, blocks and recursion take (`stack_peak()`) |
 | [`scripts/bus_loopback.py`](micropython-esp32/scripts/bus_loopback.py) | UART and SPI checked with one jumper wire each (TX to RX, MOSI to MISO) |
 | [`scripts/adc.py`](micropython-esp32/scripts/adc.py) | Averaging ADC samples and converting them to millivolts |
 | [`scripts/tft_clock.py`](micropython-esp32/scripts/tft_clock.py) | An uptime clock drawn with `text()` (TTGO only) |
@@ -1015,7 +1048,7 @@ Pins are plain GPIO numbers.
 | UART | `uart_init(tx, rx, [baud])`, `uart_write(data)`, `uart_read([n], [timeout_ms])`, `uart_any()` | UART1 on any two allowed pins, default 115 200 baud (300 to 5 000 000). `uart_write` returns the bytes sent; `uart_read` waits until `n` bytes (default 512) or `timeout_ms` (default 100) and returns what came, possibly `b''`; `uart_any()` counts the bytes waiting. Ctrl-C stops a wait. `uart_init` again changes pins or speed |
 | SPI | `spi_init(sck, mosi, miso, [khz], [mode])`, `spi_write(data)`, `spi_transfer(data)`, `spi_read(n, [fill])` | SPI3 master, default 1000 kHz (10 to 40 000) and mode 0 (0–3). Chip select is yours: a GPIO with `pin_write`. `spi_transfer` returns the bytes read while sending; `spi_read` sends `fill` (default 0) |
 | Watchdog | `wdt_enable(timeout_ms)`, `wdt_feed()`, `wdt_disable()` | The RTC watchdog resets the whole board when it isn't fed in time. `sleep_ms` feeds it automatically every 100 ms |
-| System | `reset()`, `reset_cause()` | `reset_cause()` returns `PWRON_RESET`, `HARD_RESET`, `WDT_RESET`, `DEEPSLEEP_RESET` or `SOFT_RESET` (MicroPython's values). The firmware also prints the reset reason at boot |
+| System | `reset()`, `reset_cause()`, `stack_peak()` | `reset_cause()` returns `PWRON_RESET`, `HARD_RESET`, `WDT_RESET`, `DEEPSLEEP_RESET` or `SOFT_RESET` (MicroPython's values). The firmware also prints the reset reason at boot. `stack_peak()`: the most bytes of the main stack used since its previous call (or boot), see [Stack budget](#stack-budget-measured-on-the-esp32) |
 | Battery (`tft` only) | `battery_mv([samples])` | Battery voltage in mV: switches on the TTGO's divider (`ADC_EN`, GPIO14), reads GPIO34, doubles it, switches the divider off |
 | TFT (`tft` only) | `cls()`, `color(r, g, b)`, `text(x, y, s)`, `rect(x, y, w, h)`, `backlight(on)` | `color` sets the text and fill color (0–255 per channel). `text` and `rect` draw at pixel positions. `WIDTH` and `HEIGHT` are 240 and 135 |
 
@@ -1357,6 +1390,16 @@ help() lists functions. Ctrl-C stops a script, Ctrl-D soft resets, Ctrl-E pastes
 ## Contributing
 
 Contributions are welcome! Whether you are fixing a typo, adding a new Python built-in, or improving docs for fellow Rust learners, feel free to open an issue or submit a pull request.
+
+What CI runs, and how to run it yourself:
+
+| Check | Command |
+|-------|---------|
+| Formatting, lints, tests, coverage ≥ 30 %, `no_std` builds | `cargo fmt --all -- --check`, `cargo clippy --all-targets -- -D warnings`, `make all` |
+| Language features against CPython | `cargo test` runs `tests/cpython/*.py` and compares with the `.out` files (`make cpython-expected` writes them with CPython) |
+| Thonny and mpremote end to end | see the `build-and-test` job in [`.github/workflows/ci.yml`](.github/workflows/ci.yml) |
+| Both ESP32 builds, memory report | `cd micropython-esp32 && make build [FEATURES=tft] && make report`: fails when the main stack drops below 128 KB or a function takes more than 32 KB of it ([`tools/fw_report.py`](micropython-esp32/tools/fw_report.py)) |
+| Fuzzing (5 minutes in CI) | `cargo +nightly fuzz run eval fuzz/corpus/eval -- -dict=fuzz/fuzz.dict -max_total_time=300`: random scripts through the whole interpreter ([`fuzz/fuzz_targets/eval.rs`](fuzz/fuzz_targets/eval.rs)); seed the corpus with `tests/cpython/*.py` first |
 
 
 ## License

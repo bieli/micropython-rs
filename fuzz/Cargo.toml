@@ -1,0 +1,23 @@
+[package]
+name = "micropython-rs-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+micropython-rs = { path = ".." }
+
+# Its own workspace: not built by `cargo build`/`cargo test` of the library
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "eval"
+path = "fuzz_targets/eval.rs"
+test = false
+doc = false
+bench = false

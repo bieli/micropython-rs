@@ -55,3 +55,75 @@ jobs:
           python3 -m zipfile -e /tmp/thonny5/thonny-5.0.0-py3-none-any.whl /tmp/thonny5/src
           /tmp/venv/bin/python tools/thonny5_e2e.py /tmp/thonny5/src
           /tmp/venv/bin/python tools/mpremote_e2e.py
+
+  # Both ESP32 builds, in the same container as `make build`. The report lists
+  # the memory regions and the biggest stack frames, and fails when the main
+  # stack shrinks below 128 KB or one function takes over 32 KB of it (the
+  # board-only problems of Phase 5 would have failed both)
+  firmware:
+    name: ESP32 firmware (${{ matrix.board }}), size and stack report
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - board: generic
+            features: ""
+          - board: TTGO T-Display
+            features: tft
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Cache crates and build artifacts
+        uses: actions/cache@v4
+        with:
+          path: micropython-esp32/target
+          key: firmware-${{ matrix.features }}-${{ hashFiles('micropython-esp32/Cargo.lock', 'micropython-esp32/rust-toolchain.toml') }}
+          restore-keys: firmware-${{ matrix.features }}-
+
+      - name: Build the firmware
+        working-directory: micropython-esp32
+        run: >
+          make build FEATURES=${{ matrix.features }}
+          DOCKER_FLAGS="--user root -e RUSTUP_HOME=/home/esp/.rustup -e CARGO_HOME=/home/esp/.cargo"
+
+      - name: Memory report
+        working-directory: micropython-esp32
+        shell: bash
+        run: |
+          python3 tools/fw_report.py target/xtensa-esp32-none-elf/release/micropython-esp32 \
+            --min-stack-kb 128 --max-frame-kb 32 --markdown | tee -a "$GITHUB_STEP_SUMMARY"
+
+  # Random scripts through the whole interpreter (fuzz/fuzz_targets/eval.rs):
+  # no panic, hang or native stack overflow in 5 minutes
+  fuzz:
+    name: Fuzz the interpreter
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Install nightly Rust
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Install cargo-fuzz
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+
+      - name: Fuzz for 5 minutes
+        run: |
+          mkdir -p fuzz/corpus/eval
+          cp tests/cpython/*.py micropython-esp32/scripts/*.py hello.py fuzz/corpus/eval/
+          cargo +nightly fuzz run --target x86_64-unknown-linux-gnu eval fuzz/corpus/eval -- \
+            -dict=fuzz/fuzz.dict -max_total_time=300 -max_len=4096 -timeout=10 -rss_limit_mb=2048
+
+      - name: Keep the failing input
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts
+          path: fuzz/artifacts

@@ -34,7 +34,17 @@ WORKSPACE_ROOT := $(abspath ..)
 # Persist the Cargo registry between Docker builds (no re-download of crates on every build)
 CARGO_CACHE  := $(abspath target/cargo-registry)
 
-.PHONY: all build flash monitor erase-files clean
+# Extra `docker run` options. CI runs the container as root (the runner's user
+# id differs from the image's `esp` user), with the toolchain paths of `esp`:
+#   DOCKER_FLAGS="--user root -e RUSTUP_HOME=/home/esp/.rustup -e CARGO_HOME=/home/esp/.cargo"
+DOCKER_FLAGS ?=
+
+# Limits checked by `make report` (tools/fw_report.py): the main stack must keep
+# MIN_STACK_KB, and no function may take more than MAX_FRAME_KB of stack
+MIN_STACK_KB ?= 128
+MAX_FRAME_KB ?= 32
+
+.PHONY: all build flash monitor erase-files report clean
 
 # Default target: compile inside Docker, then flash and open the serial monitor on the host
 all: flash
@@ -42,7 +52,7 @@ all: flash
 # Compile release firmware inside Espressif's Xtensa Docker container
 build:
 	mkdir -p $(CARGO_CACHE)
-	docker run --rm \
+	docker run --rm $(DOCKER_FLAGS) \
 		-v "$(WORKSPACE_ROOT)":/workspace \
 		-v "$(CARGO_CACHE)":/home/esp/.cargo/registry \
 		-e MPY_SCRIPT="$(SCRIPT)" \
@@ -61,6 +71,10 @@ erase-files:
 # Open the serial monitor without rebuilding or reflashing
 monitor:
 	$(ESPFLASH) monitor $(PORT_FLAG)
+
+# Memory report of the last build: region sizes, main stack, biggest stack frames
+report:
+	python3 tools/fw_report.py $(ELF_PATH) --min-stack-kb $(MIN_STACK_KB) --max-frame-kb $(MAX_FRAME_KB)
 
 # Remove build artifacts
 clean:

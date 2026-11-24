@@ -9,10 +9,28 @@ Status: ✅ done · 🚧 in progress · ⬜ planned · ➡️ moved
 |---|------|----------------|-----------|--------|
 | 1.1 | **Calls inside expressions**: `x = adc_read(34) * 3`, `print(millis())` | `HardwareBridge::call` already returns `Option<i64>`, but the result was dropped. Every sensor feature needs this | Calls are an RPN item, and a `None` result used in math is a `TypeError` | ✅ |
 | 1.2 | **Error line numbers**: `Error at line 7: ZeroDivision` | On a device there's no debugger, so a bare `Err(ZeroDivision)` is hard to trace | The lexer tracks lines, and `Interpreter::error_line()` reports where the last error happened | ✅ |
-| 1.3 | **Fuzzing the parser and interpreter** (`cargo-fuzz`) | Scripts are untrusted input, and a panic means the firmware resets | A fuzz target runs in CI for N minutes without panics or stack overflows | ⬜ |
+| 1.3 | **Fuzzing the parser and interpreter** (`cargo-fuzz`) | Scripts are untrusted input, and a panic means the firmware resets | A fuzz target runs in CI for N minutes without panics or stack overflows | ✅ `fuzz/fuzz_targets/eval.rs`, 5 minutes in CI |
 | 1.4 | **Execution step limit and abort flag** | Once loops exist, `while 1:` freezes the chip with no way out | `set_step_limit(n)` plus an `AtomicBool` abort flag (e.g. set by a UART Ctrl-C handler) | ✅ |
-| 1.5 | **CI for firmware**: build both ESP32 variants in the `espressif/idf-rust` container and track binary size | Firmware breakage is currently caught only by hand | The CI job fails on build errors and reports `.text` size | ⬜ |
-| 1.6 | **`#![forbid(unsafe_code)]` and stack budget docs** | Embedded users need to know the RAM cost up front | The README lists worst-case stack per `eval()`, measured on the ESP32 | ⬜ |
+| 1.5 | **CI for firmware**: build both ESP32 variants in the `espressif/idf-rust` container and track binary size | Firmware breakage is currently caught only by hand | The CI job fails on build errors and reports `.text` size | ✅ both builds; `tools/fw_report.py` also checks the stack |
+| 1.6 | **`#![forbid(unsafe_code)]` and stack budget docs** | Embedded users need to know the RAM cost up front | The README lists worst-case stack per `eval()`, measured on the ESP32 | ✅ |
+
+Robustness work on 1.3, 1.5 and 1.6 (done after Phase 6):
+
+* **1.3 Fuzzing:** `cargo +nightly fuzz run eval` sends random scripts through the lexer, parser, evaluator, heap and
+  garbage collector, files and `import`, as several `eval()` calls on one interpreter (like a REPL session), with a
+  small heap so out-of-memory paths run often and no stack floor so unbounded recursion would crash. Seeded with the
+  conformance and example scripts and a dictionary of Python keywords. 4.1 million inputs (24 minutes, 10 workers)
+  found nothing: no panic, overflow, hang or stack overflow. CI fuzzes for 5 minutes on every push.
+* **1.5 Firmware CI:** both ESP32 builds in Espressif's container (as `make build`), then `tools/fw_report.py`: flash,
+  IRAM, DRAM and `dram2` use, the main stack, and the biggest stack frames, decoded from each function's Xtensa
+  `entry` instruction (and the `l32r`/`movsp` sequence of frames over 32 KB). It fails when the main stack drops
+  below 128 KB or one function takes more than 32 KB of it: the Phase 5 stack bugs (an 80 KB frame, 64 KB of the
+  stack lost to buffers) would have failed it. Checked by running the job's commands on a clean copy of the repository.
+* **1.6 Stack budget:** measured on the TTGO with stack painting (`stack_peak()`, `scripts/stack_budget.py`), now in
+  the README: 35 KB for a statement at the top level, 7.8 KB per call, 1.6 KB per nested block, 147 KB in the worst
+  case found, of a 181 KB stack. Found while measuring: the REPL kept a second, temporary copy of the 15 KB
+  interpreter in its stack frame (moves of the `with_` builders); built out of line now, which gave every script
+  17 KB more stack. The core library is `#![forbid(unsafe_code)]` (the `iram` build only allows its `link_section`).
 
 ## Phase 2: Language features embedded engineers need most
 
