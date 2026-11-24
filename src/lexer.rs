@@ -15,7 +15,7 @@ pub enum Token<'a> {
     FStr(&'a str),
     Int(i64),
     /// A float literal: `1.5`, `.5`, `1e-3`.
-    Float(f64),
+    Float(crate::Float),
     // Keywords
     If,
     Elif,
@@ -464,7 +464,7 @@ impl<'a> Lexer<'a> {
             len += 1;
         }
         let text = core::str::from_utf8(&text[..len]).map_err(|_| Error::InvalidSyntax)?;
-        text.parse::<f64>()
+        text.parse::<crate::Float>()
             .map(Token::Float)
             .map_err(|_| Error::InvalidSyntax)
     }

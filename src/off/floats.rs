@@ -12,7 +12,7 @@ use crate::ast_parser::BinOp;
 use crate::{Error, HardwareBridge, Output};
 use core::cmp::Ordering;
 
-pub(super) fn as_f64(_v: Value<'_>) -> Option<f64> {
+pub(super) fn as_float(_v: Value<'_>) -> Option<crate::Float> {
     None
 }
 
@@ -34,15 +34,15 @@ pub(super) fn negate(_v: Value<'_>) -> Option<Value<'_>> {
     None
 }
 
-pub(super) fn write_float(_x: f64, sink: &mut dyn FnMut(&str)) {
+pub(super) fn write_float(_x: crate::Float, sink: &mut dyn FnMut(&str)) {
     sink("?");
 }
 
-pub(super) fn float_to_int(_x: f64) -> Result<i64, Error> {
+pub(super) fn float_to_int(_x: crate::Float) -> Result<i64, Error> {
     Err(Error::NotEnabled)
 }
 
-pub(super) fn math_constant(_name: &str) -> Option<f64> {
+pub(super) fn math_constant(_name: &str) -> Option<crate::Float> {
     None
 }
 

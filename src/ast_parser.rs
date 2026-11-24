@@ -95,7 +95,7 @@ pub enum CmpOp {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Item<'a> {
     Int(i64),
-    Float(f64),
+    Float(crate::Float),
     Str(&'a str),
     /// A `b'...'` literal as written (escapes decoded when evaluated).
     Bytes(&'a str),

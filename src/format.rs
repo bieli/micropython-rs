@@ -257,8 +257,8 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
                 return Err(Error::ValueError); // `'{:d}'.format(1.5)`
             }
             if is_float || float_type {
-                let x = super::floats::as_f64(v).ok_or(Error::ValueError)?;
-                return self.format_float_spec(x, spec);
+                let x = super::floats::as_float(v).ok_or(Error::ValueError)?;
+                return self.format_float_spec(crate::float_to_f64(x), spec);
             }
         }
         if numeric {

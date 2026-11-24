@@ -11,6 +11,31 @@ pub mod interpreter;
 pub mod lexer;
 
 pub use flatfs::FileSystem;
+
+/// The float type of the interpreter: `f64`, or `f32` with the `float32`
+/// feature (Python's `float` is double precision; MicroPython's ESP32 port
+/// uses single precision).
+#[cfg(not(feature = "float32"))]
+pub type Float = f64;
+#[cfg(feature = "float32")]
+pub type Float = f32;
+
+/// `Float` as `f64` (exact). Without `float32` it's the value itself.
+#[allow(clippy::useless_conversion)]
+pub(crate) fn float_to_f64(f: Float) -> f64 {
+    f64::from(f)
+}
+
+/// The bits of a `Float` for a 64-bit container slot, and back.
+#[allow(clippy::unnecessary_cast)]
+pub(crate) fn float_bits(f: Float) -> u64 {
+    f.to_bits() as u64
+}
+
+#[allow(clippy::unnecessary_cast)]
+pub(crate) fn float_from_bits(bits: u64) -> Float {
+    Float::from_bits(bits as _)
+}
 pub use interpreter::Interpreter;
 pub use interpreter::Value;
 
@@ -97,7 +122,8 @@ pub trait Output {
 pub enum Arg<'s> {
     /// An `int` (bools arrive as 0/1, like in Python).
     Int(i64),
-    /// A `float`, e.g. for `time.sleep(0.5)`.
+    /// A `float`, e.g. for `time.sleep(0.5)` (as `f64` also with the
+    /// `float32` feature: widening is exact).
     Float(f64),
     /// A `str`, e.g. for `text(x, y, 'hello')`.
     Str(&'s str),

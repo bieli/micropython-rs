@@ -92,8 +92,8 @@ pub enum Value<'a> {
     None,
     Bool(bool),
     Int(i64),
-    /// A `float` (double precision).
-    Float(f64),
+    /// A `float` (`f64`, or `f32` with the `float32` feature).
+    Float(crate::Float),
     /// A string in the script source (literals, and slices of them).
     Str(&'a str),
     /// A string created at runtime, on the heap.
@@ -3024,7 +3024,7 @@ fn bridge_args<'v>(
             Value::HStr(r) => Arg::Str(view.str(r)),
             Value::Bytes(b) => Arg::Bytes(b),
             Value::HBytes(r) => Arg::Bytes(view.bytes(r)),
-            Value::Float(f) => Arg::Float(f),
+            Value::Float(f) => Arg::Float(crate::float_to_f64(f)),
             other => Arg::Int(other.as_int().ok_or(Error::TypeError)?),
         };
     }
@@ -4743,7 +4743,15 @@ print(outer(), count)
             case!("containers"),
             case!("exceptions"),
             case!("files", cfg!(feature = "files")),
-            case!("floats", cfg!(all(feature = "float", feature = "format"))),
+            // (CPython's floats are double precision)
+            case!(
+                "floats",
+                cfg!(all(
+                    feature = "float",
+                    feature = "format",
+                    not(feature = "float32")
+                ))
+            ),
             case!("formatting", medium),
             case!("functions"),
             case!("modules", cfg!(all(feature = "files", feature = "modules"))),
@@ -4910,6 +4918,28 @@ print(outer(), count)
         fn modules(&self) -> &[crate::Module] {
             BUS_MODULE
         }
+    }
+
+    #[test]
+    #[cfg(all(feature = "float32", feature = "format"))]
+    fn test_single_precision_floats() {
+        // Results rounded to f32, printed like MicroPython's ESP32 port (7
+        // significant digits); expected values from CPython with every
+        // result rounded to single precision (struct 'f')
+        let mut out = MockOut::new();
+        let text = run_ok(
+            "import math\n\
+             print(0.1 + 0.2, 1 / 3, 2 / 3, 1e16, 100.0, 16777217.0, 3.14159265, math.pi, math.sqrt(2), 0.1 * 3, -0.0)\n\
+             print('%.10f' % 0.1, int(16777217.0), 16777217.0 == 16777216, '%.3f' % 2.675, round(2.5))\n\
+             print(7.5 / 2, 1e38 * 10, 123456.789, 1e39, type(1.5).__name__)",
+            &mut out,
+        );
+        assert_eq!(
+            text,
+            "0.3 0.3333333 0.6666667 1e+16 100.0 1.677722e+07 3.141593 3.141593 1.414214 0.3 -0.0\n\
+             0.1000000015 16777216 True 2.675 2\n\
+             3.75 inf 123456.8 inf float\n"
+        );
     }
 
     #[test]

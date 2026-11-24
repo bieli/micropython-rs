@@ -2,7 +2,7 @@
 // FLOATS: `1.5`, `7 / 2`, `float()`, `round()`, and the `math` module
 // ============================================================================
 //
-// Double precision (`f64`), as MicroPython's ports with
+// Double precision (`Float`), as MicroPython's ports with
 // `MICROPY_FLOAT_IMPL_DOUBLE` (its ESP32 port uses single precision by
 // default). Like MicroPython, an int meeting a float is converted to a float
 // first (CPython compares and divides big ints exactly; the results only
@@ -12,16 +12,85 @@
 
 use super::{Interpreter, Value};
 use crate::ast_parser::BinOp;
+use crate::Float;
 use crate::{Error, HardwareBridge, HwFn, Module, Output};
 use core::cmp::Ordering;
+#[cfg(feature = "float32")]
+use core::f32::consts as fconsts;
+#[cfg(not(feature = "float32"))]
+use core::f64::consts as fconsts;
 use core::fmt::Write;
 
+/// The math library for `Float`: libm's `f64` functions, or its `f32` ones
+/// (`sinf`, `sqrtf`, ...) with `float32`, which use the single precision FPU.
+mod m {
+    use crate::Float;
+
+    macro_rules! one {
+        ($($name:ident $single:ident),* $(,)?) => {$(
+            #[cfg(not(feature = "float32"))]
+            pub(super) fn $name(x: Float) -> Float {
+                libm::$name(x)
+            }
+            #[cfg(feature = "float32")]
+            pub(super) fn $name(x: Float) -> Float {
+                libm::$single(x)
+            }
+        )*};
+    }
+    macro_rules! two {
+        ($($name:ident $single:ident),* $(,)?) => {$(
+            #[cfg(not(feature = "float32"))]
+            pub(super) fn $name(x: Float, y: Float) -> Float {
+                libm::$name(x, y)
+            }
+            #[cfg(feature = "float32")]
+            pub(super) fn $name(x: Float, y: Float) -> Float {
+                libm::$single(x, y)
+            }
+        )*};
+    }
+    one!(
+        floor floorf, ceil ceilf, trunc truncf, round roundf, sqrt sqrtf, exp expf,
+        expm1 expm1f, log logf, log2 log2f, log10 log10f, sin sinf, cos cosf, tan tanf,
+        asin asinf, acos acosf, atan atanf, sinh sinhf, cosh coshf, tanh tanhf,
+        asinh asinhf, acosh acoshf, atanh atanhf, fabs fabsf, erf erff, erfc erfcf,
+        tgamma tgammaf, lgamma lgammaf,
+    );
+    two!(fmod fmodf, copysign copysignf, pow powf, atan2 atan2f, hypot hypotf);
+
+    #[cfg(not(feature = "float32"))]
+    pub(super) fn ldexp(x: Float, e: i32) -> Float {
+        libm::ldexp(x, e)
+    }
+    #[cfg(feature = "float32")]
+    pub(super) fn ldexp(x: Float, e: i32) -> Float {
+        libm::ldexpf(x, e)
+    }
+    #[cfg(not(feature = "float32"))]
+    pub(super) fn modf(x: Float) -> (Float, Float) {
+        libm::modf(x)
+    }
+    #[cfg(feature = "float32")]
+    pub(super) fn modf(x: Float) -> (Float, Float) {
+        libm::modff(x)
+    }
+    #[cfg(not(feature = "float32"))]
+    pub(super) fn frexp(x: Float) -> (Float, i32) {
+        libm::frexp(x)
+    }
+    #[cfg(feature = "float32")]
+    pub(super) fn frexp(x: Float) -> (Float, i32) {
+        libm::frexpf(x)
+    }
+}
+
 /// The value of an int, bool or float as a float.
-pub(super) fn as_f64(v: Value<'_>) -> Option<f64> {
+pub(super) fn as_float(v: Value<'_>) -> Option<Float> {
     match v {
         Value::Float(f) => Some(f),
-        Value::Int(n) => Some(n as f64),
-        Value::Bool(b) => Some(b as u8 as f64),
+        Value::Int(n) => Some(n as Float),
+        Value::Bool(b) => Some(b as u8 as Float),
         _ => None,
     }
 }
@@ -39,13 +108,13 @@ pub(super) fn float_binop<'a>(
     if !floats && op != BinOp::Div && !negative_pow {
         return None;
     }
-    let (Some(a), Some(b)) = (as_f64(lhs), as_f64(rhs)) else {
+    let (Some(a), Some(b)) = (as_float(lhs), as_float(rhs)) else {
         return Some(Err(Error::TypeError));
     };
     Some(float_arith(op, a, b).map(Value::Float))
 }
 
-fn float_arith(op: BinOp, a: f64, b: f64) -> Result<f64, Error> {
+fn float_arith(op: BinOp, a: Float, b: Float) -> Result<Float, Error> {
     Ok(match op {
         BinOp::Add => a + b,
         BinOp::Sub => a - b,
@@ -66,11 +135,11 @@ fn float_arith(op: BinOp, a: f64, b: f64) -> Result<f64, Error> {
 
 /// `a // b` and `a % b` with Python's floor semantics (CPython's
 /// `float_divmod`): the remainder has the sign of `b`.
-pub(super) fn divmod(a: f64, b: f64) -> Result<(f64, f64), Error> {
+pub(super) fn divmod(a: Float, b: Float) -> Result<(Float, Float), Error> {
     if b == 0.0 {
         return Err(Error::ZeroDivision);
     }
-    let mut m = libm::fmod(a, b);
+    let mut m = m::fmod(a, b);
     let mut div = (a - m) / b;
     if m != 0.0 {
         if (b < 0.0) != (m < 0.0) {
@@ -78,32 +147,32 @@ pub(super) fn divmod(a: f64, b: f64) -> Result<(f64, f64), Error> {
             div -= 1.0;
         }
     } else {
-        m = libm::copysign(0.0, b);
+        m = m::copysign(0.0, b);
     }
     let floordiv = if div != 0.0 {
-        let f = libm::floor(div);
+        let f = m::floor(div);
         if div - f > 0.5 {
             f + 1.0
         } else {
             f
         }
     } else {
-        libm::copysign(0.0, a / b)
+        m::copysign(0.0, a / b)
     };
     Ok((floordiv, m))
 }
 
 /// `a ** b` for floats, with Python's errors.
-fn power(a: f64, b: f64) -> Result<f64, Error> {
+fn power(a: Float, b: Float) -> Result<Float, Error> {
     if a == 0.0 && b < 0.0 {
         return Err(Error::ZeroDivision); // 0.0 cannot be raised to a negative power
     }
-    if a < 0.0 && a.is_finite() && b.is_finite() && libm::floor(b) != b {
+    if a < 0.0 && a.is_finite() && b.is_finite() && m::floor(b) != b {
         // CPython gives a complex number; MicroPython without complex numbers
         // (and this interpreter) can't
         return Err(Error::ValueError);
     }
-    let r = libm::pow(a, b);
+    let r = m::pow(a, b);
     if r.is_infinite() && a.is_finite() && b.is_finite() {
         return Err(Error::Overflow);
     }
@@ -116,7 +185,7 @@ pub(super) fn float_order(lhs: Value<'_>, rhs: Value<'_>) -> Option<Option<Order
     if !matches!(lhs, Value::Float(_)) && !matches!(rhs, Value::Float(_)) {
         return None;
     }
-    let (a, b) = (as_f64(lhs)?, as_f64(rhs)?);
+    let (a, b) = (as_float(lhs)?, as_float(rhs)?);
     Some(a.partial_cmp(&b))
 }
 
@@ -165,6 +234,7 @@ impl<const N: usize> Write for Buf<N> {
 
 /// The shortest digits that read back as `x` (> 0, finite), and the position
 /// of the decimal point: `x = 0.DIGITS * 10**point`.
+#[cfg(not(feature = "float32"))]
 fn shortest_digits(x: f64, digits: &mut Buf<32>) -> i32 {
     let mut sci = Buf::<40>::new();
     let _ = write!(sci, "{:e}", x); // `1.2345e-5`: Rust's shortest round trip
@@ -176,8 +246,28 @@ fn shortest_digits(x: f64, digits: &mut Buf<32>) -> i32 {
     exp.parse::<i32>().unwrap_or(0) + 1
 }
 
+/// `repr()` / `str()` of a single precision float, as MicroPython's ESP32
+/// port writes it: 7 significant digits (`'%.7g'`), with `.0` added when it
+/// would look like an int (`0.3333333`, `100.0`, `1e+16`).
+#[cfg(feature = "float32")]
+pub(super) fn write_float(x: Float, sink: &mut dyn FnMut(&str)) {
+    if x.is_nan() {
+        return sink("nan");
+    }
+    if x.is_sign_negative() {
+        sink("-");
+    }
+    let mut text = Buf::<48>::new();
+    let _ = format_float(crate::float_to_f64(x.abs()), 'g', Some(7), false, &mut text);
+    sink(text.as_str());
+    if !text.as_str().contains(['.', 'e', 'n']) {
+        sink(".0");
+    }
+}
+
 /// `repr()` / `str()` of a float, as CPython writes it.
-pub(super) fn write_float(x: f64, sink: &mut dyn FnMut(&str)) {
+#[cfg(not(feature = "float32"))]
+pub(super) fn write_float(x: Float, sink: &mut dyn FnMut(&str)) {
     if x.is_nan() {
         return sink("nan");
     }
@@ -259,6 +349,9 @@ pub(super) fn format_float<const N: usize>(
     if ty == '\0' && precision.is_none() {
         // No type and no precision: like `str()`
         let mut failed = false;
+        // (`x` came from a `Float`, so narrowing it back is exact)
+        #[allow(clippy::unnecessary_cast)]
+        let x = x as Float;
         write_float(x, &mut |s| failed |= out.push(s).is_err());
         return if failed { Err(Error::Overflow) } else { Ok(()) };
     }
@@ -376,7 +469,7 @@ fn strip_zeros<const N: usize>(out: &mut Buf<N>) {
 }
 
 /// `float(text)`: `'1.5'`, `' -2e3 '`, `'inf'`, `'nan'`, `'1_000.5'`.
-pub(super) fn parse_float(text: &str) -> Result<f64, Error> {
+pub(super) fn parse_float(text: &str) -> Result<Float, Error> {
     let t = text.trim();
     let (sign, body) = match t.as_bytes().first() {
         Some(b'-') => (-1.0, &t[1..]),
@@ -384,8 +477,8 @@ pub(super) fn parse_float(text: &str) -> Result<f64, Error> {
         _ => (1.0, t),
     };
     let special = match body.to_ascii_lowercase_buf().as_str() {
-        "inf" | "infinity" => Some(f64::INFINITY),
-        "nan" => Some(f64::NAN),
+        "inf" | "infinity" => Some(Float::INFINITY),
+        "nan" => Some(Float::NAN),
         _ => None,
     };
     if let Some(v) = special {
@@ -408,7 +501,7 @@ pub(super) fn parse_float(text: &str) -> Result<f64, Error> {
         buf.push(core::str::from_utf8(&[b]).unwrap_or(""))
             .map_err(|_| Error::ValueError)?;
     }
-    let value: f64 = buf.as_str().parse().map_err(|_| Error::ValueError)?;
+    let value: Float = buf.as_str().parse().map_err(|_| Error::ValueError)?;
     Ok(sign * value)
 }
 
@@ -431,23 +524,25 @@ impl LowerBuf for str {
 }
 
 /// `int(x)` of a float: towards zero, like Python.
-pub(super) fn float_to_int(x: f64) -> Result<i64, Error> {
+pub(super) fn float_to_int(x: Float) -> Result<i64, Error> {
     if x.is_nan() {
         return Err(Error::ValueError); // cannot convert float NaN to integer
     }
-    let t = libm::trunc(x);
+    let t = m::trunc(x);
     // The i64 range: [-2**63, 2**63)
-    if !(-9.223_372_036_854_776e18..9.223_372_036_854_776e18).contains(&t) {
+    // -2**63 is exact in both precisions; 2**63 is its negation
+    let min = i64::MIN as Float;
+    if !(min..-min).contains(&t) {
         return Err(Error::Overflow);
     }
     Ok(t as i64)
 }
 
 /// Round half to even (`round(2.5)` is 2), as Python does.
-fn round_half_even(x: f64) -> f64 {
-    let r = libm::round(x);
-    if (r - x).abs() == 0.5 && libm::fmod(r, 2.0) != 0.0 {
-        r - libm::copysign(1.0, x)
+fn round_half_even(x: Float) -> Float {
+    let r = m::round(x);
+    if (r - x).abs() == 0.5 && m::fmod(r, 2.0) != 0.0 {
+        r - m::copysign(1.0, x)
     } else {
         r
     }
@@ -457,38 +552,38 @@ fn round_half_even(x: f64) -> f64 {
 /// CPython's errors: a NaN from a number is a domain error (ValueError), an
 /// infinity from a finite number an OverflowError for the functions that can
 /// overflow and a domain error for the others (`log(0)`).
-fn math1(name: &str, x: f64) -> Option<Result<f64, Error>> {
+fn math1(name: &str, x: Float) -> Option<Result<Float, Error>> {
     let (r, can_overflow) = match name {
-        "sqrt" => (libm::sqrt(x), false),
-        "exp" => (libm::exp(x), true),
-        "expm1" => (libm::expm1(x), true),
-        "log2" => (libm::log2(x), false),
-        "log10" => (libm::log10(x), false),
-        "sin" => (libm::sin(x), false),
-        "cos" => (libm::cos(x), false),
-        "tan" => (libm::tan(x), false),
-        "asin" => (libm::asin(x), false),
-        "acos" => (libm::acos(x), false),
-        "atan" => (libm::atan(x), false),
-        "sinh" => (libm::sinh(x), true),
-        "cosh" => (libm::cosh(x), true),
-        "tanh" => (libm::tanh(x), false),
-        "asinh" => (libm::asinh(x), false),
-        "acosh" => (libm::acosh(x), false),
-        "atanh" => (libm::atanh(x), false),
-        "fabs" => (libm::fabs(x), false),
-        "erf" => (libm::erf(x), false),
-        "erfc" => (libm::erfc(x), false),
-        "gamma" => (libm::tgamma(x), true),
-        "lgamma" => (libm::lgamma(x), true),
-        "degrees" => (x * (180.0 / core::f64::consts::PI), true),
-        "radians" => (x * (core::f64::consts::PI / 180.0), false),
+        "sqrt" => (m::sqrt(x), false),
+        "exp" => (m::exp(x), true),
+        "expm1" => (m::expm1(x), true),
+        "log2" => (m::log2(x), false),
+        "log10" => (m::log10(x), false),
+        "sin" => (m::sin(x), false),
+        "cos" => (m::cos(x), false),
+        "tan" => (m::tan(x), false),
+        "asin" => (m::asin(x), false),
+        "acos" => (m::acos(x), false),
+        "atan" => (m::atan(x), false),
+        "sinh" => (m::sinh(x), true),
+        "cosh" => (m::cosh(x), true),
+        "tanh" => (m::tanh(x), false),
+        "asinh" => (m::asinh(x), false),
+        "acosh" => (m::acosh(x), false),
+        "atanh" => (m::atanh(x), false),
+        "fabs" => (m::fabs(x), false),
+        "erf" => (m::erf(x), false),
+        "erfc" => (m::erfc(x), false),
+        "gamma" => (m::tgamma(x), true),
+        "lgamma" => (m::lgamma(x), true),
+        "degrees" => (x * (180.0 / fconsts::PI), true),
+        "radians" => (x * (fconsts::PI / 180.0), false),
         _ => return None,
     };
     Some(checked(x, r, can_overflow))
 }
 
-fn checked(x: f64, r: f64, can_overflow: bool) -> Result<f64, Error> {
+fn checked(x: Float, r: Float, can_overflow: bool) -> Result<Float, Error> {
     if r.is_nan() && !x.is_nan() {
         return Err(Error::ValueError); // math domain error
     }
@@ -552,21 +647,21 @@ pub(crate) const MATH: Module = Module {
 };
 
 /// `math.pi` and the other float constants.
-pub(super) fn math_constant(name: &str) -> Option<f64> {
+pub(super) fn math_constant(name: &str) -> Option<Float> {
     Some(match name {
-        "pi" => core::f64::consts::PI,
-        "e" => core::f64::consts::E,
-        "tau" => core::f64::consts::TAU,
-        "inf" => f64::INFINITY,
-        "nan" => f64::NAN,
+        "pi" => fconsts::PI,
+        "e" => fconsts::E,
+        "tau" => fconsts::TAU,
+        "inf" => Float::INFINITY,
+        "nan" => Float::NAN,
         _ => return None,
     })
 }
 
 impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
     /// A float argument (ints and bools too).
-    fn float_arg(v: Value<'a>) -> Result<f64, Error> {
-        as_f64(v).ok_or(Error::TypeError)
+    fn float_arg(v: Value<'a>) -> Result<Float, Error> {
+        as_float(v).ok_or(Error::TypeError)
     }
 
     /// `math.name(args)`.
@@ -576,25 +671,25 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
         if let Some(r) = math1(name, x) {
             return r.map(Value::Float);
         }
-        let float = |r: f64| Ok(Value::Float(r));
+        let float = |r: Float| Ok(Value::Float(r));
         match name {
             "floor" | "ceil" | "trunc" => {
                 if let Value::Int(_) | Value::Bool(_) = args[0] {
                     return Ok(Value::Int(args[0].as_int().unwrap_or(0)));
                 }
                 let r = match name {
-                    "floor" => libm::floor(x),
-                    "ceil" => libm::ceil(x),
-                    _ => libm::trunc(x),
+                    "floor" => m::floor(x),
+                    "ceil" => m::ceil(x),
+                    _ => m::trunc(x),
                 };
                 float_to_int(r).map(Value::Int)
             }
             "log" => {
-                let ln = checked(x, libm::log(x), false)?;
+                let ln = checked(x, m::log(x), false)?;
                 match y()? {
                     None => float(ln),
                     Some(base) => {
-                        let lb = checked(base, libm::log(base), false)?;
+                        let lb = checked(base, m::log(base), false)?;
                         if lb == 0.0 {
                             return Err(Error::ZeroDivision);
                         }
@@ -609,30 +704,30 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
                 }
                 float(power(x, b)?)
             }
-            "atan2" => float(libm::atan2(x, y()?.unwrap_or(0.0))),
+            "atan2" => float(m::atan2(x, y()?.unwrap_or(0.0))),
             "fmod" => {
                 let b = y()?.unwrap_or(0.0);
                 if b == 0.0 || x.is_infinite() {
                     return Err(Error::ValueError);
                 }
-                float(libm::fmod(x, b))
+                float(m::fmod(x, b))
             }
-            "copysign" => float(libm::copysign(x, y()?.unwrap_or(0.0))),
-            "hypot" => float(libm::hypot(x, y()?.unwrap_or(0.0))),
+            "copysign" => float(m::copysign(x, y()?.unwrap_or(0.0))),
+            "hypot" => float(m::hypot(x, y()?.unwrap_or(0.0))),
             "ldexp" => {
                 let i = args[1].as_int().ok_or(Error::TypeError)?;
                 let i = i.clamp(i32::MIN as i64, i32::MAX as i64) as i32;
-                float(checked(x, libm::ldexp(x, i), true)?)
+                float(checked(x, m::ldexp(x, i), true)?)
             }
             "isfinite" => Ok(Value::Bool(x.is_finite())),
             "isinf" => Ok(Value::Bool(x.is_infinite())),
             "isnan" => Ok(Value::Bool(x.is_nan())),
             "modf" => {
-                let (frac, int) = libm::modf(x);
+                let (frac, int) = m::modf(x);
                 self.new_tuple(&[Value::Float(frac), Value::Float(int)])
             }
             "frexp" => {
-                let (m, e) = libm::frexp(x);
+                let (m, e) = m::frexp(x);
                 self.new_tuple(&[Value::Float(m), Value::Int(e as i64)])
             }
             "factorial" => {
@@ -653,7 +748,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
     pub(super) fn float_builtin(&self, args: &[Value<'a>]) -> Result<Value<'a>, Error> {
         match args {
             [] => Ok(Value::Float(0.0)),
-            [v] => match as_f64(*v) {
+            [v] => match as_float(*v) {
                 Some(f) => Ok(Value::Float(f)),
                 None => {
                     let text = self.str_of(*v).ok_or(Error::TypeError)?;
@@ -702,7 +797,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
 
 /// `round(x, n)` of a float: correctly rounded to `n` decimals (through the
 /// exact decimal text, like CPython), or to tens/hundreds for negative `n`.
-fn round_float(x: f64, n: i64) -> f64 {
+fn round_float(x: Float, n: i64) -> Float {
     if !x.is_finite() || n > 300 {
         return x;
     }
@@ -713,9 +808,9 @@ fn round_float(x: f64, n: i64) -> f64 {
         }
         return text.as_str().parse().unwrap_or(x);
     }
-    let scale = libm::pow(10.0, (-n).min(400) as f64);
+    let scale = m::pow(10.0, (-n).min(400) as Float);
     if scale.is_infinite() {
-        return libm::copysign(0.0, x);
+        return m::copysign(0.0, x);
     }
     round_half_even(x / scale) * scale
 }

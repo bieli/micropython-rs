@@ -64,7 +64,7 @@ fn encode(v: Value<'_>) -> [u8; SLOT] {
         Value::Func(f) => (T_FUNC, f as u64),
         Value::Builtin(b) => (T_BUILTIN, b as u64),
         Value::Globals => (T_GLOBALS, 0),
-        Value::Float(f) => (T_FLOAT, f.to_bits()),
+        Value::Float(f) => (T_FLOAT, crate::float_bits(f)),
         Value::Str(_) => (T_EMPTY_STR, 0),
         Value::Bytes(_) => (T_EMPTY_BYTES, 0),
     };
@@ -96,7 +96,7 @@ fn decode<'a>(slot: &[u8]) -> Value<'a> {
         T_FUNC => Value::Func(n as u8),
         T_BUILTIN => Value::Builtin(n as u8),
         T_GLOBALS => Value::Globals,
-        T_FLOAT => Value::Float(f64::from_bits(n)),
+        T_FLOAT => Value::Float(crate::float_from_bits(n)),
         _ => Value::None,
     }
 }

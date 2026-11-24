@@ -35,6 +35,10 @@ full = ["medium", "files", "modules", "stdlib"]
 
 # The parts the levels are made of (can also be chosen one by one)
 float = ["dep:libm"]
+# Single precision floats (f32) instead of double (f64), like MicroPython's
+# ESP32 port: on chips with a single precision FPU (ESP32, Cortex-M4F) float
+# maths runs in hardware instead of software routines
+float32 = ["float"]
 classes = []
 format = []
 files = []

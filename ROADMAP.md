@@ -170,6 +170,7 @@ Open after Phase 6 (the `machine` module is done in 7.1): `bytearray`
 | 7.2 | Raw-paste mode | Faster uploads from Thonny and mpremote | ⬜ |
 | 7.2a | **CPU clock at build time**: `make flash CPU_MHZ=80/160/240` (80 by default); `machine.freq()` reports it | Scripts run 2× / 3× faster when power doesn't matter | ✅ measured on the TTGO (README, "CPU clock") |
 | 7.4 | **Floats** (double precision) and the `math` module, `float()`, `round()`, `divmod()`, `pow()`, `%f %e %g` formatting, `time.sleep(0.5)` | Sensor maths in volts, degrees, percent; MicroPython tutorials use floats everywhere | ✅ identical to CPython (`tests/cpython/floats.py`) on the PC and on the TTGO |
+| 7.5 | **Single precision floats** (`float32`, `make flash FLOAT=32`), like MicroPython's ESP32 port | Its digits and rounding; the FPU | ✅ measured on the TTGO (README, "Single precision") |
 | 7.3 | **Feature levels** (`minimal`, `medium`, `full`; `full` by default) for the core library and the firmware (`make flash LEVEL=...`) | Smaller builds and less RAM for small chips | ✅ (README, "Feature levels") |
 
 Done for 7.1:
@@ -210,8 +211,12 @@ Done for 7.4:
   MicroPython's double builds): 17 significant digits.
 * On the ESP32: `floats.py` and all other conformance scripts identical to CPython; 86 KB more flash, no more RAM;
   1000 float additions 209 ms (ints 171 ms); int-only benchmark 2 % slower. Fuzzed with float tokens.
-* Not done: complex numbers, single precision (`f32`, MicroPython's ESP32 default) as an option, floats returned by
-  hardware functions (`HardwareBridge::call` returns ints).
+* Not done: complex numbers, floats returned by hardware functions (`HardwareBridge::call` returns ints).
+
+Done for 7.5: `micropython_rs::Float` is `f64`, or `f32` with the `float32` feature; libm's `f32` functions;
+`repr()` with 7 significant digits like MicroPython. On the ESP32 the maths is 2-11× faster natively (FPU instead
+of the ROM's soft-float), but Python code only 0-13 % (the interpreter's own overhead is 35-100 times a soft-float
+operation); 6 KB less flash, no RAM change.
 
 ## Recommended order
 

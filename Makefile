@@ -33,10 +33,10 @@ build-embedded:
 	cargo build --lib --target $(EMBEDDED_ARM)
 	cargo build --lib --target $(EMBEDDED_ESP32)
 
-# The smaller feature levels (the default is full): lints, tests and the
-# bare-metal builds of each
+# The smaller feature levels (the default is full) and single precision
+# floats: lints, tests and the bare-metal builds of each
 levels:
-	for level in minimal medium; do \
+	for level in minimal medium full,float32; do \
 		cargo clippy --all-targets --no-default-features --features $$level -- -D warnings && \
 		cargo test --no-default-features --features $$level && \
 		cargo build --lib --target $(EMBEDDED_ARM) --no-default-features --features $$level || exit 1; \

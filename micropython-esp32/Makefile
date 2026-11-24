@@ -18,8 +18,11 @@ FEATURES     ?=
 # The interpreter's feature level: full (default: everything, Thonny, the
 # machine module), medium (classes and formatting) or minimal (smallest)
 LEVEL        ?= full
+# Float precision: 64 (double, default; like CPython) or 32 (single, like
+# MicroPython's ESP32 port; computed by the FPU)
+FLOAT        ?= 64
 comma        := ,
-FEATURES_FLAG := --no-default-features --features $(LEVEL)$(if $(FEATURES),$(comma)$(FEATURES))
+FEATURES_FLAG := --no-default-features --features $(LEVEL)$(if $(FEATURES),$(comma)$(FEATURES))$(if $(filter 32,$(FLOAT)),$(comma)float32)
 
 # Optional Python script to embed (e.g., make flash SCRIPT=scripts/blink.py), relative to this
 # directory; leave empty for the board's demo (scripts/demo.py or scripts/ttgo_demo.py)

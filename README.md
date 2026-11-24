@@ -171,6 +171,34 @@ print(math.sqrt(2), math.floor(-2.5), math.log(8, 2), math.pi)       # 1.4142135
   float code 8 KB) and no RAM. A float addition in a loop is about 20 % slower than an int one; int-only loops got
   about 2 % slower.
 
+#### Single precision (`float32`)
+
+The Cargo feature `float32` (`make flash FLOAT=32` for the firmware) makes floats `f32`, like MicroPython's ESP32
+port: 7 significant digits are printed (`1 / 3` → `0.3333333`, `0.1 + 0.2` → `0.3`), and results are rounded to
+single precision (`16777217.0` → `16777216`, `1e39` → `inf`). The `math` functions use libm's `f32` versions
+(`sinf`, `sqrtf`, ...). Floats still reach the `HardwareBridge` as `f64` (exactly).
+
+Speed on the ESP32 (TTGO, 80 MHz): its FPU only does single precision, so `f64` runs in the ROM's software
+routines (the `f64` firmware calls them from 377 places; the `f32` one has 670 FPU instructions instead):
+
+| Operation | `f64` (default) | `f32` | |
+|-----------|----------------:|------:|-|
+| Native `a * 1.0001 + 0.5` | 1924 ns | 175 ns | 11× faster |
+| Native `10 / (a + 1)` | 8302 ns | 2383 ns | 3.5× |
+| Native `sqrt` / `sin` | 6148 / 32225 ns | 2000 / 18200 ns | 3× / 1.8× |
+| Python `y = y * 1.0001 + i * 0.5` (per loop pass) | 258 µs | 254 µs | 2 % |
+| Python `y = i / 7.3` | 183 µs | 183 µs | the same |
+| Python `math.sin(x)` / `math.sqrt(x)` | 406 / 270 µs | 352 / 239 µs | 13 % / 11 % |
+| Python `'%.3f' % x` | 571 µs | 597 µs | the same (formatting uses the `f64` value) |
+
+So the maths itself is 2-11 times faster, but a script barely notices: running one line of Python costs 70-250 µs
+in this interpreter (it parses as it runs), against about 2 µs for a software `f64` operation. Only scripts heavy
+on `math` functions gain about 10 %. (Results within ±5 % depend on the build: an int-only loop varied that much
+between the two firmwares.) `f32` saves 6 KB of flash and no RAM (the interpreter's stack frames are the same size: values are as large as
+the 64-bit ints either way). The bigger
+speed-ups are `CPU_MHZ=240` (3×) and the planned bytecode compiler; `float32` is for MicroPython's behaviour
+(its digits and rounding), and for chips with less flash.
+
 How it works without a heap: the parser turns each expression into postfix (RPN) order in a fixed-size buffer.
 For example, `(a + 2) * -3` becomes `[a, 2, Add, 3, Neg, Mul]`.
 The interpreter then evaluates it with a small fixed-size value stack.
@@ -793,6 +821,7 @@ make clean                                   # remove build artifacts
 |---------------|---------|---------|
 | `FEATURES` | *(empty)* | Cargo features passed as `--features ...` (e.g. `tft`) |
 | `LEVEL` | `full` | The interpreter's [feature level](#feature-levels): `full` (everything: Thonny, `machine`), `medium` (classes, formatting) or `minimal` (smallest) |
+| `FLOAT` | `64` | Float precision: `64` (double, like CPython) or `32` (single, like MicroPython's ESP32 port; computed by the FPU, see [Single precision](#single-precision-float32)) |
 | `CPU_MHZ` | `80` | CPU clock: `80` (least current, for batteries), `160` or `240` (scripts run 2× / 3× faster). Fixed in the firmware, `machine.freq()` reports it |
 | `SCRIPT` | *(empty: the board's demo)* | Python file to embed, relative to `micropython-esp32/`. It must be inside the repository, because the Docker build only sees the repository |
 | `ERASE_FILES` | *(empty)* | Files on the board survive `make flash`. `ERASE_FILES=1` deletes them all (then the embedded `SCRIPT` runs at boot, as no `main.py` is left); `make erase-files` does the same without flashing |
