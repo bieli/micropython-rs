@@ -39,6 +39,10 @@ const FUNCTIONS: &[HwFn] = &[
     HwFn::new("reset_cause", "", ""),
     HwFn::new("unique_id", "", "").returning_bytes(),
     HwFn::new("cpu_freq", "", ""),
+    HwFn::new("pin_irq", "pin, trigger", ""),
+    HwFn::new("timer_init", "id, period_us, periodic", ""),
+    HwFn::new("timer_deinit", "id", ""),
+    HwFn::new("fire", "event", ""),
 ];
 
 const CONSTANTS: &[(&str, i64)] = &[
@@ -61,6 +65,8 @@ struct MockBoard {
     pins: Vec<i64>,
     /// Bytes the "UART" receives, handed out by uart_read.
     rx: Vec<u8>,
+    /// Events for the interpreter (`fire(n)` queues one)
+    events: Vec<i64>,
 }
 
 fn show(args: &[Arg<'_>]) -> String {
@@ -96,6 +102,10 @@ impl HardwareBridge for MockBoard {
             "i2c_write" | "uart_write" => Ok(Some(args[args.len() - 1].bytes()?.len() as i64)),
             "uart_any" => Ok(Some(self.rx.len() as i64)),
             "cpu_freq" => Ok(Some(80_000_000)),
+            "fire" => {
+                self.events.push(int(0)?);
+                Ok(None)
+            }
             "reset_cause" => Ok(Some(1)),
             _ => Ok(None),
         }
@@ -122,6 +132,10 @@ impl HardwareBridge for MockBoard {
 
     fn functions(&self) -> &[HwFn] {
         FUNCTIONS
+    }
+
+    fn poll_event(&mut self) -> Option<i64> {
+        (!self.events.is_empty()).then(|| self.events.remove(0))
     }
 
     fn constants(&self) -> &[(&'static str, i64)] {
@@ -267,4 +281,38 @@ fn leaves_function_slots_for_scripts() {
     script.push_str("print(f15())\n");
     let (out, _) = run(&script, b"");
     assert_eq!(out, "15\n");
+}
+
+#[test]
+fn pin_irq_and_timer_callbacks() {
+    let (out, log) = run(
+        "from machine import Pin, Timer\n\
+         hits = []\n\
+         p = Pin(25, Pin.OUT)\n\
+         p.irq(handler=lambda pin: hits.append(('pin', pin)), trigger=Pin.IRQ_RISING)\n\
+         t = Timer(1, period=250, callback=lambda tm: hits.append(('timer', tm is t)))\n\
+         fire(25)\nfire(101)\nfire(7)\nx = 1\n\
+         print(hits)\n\
+         t.deinit()\np.irq(handler=None)\n\
+         fire(101)\nfire(25)\ny = 2\nprint(len(hits))\n\
+         Timer(-1, mode=Timer.ONE_SHOT, freq=10, callback=lambda tm: hits.append('virtual'))\n\
+         fire(104)\nz = 3\nprint(hits[-1])\n\
+         p.irq(lambda pin: None)\n\
+         try:\n    p.irq(lambda pin: None, trigger=Pin.IRQ_LOW_LEVEL)\nexcept ValueError:\n    print('level: ValueError')\n\
+         try:\n    Timer(0, mode=Timer.PERIODIC)\n    Timer(0).init()\nexcept ValueError:\n    print('no period: ValueError')\n",
+        b"",
+    );
+    assert_eq!(
+        out,
+        "[('pin', Pin(25)), ('timer', True)]\n2\nvirtual\nlevel: ValueError\nno period: ValueError\n"
+    );
+    assert!(
+        log.contains("pin_mode(25,1)\npin_irq(25,1)\ntimer_init(1,250000,1)\n"),
+        "{}",
+        log
+    );
+    assert!(log.contains("timer_deinit(1)\npin_irq(25,0)\n"), "{}", log);
+    assert!(log.contains("timer_init(-1,100000,0)\n"), "{}", log);
+    // The default trigger: both edges
+    assert!(log.contains("pin_irq(25,3)\n"), "{}", log);
 }

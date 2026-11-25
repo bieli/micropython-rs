@@ -128,6 +128,9 @@ macro_rules! board_functions {
             micropython_rs::HwFn::new("stack_peak", "", "Most stack bytes used since the last call"),
             micropython_rs::HwFn::new("unique_id", "", "The chip's MAC address (6 bytes)").returning_bytes(),
             micropython_rs::HwFn::new("cpu_freq", "", "CPU clock in Hz"),
+            micropython_rs::HwFn::new("pin_irq", "pin, trigger", "Pin interrupt events: 1 rising, 2 falling, 3 both, 0 off (use Pin.irq)"),
+            micropython_rs::HwFn::new("timer_init", "id, period_us, periodic", "Timer events (use machine.Timer)"),
+            micropython_rs::HwFn::new("timer_deinit", "id", "Stop a timer"),
             #[cfg(feature = "wifi")]
             micropython_rs::HwFn::with_args("wifi_active", 0, 1, "[on]", "Wi-Fi station on/off; returns whether it's on"),
             #[cfg(feature = "wifi")]
@@ -174,6 +177,8 @@ macro_rules! board_constants {
 
 /// The peripherals the board module needs.
 pub struct BoardPeripherals<'d> {
+    /// For the GPIO interrupt handler (`Pin.irq()`)
+    pub io_mux: esp_hal::peripherals::IO_MUX<'d>,
     /// The Wi-Fi radio and the timer its scheduler runs on (`wifi` feature)
     #[cfg(feature = "wifi")]
     pub wifi: esp_hal::peripherals::WIFI<'static>,
@@ -218,6 +223,9 @@ pub struct Board<'d> {
     #[cfg(feature = "wifi")]
     station: Option<crate::wifi::Station>,
     rtc: Rtc<'d>,
+    /// `Pin.irq()` and `machine.Timer` events
+    events: crate::events::Events,
+    _io: esp_hal::gpio::Io<'d>,
     wdt_enabled: bool,
 }
 
@@ -268,6 +276,12 @@ impl<'d> Board<'d> {
             #[cfg(feature = "wifi")]
             station: None,
             rtc: Rtc::new(p.lpwr),
+            events: crate::events::Events::new(),
+            _io: {
+                let mut io = esp_hal::gpio::Io::new(p.io_mux);
+                io.set_interrupt_handler(crate::events::gpio_interrupt);
+                io
+            },
             wdt_enabled: false,
         }
     }
@@ -326,6 +340,35 @@ impl<'d> Board<'d> {
                     .map(|()| None)
             }
             "cpu_freq" => Ok(Some(CPU_CLOCK as i64 * 1_000_000)),
+            "pin_irq" => {
+                let pin = pin_number(int(0)?)?;
+                let trigger = int(1)?;
+                let event = crate::events::trigger_event(trigger);
+                if event.is_none() && trigger != 0 {
+                    return Err(Error::ValueError); // level triggers aren't supported
+                }
+                let flex = self.input(pin)?;
+                match event {
+                    Some(event) => flex.listen(event),
+                    None => flex.unlisten(),
+                }
+                crate::events::clear_pin(pin);
+                Ok(None)
+            }
+            "timer_init" => {
+                let slot = timer_slot(int(0)?)?;
+                let period = u64::try_from(int(1)?).map_err(|_| Error::ValueError)?;
+                if period == 0 {
+                    return Err(Error::ValueError);
+                }
+                let now = since_boot().as_micros();
+                self.events.start_timer(slot, period, int(2)? != 0, now);
+                Ok(None)
+            }
+            "timer_deinit" => {
+                self.events.stop_timer(timer_slot(int(0)?)?);
+                Ok(None)
+            }
             #[cfg(feature = "wifi")]
             "wifi_active" => {
                 if let Some(on) = args.first() {
@@ -683,9 +726,7 @@ impl<'d> Board<'d> {
                         .checked_mul(1_000_000)
                         .ok_or(Error::ValueError)?,
                 };
-                self.sleep_ms(us / 1000)?;
-                self.delay.delay_micros((us.max(0) % 1000) as u32);
-                Ok(None)
+                self.sleep_for_us(us.max(0) as u64).map(|()| None)
             }
             // The other `time` functions are the flat ones with the same name
             ("time", _) => self.call(name, args),
@@ -693,28 +734,77 @@ impl<'d> Board<'d> {
         }
     }
 
-    /// Busy-waits in short chunks, feeding the watchdog in between, so a
-    /// long `sleep_ms` doesn't trip it.
     pub fn sleep_ms(&mut self, ms: i64) -> Result<(), Error> {
-        let mut remaining = non_negative(ms)?;
-        while remaining > 0 {
+        self.sleep_for_us(non_negative(ms)?.saturating_mul(1000) as u64)
+    }
+
+    /// Busy-waits until `us` have passed, in short steps: feeding the
+    /// watchdog (so a long sleep doesn't trip it), polling Wi-Fi, and
+    /// stopping with `Error::Pending` when an event is waiting for its
+    /// Python callback (the interpreter runs it and resumes the sleep).
+    pub fn sleep_for_us(&mut self, us: u64) -> Result<(), Error> {
+        let deadline = since_boot().as_micros().saturating_add(us);
+        let mut last_service = since_boot().as_micros();
+        loop {
             // Ctrl-C on the serial port interrupts long sleeps too
             if crate::ABORT.load(core::sync::atomic::Ordering::Relaxed) {
                 return Err(Error::Interrupted);
             }
-            let chunk = remaining.min(SLEEP_CHUNK_MS);
-            self.delay.delay_millis(chunk as u32);
-            remaining -= chunk;
-            // A script waiting for Wi-Fi sleeps: DHCP and packets go on meanwhile
-            #[cfg(feature = "wifi")]
-            if let Some(station) = self.station.as_mut() {
-                station.poll();
+            let now = since_boot().as_micros();
+            if now >= deadline {
+                return Ok(());
             }
-            if self.wdt_enabled {
-                self.rtc.rwdt.feed();
+            if self.events.on && self.events.waiting(now) {
+                let left_ms = (deadline - now).div_ceil(1000);
+                return Err(Error::Pending(left_ms.min(u32::MAX as u64) as u32));
+            }
+            // 1 ms steps while events may come (timers, pin interrupts)
+            let step_us = if self.events.on {
+                1000
+            } else {
+                SLEEP_CHUNK_MS as u64 * 1000
+            };
+            self.delay
+                .delay_micros((deadline - now).min(step_us) as u32);
+            if since_boot().as_micros() - last_service >= SLEEP_CHUNK_MS as u64 * 1000 {
+                last_service = since_boot().as_micros();
+                // A script waiting for Wi-Fi sleeps: DHCP and packets go on meanwhile
+                #[cfg(feature = "wifi")]
+                if let Some(station) = self.station.as_mut() {
+                    station.poll();
+                }
+                if self.wdt_enabled {
+                    self.rtc.rwdt.feed();
+                }
             }
         }
-        Ok(())
+    }
+
+    /// The next event for the interpreter (`HardwareBridge::poll_event`).
+    pub fn poll_event(&mut self) -> Option<i64> {
+        self.events.poll(since_boot().as_micros())
+    }
+
+    /// Whether sleeps stop for events (`HardwareBridge::set_events`).
+    pub fn set_events(&mut self, on: bool) {
+        self.events.on = on;
+    }
+
+    /// `HardwareBridge::resume_sleep`.
+    pub fn resume_sleep(&mut self, remaining_ms: u32) -> Result<(), Error> {
+        self.sleep_for_us(remaining_ms as u64 * 1000)
+    }
+
+    /// A soft reset: no more pin interrupts and timers from the last session.
+    pub fn soft_reset(&mut self) {
+        for (pin, entry) in self.pins.iter_mut().enumerate() {
+            if let Some((flex, _)) = entry.as_mut() {
+                flex.unlisten();
+                crate::events::clear_pin(pin as u8);
+            }
+        }
+        self.events.reset();
+        self.events.on = false;
     }
 
     /// The Wi-Fi station, once a script has activated it.
@@ -971,6 +1061,16 @@ pub fn reset_cause() -> i64 {
 /// Milliseconds since boot.
 pub fn now_ms() -> u64 {
     since_boot().as_millis()
+}
+
+/// MicroPython's timer ids: 0-3 (the ESP32's hardware timers), and -1
+/// (a virtual timer) as 4.
+fn timer_slot(id: i64) -> Result<usize, Error> {
+    match id {
+        0..=3 => Ok(id as usize),
+        -1 => Ok(4),
+        _ => Err(Error::ValueError),
+    }
 }
 
 fn since_boot() -> Duration {

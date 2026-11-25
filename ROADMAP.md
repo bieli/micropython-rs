@@ -172,6 +172,7 @@ Open after Phase 6 (the `machine` module is done in 7.1): `bytearray`
 | 7.4 | **Floats** (double precision) and the `math` module, `float()`, `round()`, `divmod()`, `pow()`, `%f %e %g` formatting, `time.sleep(0.5)` | Sensor maths in volts, degrees, percent; MicroPython tutorials use floats everywhere | ✅ identical to CPython (`tests/cpython/floats.py`) on the PC and on the TTGO |
 | 7.5 | **Single precision floats** (`float32`, `make flash FLOAT=32`), like MicroPython's ESP32 port | Its digits and rounding; the FPU | ✅ measured on the TTGO (README, "Single precision") |
 | 7.6 | **Wi-Fi: `network.WLAN`** (station mode) like MicroPython's ESP32 port: `active`, `scan`, `connect`, `isconnected`, `status`, `ifconfig`, `config`, `disconnect` (`FEATURES=wifi`) | Connected boards; the base for sockets and HTTP | ✅ on a TTGO with a WPA2 network |
+| 7.7 | **`Pin.irq()` and `machine.Timer`**: soft interrupts like MicroPython's (callbacks between statements, during sleeps and at the prompt) | Buttons, periodic tasks, event-driven code from MicroPython tutorials | ✅ on a TTGO (edges on a looped-back pin, timers) |
 | 7.3 | **Feature levels** (`minimal`, `medium`, `full`; `full` by default) for the core library and the firmware (`make flash LEVEL=...`) | Smaller builds and less RAM for small chips | ✅ (README, "Feature levels") |
 
 Done for 7.1:
@@ -186,7 +187,7 @@ Done for 7.1:
 * Found while writing it: a parameter with a default followed by `*args` or `**kwargs` (`def f(a, b=1, **kw)`) was a
   syntax error (fixed, in `tests/cpython/functions.py` now), and `I2C(...)` hung the board: the old I2C driver was
   dropped after the new one was made, which reset the peripheral under it.
-* Still missing: `Pin.irq`, `Timer`, `RTC`, `Signal`, the `*_into` methods (need `bytearray`), `time.sleep(0.5)`
+* Still missing: (`Pin.irq` and `Timer`: done in 7.7) `RTC`, `Signal`, the `*_into` methods (need `bytearray`), `time.sleep(0.5)`
   (floats: done in 7.4), keyword-only parameters (`def f(*, x)`), and unpacking into attributes (`self.a, self.b = a, b`). One
   bus per kind (I²C, UART, SPI). A method call takes 1.2 ms at 80 MHz (`pin_write` 0.27 ms); `CPU_MHZ=240` (7.2a)
   makes that 0.43 ms. Changing the clock while running (`machine.freq(f)`, by saving it and rebooting) is open.
@@ -232,6 +233,25 @@ Done for 7.6:
 * Costs: +435 KB flash, +53 KB IRAM, 70 KB of the stack (111 KB left), so it's a feature (`FEATURES=wifi`), not
   in every build; CI builds it with a 96 KB stack minimum.
 * Next: `socket` (TCP/UDP over the same smoltcp interface), then `urequests`; access point mode; static addresses.
+
+Done for 7.7:
+
+* Core: `HardwareBridge::poll_event` (events by number), `set_events`, `resume_sleep` and `soft_reset`, and
+  `Error::Pending`: a sleep that sees an event stops early with the time left; the interpreter runs the handler and
+  resumes the sleep (nothing kept in the firmware, so a handler may sleep too). The handler is one Python function
+  (`_irq_handler(f)`), called between statements (in `tick`, with the abort and step checks) and by
+  `Interpreter::run_pending_events`, which the REPL calls at the `>>>` prompt. Handlers don't nest; errors are
+  printed, Ctrl-C stops the script.
+* Firmware: a GPIO interrupt handler that records the pins (`events.rs`), software timers (ids 0-3 and -1), sleeps in
+  1 ms steps while events may come, and a soft reset that stops them. `machine.py`: `Pin.irq()`, `Timer`, and the
+  dispatcher from event numbers to callbacks.
+* `MAX_FUNCS` 96 for the `full` level (`machine` now takes 48 slots): 6 KB more RAM for the interpreter (29 KB REPL
+  frame). Building the interpreter out of line (`from_parts`) keeps its temporary copies off the scripts' stack.
+* Measured on the TTGO: a 50 ms timer fires 20 times in `sleep_ms(1000)`, a 100 Hz one 50 times in a 500 ms busy
+  loop, both-edge interrupts give 10 callbacks for 5 pulses (values right), timers keep going at the prompt and stop
+  on a soft reset, also with Wi-Fi connected; 6 % slower with a timer set, unchanged otherwise.
+* Not done: level triggers, hard interrupts (Python in the interrupt itself), `RTC`, `Signal`,
+  `micropython.schedule()`.
 
 ## Recommended order
 

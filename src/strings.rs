@@ -70,6 +70,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
             self.next_env,
             self.module_env,
             self.py_modules,
+            self.event_handler,
         ] {
             self.mark_value(v, &mut work, &mut n);
             self.trace(&mut work, &mut n);

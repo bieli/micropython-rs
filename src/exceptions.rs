@@ -97,7 +97,7 @@ fn error_class(err: Error) -> u8 {
         Error::TypeError => "TypeError",
         Error::ZeroDivision => "ZeroDivisionError",
         Error::Overflow => "OverflowError",
-        Error::StepLimit | Error::Exception => "RuntimeError",
+        Error::StepLimit | Error::Exception | Error::Pending(_) => "RuntimeError",
         Error::Interrupted => "KeyboardInterrupt",
         Error::RecursionLimit => "RecursionError",
         Error::ValueError => "ValueError",

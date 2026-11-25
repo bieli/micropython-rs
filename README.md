@@ -302,14 +302,14 @@ Limits (in `src/interpreter.rs`), for the `full` [feature level](#feature-levels
 | Constant | Value | Meaning | Error |
 |----------|-------|---------|-------|
 | `MAX_VARS` | 128 (48 / 96) | Variables: globals plus the locals of all active calls | `OutOfMemory` |
-| `MAX_FUNCS` | 64 (16 / 32) | `def` functions, methods and lambdas (the firmware's `machine` module takes 43) | `OutOfMemory` |
+| `MAX_FUNCS` | 96 (16 / 32) | `def` functions, methods and lambdas (the firmware's `machine` module takes 48, `network` 11) | `OutOfMemory` |
 | `MAX_GLOBAL_DECLS` | 16 (8 / 16) | Names declared `global` by all active calls together | `OutOfMemory` |
 | `MAX_CALL_DEPTH` | 8 (6 / 8) | Nested function calls, recursion included | `RecursionLimit` |
 | `MAX_NESTING` | 40 (24 / 40) | Nested blocks (`if`/`while`/function bodies) running at once | `RecursionLimit` |
 
 Native stack use grows with each nested call (an RPN buffer and parser state per call, about 7.8 KB on the ESP32,
 see [Stack budget](#stack-budget-measured-on-the-esp32)), which is why `MAX_CALL_DEPTH` is small. On a 64-bit host the `Interpreter` struct is about 22 KB (including the 128 variable
-slots, the 128-value stack, the 256-entry object table of the heap and the 32-slot function table); on the ESP32 it's about 21 KB.
+slots, the 128-value stack, the 256-entry object table of the heap and the 96-slot function table); on the ESP32 it's about 27 KB.
 
 ### Strings
 
@@ -539,23 +539,24 @@ include everything below the script: `main`, the REPL and `eval()`.
 
 | Code | Peak stack |
 |------|-----------:|
-| A statement at the top level (`x = 1`) | 42 KB |
+| A statement at the top level (`x = 1`) | 48.5 KB |
 | Each further Python call (`def` function or method) | + 7.8 KB |
 | Each nested block (`if`, `for`, `while`, `try`, `with`) | + 1.6 KB |
-| Recursion until `RecursionError` (`MAX_CALL_DEPTH` = 8 calls) | 114 KB |
-| Methods with `with`, `try`, `*args`/`**kwargs`, f-strings, comprehensions, until `RecursionError` | 142 KB |
-| **Worst case found**: 4 nested blocks per call, until `RecursionError` (`MAX_NESTING` = 40) | **153 KB** |
+| Recursion until `RecursionError` (`MAX_CALL_DEPTH` = 8 calls) | 118 KB |
+| Methods with `with`, `try`, `*args`/`**kwargs`, f-strings, comprehensions, until `RecursionError` | 146 KB |
+| **Worst case found**: 4 nested blocks per call, until `RecursionError` (`MAX_NESTING` = 40) | **154 KB** |
 
 The main stack is 181 KB (what the 520 KB of RAM leaves after statics, the REPL's buffers in `dram2` and esp-hal), so
-the interpreter's limits stop scripts about 16 KB above the stack guard's floor (181 − 16 KB margin): the guard is the
-second line of defense. Of the 42 KB at the top level, `main` takes 11 KB (the board's drivers, a 4 KB SPI buffer and
-the flash driver's 4 KB buffer), the REPL 23 KB (the 21 KB `Interpreter` struct, built out of line so that no
-temporary copy of it stays on the stack; 6 KB of it are the 64 function slots), and `eval()` with the call of
-`stack_peak()` itself the remaining 8 KB. `make report` lists the
+the interpreter's limits stop scripts about 11 KB above the stack guard's floor (181 − 16 KB margin): the guard is the
+second line of defense (with Wi-Fi, 111 KB of stack, it's the one that stops deep recursion). Of the 48.5 KB at the
+top level, `main` takes 12 KB (the board's drivers, a 4 KB SPI buffer and the flash driver's 4 KB buffer), the REPL
+29 KB (the 27 KB `Interpreter` struct, built out of line so that no temporary copy of it stays on the stack; 18 KB of
+it are the 96 function slots), and `eval()` with the call of `stack_peak()` itself the remaining 8 KB. `make report` lists the
 biggest stack frames of a build.
 
-On another MCU, budget about 42 KB for `eval()` plus 8 KB per call level you allow, or lower `MAX_CALL_DEPTH`
-and `MAX_NESTING` and set the stack floor. Keep the `Interpreter` (21 KB on 32-bit targets) in one place: build it
+On another MCU, budget about 48 KB for `eval()` plus 8 KB per call level you allow, or use a smaller [feature
+level](#feature-levels) or lower `MAX_CALL_DEPTH` and `MAX_NESTING` and set the stack floor. Keep the `Interpreter`
+(27 KB on 32-bit targets with the `full` level) in one place: build it
 with `new()`/`with_hardware()` and the `set_` methods rather than moving it through the `with_` builders.
 
 **No `unsafe` code.** The core library is `#![forbid(unsafe_code)]` (except the `link_section` attribute of the
@@ -616,7 +617,7 @@ one before:
 |-------|--------|---------------------------------------------|
 | `minimal` | ints, bools, `None`, strings, bytes, lists, tuples, dicts, comprehensions, `if`/`while`/`for`, `def` with defaults and keyword arguments, `lambda`, closures, decorators, exceptions, native modules and hardware functions, `builtins` | 16 / 48 / 6 |
 | `medium` | + floats and `math`, classes (`class`, `super()`, `@classmethod`, `__str__`, `__call__`, your own exceptions), string formatting (`%`, `str.format`, f-strings, `format()`, `hex()`/`bin()`/`oct()`) | 32 / 96 / 8 |
-| `full` | + files (`open()`, `os`), importing `.py` files and frozen modules, `sys`, `binascii`: everything Thonny and mpremote need | 64 / 128 / 8 |
+| `full` | + files (`open()`, `os`), importing `.py` files and frozen modules, `sys`, `binascii`: everything Thonny and mpremote need | 96 / 128 / 8 |
 
 ```toml
 micropython-rs = { path = "...", default-features = false, features = ["medium"] }
@@ -635,7 +636,7 @@ The ESP32 firmware (`make flash LEVEL=minimal`), measured on the generic build a
 |---------|-----------------:|----------:|-------------------:|--------------------------------:|--------------------------------:|
 | `minimal` | 142.0 KB | 258 KB | 10.0 KB | 29 KB | 85 KB (6 calls) |
 | `medium` | 218.8 KB (floats: about 60 KB of it) | 356 KB | 15.5 KB | 35 KB | 108 KB (8 calls) |
-| `full` (default) | 231.2 KB + 9 KB `machine.py` | 380 KB | 22.7 KB | 42 KB | 114 KB (8 calls) |
+| `full` (default) | 231.2 KB + 9 KB `machine.py` | 380 KB | 29.1 KB (96 function slots) | 48.5 KB | 118 KB (8 calls) |
 
 "Interpreter in RAM" is the REPL's stack frame, which holds the `Interpreter` struct; its tables shrink with the
 level. Speed is the same at every level. Thonny, mpremote's file commands and the `machine` module need `full`.
@@ -1222,12 +1223,40 @@ memory. A `machine.py` on the board's file system comes first, as in MicroPython
 | `I2C(id, scl=, sda=, freq=)`, `SoftI2C(scl, sda, freq=)` | `scan()`, `readfrom()`, `writeto()`, `readfrom_mem()`, `writeto_mem()` (also `addrsize=16`); one bus (pins default to 22 and 21) |
 | `UART(id, baudrate, tx=, rx=, timeout=)` | `write()`, `read([n])` (`None` when nothing came), `readline()`, `any()`, `init(...)`; id 1 or 2 (UART0 is the REPL), one at a time, 8N1 only; `UART(2)` defaults to tx 17, rx 16 |
 | `SPI(id, baudrate, polarity=, phase=, sck=, mosi=, miso=)`, `SoftSPI` | `read(n, [write])`, `write()`, `init(...)`; one bus, 8 bits MSB first; MicroPython's default pins for ids 1 and 2 |
+| `Pin.irq(handler=, trigger=)` | `handler(pin)` after an edge: `Pin.IRQ_RISING`, `Pin.IRQ_FALLING`, or both (`IRQ_RISING \| IRQ_FALLING`, the default); `irq(handler=None)` turns it off. Level triggers (`IRQ_LOW_LEVEL`, `IRQ_HIGH_LEVEL`) raise `ValueError` |
+| `Timer(id, mode=, period=, freq=, callback=)` | `Timer.PERIODIC`, `Timer.ONE_SHOT`; `period` in ms (`tick_hz=` changes the unit) or `freq` in Hz; `init(...)`, `deinit()`; `callback(timer)`. Ids 0-3 (and -1), software timers |
 | `WDT(timeout=)` | `feed()` |
 | functions | `reset()`, `reset_cause()` and its constants, `unique_id()`, `freq()` (fixed when building: `CPU_MHZ`; another value raises `ValueError`), `lightsleep(ms)` (waits) |
 
-Not there yet: `Pin.irq`, `Timer`, `RTC`, `Signal`, and the `*_into` methods (`readinto`, `write_readinto`,
-`readfrom_mem_into`), which need `bytearray`. The module
-takes 43 of the 64 function slots (`MAX_FUNCS`), and each method call runs Python code: `led.value(1)` takes 1.2 ms
+```python
+from machine import Pin, Timer
+import time
+
+presses = 0
+def pressed(pin):
+    global presses
+    presses += 1
+Pin(0, Pin.IN, Pin.PULL_UP).irq(handler=pressed, trigger=Pin.IRQ_FALLING)   # the BOOT button
+
+led = Pin(2, Pin.OUT)
+blink = Timer(0, mode=Timer.PERIODIC, period=250, callback=lambda t: led.toggle())
+while presses < 3:
+    time.sleep_ms(100)           # callbacks run while the script sleeps
+blink.deinit()
+```
+
+Pin interrupts and timer callbacks are *soft interrupts*, like MicroPython's default (`hard=False`; `hard=True` is
+accepted and works the same): the interrupt (or the timer, in software) only records the event, and the callback runs
+at the next statement, while the script sleeps (a sleep stops for it and goes on afterwards), or at the `>>>` prompt
+when the script has ended (so a timer keeps going, as in MicroPython; not in the raw REPL Thonny uses). Callbacks
+don't interrupt each other; an error in one is printed (`Unhandled exception in IRQ callback handler`) and the
+script goes on; a soft reset (Ctrl-D) stops them all. Measured on the TTGO: a 50 ms timer fires 20 times in a
+`sleep_ms(1000)`, a 100 Hz timer 50 times in a 500 ms busy loop, 5 pulses on a pin give 10 callbacks with both
+edges; with a timer set, scripts run about 6 % slower (an event check per statement), without one at the same speed.
+
+Not there yet: level triggers, `RTC`, `Signal`, and the `*_into` methods (`readinto`, `write_readinto`,
+`readfrom_mem_into`), which need `bytearray`. The module takes 48 of the 96 function slots (`MAX_FUNCS`), and each
+method call runs Python code: `led.value(1)` takes 1.2 ms
 on the ESP32 at 80 MHz (0.43 ms at 240 MHz), `pin_write(2, 1)` 0.27 ms (0.12 ms). Fine for blinking, sensors and
 buses, too slow for bit-banging.
 
@@ -1287,7 +1316,7 @@ What Wi-Fi costs (the reason it's a feature, not in every build):
 | Speed with Wi-Fi off / connected | | the same / 2 % slower (the scheduler's ticks) |
 
 Not there yet: access point mode, static addresses (`ifconfig((...))`), and sockets (`socket`, `urequests`), which are
-next. `network` takes 11 function slots, so a script using both `machine` and `network` has 10 of the 64 left.
+next. `network` takes 11 function slots, so a script using both `machine` and `network` has 37 of the 96 left.
 
 #### Modules
 

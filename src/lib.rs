@@ -82,6 +82,11 @@ pub enum Error {
     /// A Python exception from `raise` (or an error re-raised by `raise`):
     /// `Interpreter::write_exception` prints its class and message.
     Exception,
+    /// From a hardware function that waits (a sleep): it stopped early, with
+    /// this many milliseconds left, because events are waiting for their
+    /// handlers (`HardwareBridge::poll_event`). The interpreter runs them and
+    /// continues with `HardwareBridge::resume_sleep`; scripts never see it.
+    Pending(u32),
 }
 
 impl Error {
@@ -109,6 +114,7 @@ impl Error {
             Error::KeyError => "key not found",
             Error::NotEnabled => "not enabled in this build",
             Error::Exception => "",
+            Error::Pending(_) => "interrupted by an event",
         }
     }
 }
@@ -308,6 +314,31 @@ pub trait HardwareBridge {
         _out: &mut [u8],
     ) -> Result<usize, Error> {
         Err(Error::UnknownIdentifier)
+    }
+
+    /// The next event waiting for its Python handler, as a number: a pin
+    /// interrupt or a timer that fired (the firmware's `machine` module maps
+    /// the numbers to `Pin.irq()` and `Timer` callbacks). The interpreter
+    /// asks between statements, while it has a handler (`_irq_handler`), and
+    /// calls the handler with the number, until this returns `None`. Like
+    /// MicroPython's soft interrupts: callbacks run between statements.
+    fn poll_event(&mut self) -> Option<i64> {
+        None
+    }
+
+    /// Whether sleeps may stop early for events (returning
+    /// `Error::Pending`): only while the script has a handler and isn't
+    /// running one already (handlers don't nest).
+    fn set_events(&mut self, _on: bool) {}
+
+    /// A soft reset (the application calls it before a new session): the
+    /// last session's pin interrupts and timers stop.
+    fn soft_reset(&mut self) {}
+
+    /// Continues a sleep that returned `Error::Pending`, after the handlers
+    /// ran: `remaining_ms` more (and may stop early again).
+    fn resume_sleep(&mut self, _remaining_ms: u32) -> Result<(), Error> {
+        Ok(())
     }
 
     /// `call_bytes` for a function of a native module.

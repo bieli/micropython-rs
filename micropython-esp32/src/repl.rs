@@ -120,6 +120,9 @@ pub fn run<O: Output, H: HardwareBridge>(
     let mut run_boot_script = true;
 
     loop {
+        // Like MicroPython: a soft reset stops the last session's pin
+        // interrupts and timers
+        hw.soft_reset();
         let mut vm = new_interpreter(out, hw, heap, files, module_memory);
         let mut repl = Repl {
             vm: &mut vm,
@@ -157,10 +160,10 @@ static FROZEN_MODULES: &[(&str, &str)] = &[
     ("network", include_str!("../modules/network.py")),
 ];
 
-/// A new interpreter for a session. Out of line: building it (from parts
-/// made by value) takes temporary copies of its 15 KB, which would otherwise
-/// stay in `run`'s frame, under every script, for good. The REPL then only
-/// borrows it, so it isn't moved again.
+/// A new interpreter for a session. Out of line: building it takes a
+/// temporary copy of its 27 KB, which would otherwise stay in `run`'s frame,
+/// under every script, for good (here it's freed before the session runs).
+/// The REPL then only borrows it, so it isn't moved again.
 #[inline(never)]
 fn new_interpreter<'a, O: Output, H: HardwareBridge>(
     out: &'a mut O,
@@ -345,6 +348,20 @@ impl<'a, O: Output, H: HardwareBridge> Repl<'_, 'a, O, H> {
     // Normal REPL
     // ------------------------------------------------------------------
 
+    /// Waits for a byte at the `>>>` prompt, running the callbacks of pin
+    /// interrupts and timers meanwhile (a `Timer` keeps going after its
+    /// script, as in MicroPython). Not in the raw REPL: tools like Thonny
+    /// read its output as their protocol.
+    fn wait_byte_idle(&mut self) -> u8 {
+        loop {
+            if let Some(byte) = crate::serial_input::read_byte() {
+                return byte;
+            }
+            // Ctrl-C arrives as a byte too, so errors end here
+            let _ = self.vm.run_pending_events();
+        }
+    }
+
     fn normal_mode(&mut self) -> Mode {
         self.banner();
         self.write(">>> ");
@@ -356,7 +373,7 @@ impl<'a, O: Output, H: HardwareBridge> Repl<'_, 'a, O, H> {
         let mut escape = 0u8; // progress through an `ESC [ x` key sequence
 
         loop {
-            let byte = wait_byte();
+            let byte = self.wait_byte_idle();
             let after_cr = core::mem::replace(&mut last_was_cr, byte == b'\r');
 
             if escape > 0 {

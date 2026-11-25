@@ -69,6 +69,7 @@ const NAMES: &[&str] = &[
     "round",
     "divmod",
     "pow",
+    "_irq_handler",
 ];
 const FIRST_FUNCTION: u8 = 15;
 /// Types that can't be called (`NoneType()`, `function()`, `module()`).
@@ -397,6 +398,10 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
         Some(match (name, args) {
             ("isinstance", [v, spec]) => self.isinstance(*v, *spec).map(Value::Bool),
             ("float", _) => self.float_builtin(args),
+            ("_irq_handler", [f]) => {
+                self.set_event_handler(*f);
+                Ok(Value::None)
+            }
             ("round", _) => self.round_builtin(args),
             ("divmod", [a, b]) => self.divmod_builtin(*a, *b),
             ("pow", [a, b]) => super::binop(crate::ast_parser::BinOp::Pow, *a, *b),

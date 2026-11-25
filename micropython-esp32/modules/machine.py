@@ -9,7 +9,11 @@
 # * one I2C bus, one UART and one SPI bus at a time (the id picks defaults);
 # * ADC: 11 dB attenuation and 12 bits only (0-3.3 V);
 # * UART: 8 data bits, no parity, 1 stop bit; SPI: 8 bits, MSB first.
-# No Pin.irq, Timer, RTC or *_into methods (they need bytearray) yet.
+# Pin.irq() and Timer callbacks are soft interrupts (MicroPython's default,
+# hard=False): they run between statements, while the script sleeps, and at
+# the >>> prompt. hard=True is accepted and works the same way. Edge
+# triggers only (no IRQ_LOW_LEVEL / IRQ_HIGH_LEVEL). No RTC or *_into
+# methods (they need bytearray) yet.
 # Floats work where MicroPython takes them: time.sleep(0.5), machine values
 # from int arithmetic (duty_ns, read_uv) stay ints, as on MicroPython.
 
@@ -32,6 +36,18 @@ def freq(hz=None):
         # Set when the firmware is built: make flash CPU_MHZ=80/160/240
         raise ValueError('the CPU clock is fixed at %d Hz (build with CPU_MHZ=%d)'
                          % (cpu_freq(), hz // 1000000))
+
+
+# The callbacks of Pin.irq() and Timer, by event number (a pin's GPIO
+# number, or 100 + a timer's slot): (callback, its argument)
+_callbacks = {}
+
+
+def _event(n):
+    # Called by the interpreter for each event (see _irq_handler)
+    entry = _callbacks.get(n)
+    if entry is not None and entry[0] is not None:
+        entry[0](entry[1])
 
 
 def _pin(pin):
@@ -85,6 +101,24 @@ class Pin:
 
     def toggle(self):
         pin_toggle(self._id)
+
+    IRQ_RISING = 1
+    IRQ_FALLING = 2
+    IRQ_LOW_LEVEL = 4
+    IRQ_HIGH_LEVEL = 5
+
+    def irq(self, handler=None, trigger=3, priority=1, wake=None, hard=False):
+        # handler(pin) runs soon after the edge (trigger: IRQ_RISING,
+        # IRQ_FALLING, or both: IRQ_RISING | IRQ_FALLING, the default)
+        if handler is None:
+            pin_irq(self._id, 0)
+            _callbacks.pop(self._id, None)
+            return
+        if trigger not in (1, 2, 3):
+            raise ValueError('only IRQ_RISING and IRQ_FALLING (no level triggers)')
+        _callbacks[self._id] = (handler, self)
+        _irq_handler(_event)
+        pin_irq(self._id, trigger)
 
     def __repr__(self):
         return 'Pin(%d)' % self._id
@@ -279,6 +313,34 @@ class SPI:
 
 
 SoftSPI = SPI
+
+
+class Timer:
+    # Software timers with MicroPython's API: ids 0-3 (and -1)
+    ONE_SHOT = 0
+    PERIODIC = 1
+
+    def __init__(self, id=-1, mode=1, period=-1, freq=-1, callback=None, tick_hz=1000):
+        self._id = id
+        self._event = 104 if id == -1 else 100 + id
+        if callback is not None or period >= 0 or freq > 0:
+            self.init(mode, period, freq, callback, tick_hz)
+
+    def init(self, mode=1, period=-1, freq=-1, callback=None, tick_hz=1000):
+        # period in 1/tick_hz seconds (ms by default), or freq in Hz
+        if freq > 0:
+            us = int(1000000 / freq)
+        elif period >= 0:
+            us = int(period * 1000000 / tick_hz)
+        else:
+            raise ValueError('Timer needs period= or freq=')
+        _callbacks[self._event] = (callback, self)
+        _irq_handler(_event)
+        timer_init(self._id, max(us, 1), mode)
+
+    def deinit(self):
+        timer_deinit(self._id)
+        _callbacks.pop(self._event, None)
 
 
 class WDT:

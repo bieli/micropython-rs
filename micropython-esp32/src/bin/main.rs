@@ -34,6 +34,7 @@ const SCRIPT: &str = include_str!(env!("MPY_SCRIPT_PATH"));
 macro_rules! board_peripherals {
     ($p:ident) => {
         BoardPeripherals {
+            io_mux: $p.IO_MUX,
             #[cfg(feature = "wifi")]
             wifi: $p.WIFI,
             #[cfg(feature = "wifi")]
@@ -98,6 +99,22 @@ impl HardwareBridge for GenericHardware<'_> {
 
     fn call_bytes(&mut self, name: &str, args: &[Arg<'_>], out: &mut [u8]) -> Result<usize, Error> {
         self.board.call_bytes(name, args, out)
+    }
+
+    fn poll_event(&mut self) -> Option<i64> {
+        self.board.poll_event()
+    }
+
+    fn set_events(&mut self, on: bool) {
+        self.board.set_events(on)
+    }
+
+    fn resume_sleep(&mut self, remaining_ms: u32) -> Result<(), Error> {
+        self.board.resume_sleep(remaining_ms)
+    }
+
+    fn soft_reset(&mut self) {
+        self.board.soft_reset()
     }
 
     fn functions(&self) -> &[HwFn] {
@@ -267,6 +284,22 @@ impl HardwareBridge for TtgoHardware<'_, '_> {
 
     fn call_bytes(&mut self, name: &str, args: &[Arg<'_>], out: &mut [u8]) -> Result<usize, Error> {
         self.board.call_bytes(name, args, out)
+    }
+
+    fn poll_event(&mut self) -> Option<i64> {
+        self.board.poll_event()
+    }
+
+    fn set_events(&mut self, on: bool) {
+        self.board.set_events(on)
+    }
+
+    fn resume_sleep(&mut self, remaining_ms: u32) -> Result<(), Error> {
+        self.board.resume_sleep(remaining_ms)
+    }
+
+    fn soft_reset(&mut self) {
+        self.board.soft_reset()
     }
 
     fn functions(&self) -> &[HwFn] {

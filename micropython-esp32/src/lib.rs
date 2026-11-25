@@ -4,6 +4,7 @@ use core::sync::atomic::AtomicBool;
 
 pub mod board;
 pub mod buttons;
+pub mod events;
 pub mod repl;
 pub mod serial_console;
 pub mod serial_input;

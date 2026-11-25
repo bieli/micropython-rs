@@ -64,7 +64,7 @@ use crate::{Arg, Error, FileSystem, HardwareBridge, HwFn, Module, NoHardware, Ou
 /// Variable slots, shared by globals and the locals of active function calls.
 pub const MAX_VARS: usize = level(48, 96, 128);
 /// Number of `def` functions that can exist at the same time.
-pub const MAX_FUNCS: usize = level(16, 32, 64);
+pub const MAX_FUNCS: usize = level(16, 32, 96);
 /// Maximum depth of nested user function calls (recursion included).
 pub const MAX_CALL_DEPTH: usize = level(6, 8, 8);
 /// `global` names declared by all active function calls together.
@@ -219,6 +219,10 @@ pub struct Interpreter<'a, O: Output, H: HardwareBridge = NoHardware> {
     hw: Option<&'a mut H>,
     /// Set from outside (e.g. a UART Ctrl-C handler) to stop a running script.
     abort: Option<&'a AtomicBool>,
+    /// The Python function that handles hardware events (`_irq_handler`),
+    /// and whether it's running (it isn't called again meanwhile).
+    event_handler: Value<'a>,
+    in_event: bool,
     /// Globals first, then one frame of locals per active function call.
     vars: [(&'a str, Value<'a>); MAX_VARS],
     /// Values in flight (see `VALUE_STACK`).
@@ -243,7 +247,7 @@ pub struct Interpreter<'a, O: Output, H: HardwareBridge = NoHardware> {
     closure_env: Value<'a>,
     next_env: Value<'a>,
     /// Reachable function slots during a collection (bit per slot).
-    func_marks: u64,
+    func_marks: u128,
     /// Lowest native stack address scripts may reach (`set_stack_floor`).
     stack_floor: usize,
     /// Memory for the source of imported `.py` modules (`with_module_memory`).
@@ -276,6 +280,10 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
         Self::from_parts(out, Some(hw))
     }
 
+    // Out of line: the struct (27 KB on the ESP32 with the full level) is
+    // then built directly where the caller keeps it, not in a temporary
+    // that's copied over (which takes that much stack again)
+    #[inline(never)]
     fn from_parts(out: &'a mut O, hw: Option<&'a mut H>) -> Self {
         Self {
             out,
@@ -294,6 +302,8 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
             step_limit: None,
             steps: 0,
             abort: None,
+            event_handler: Value::None,
+            in_event: false,
             interactive: false,
             heap: Heap::new(&mut []),
             stack: [Value::None; VALUE_STACK],
@@ -355,6 +365,57 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
     pub fn with_frozen_modules(mut self, modules: &'a [(&'a str, &'a str)]) -> Self {
         self.frozen = modules;
         self
+    }
+
+    /// Runs the handlers of the hardware events that are waiting (pin
+    /// interrupts, timers; see `HardwareBridge::poll_event`). The interpreter
+    /// does it between statements and during sleeps; an application calls it
+    /// while it's idle (the ESP32 REPL, waiting for input), so a timer keeps
+    /// running after its script ended, as in MicroPython. An error in a
+    /// handler is printed (MicroPython: "Unhandled exception in IRQ callback
+    /// handler"), except Ctrl-C (`Error::Interrupted`), which is returned.
+    #[inline(never)]
+    pub fn run_pending_events(&mut self) -> Result<(), Error> {
+        if self.event_handler == Value::None || self.in_event {
+            return Ok(());
+        }
+        loop {
+            let Some(event) = self.hw.as_mut().and_then(|hw| hw.poll_event()) else {
+                return Ok(());
+            };
+            self.in_event = true;
+            if let Some(hw) = self.hw.as_mut() {
+                hw.set_events(false);
+            }
+            let handler = self.event_handler;
+            let base = self.sp;
+            let result = self.call_value(handler, &[Value::Int(event)], &[]);
+            self.sp = base;
+            self.in_event = false;
+            if let Some(hw) = self.hw.as_mut() {
+                hw.set_events(self.event_handler != Value::None);
+            }
+            match result {
+                Ok(_) => {}
+                Err(Error::Interrupted) => return Err(Error::Interrupted),
+                Err(err) => {
+                    self.out
+                        .write_str("Unhandled exception in IRQ callback handler\n");
+                    self.print_exception(err);
+                    self.out.write_str("\n");
+                    self.exc = Value::None;
+                }
+            }
+        }
+    }
+
+    /// `_irq_handler(f)`: the Python function the firmware's `machine`
+    /// module gives for its events (`None` to stop).
+    pub(super) fn set_event_handler(&mut self, f: Value<'a>) {
+        self.event_handler = f;
+        if let Some(hw) = self.hw.as_mut() {
+            hw.set_events(f != Value::None && !self.in_event);
+        }
     }
 
     /// Like `with_frozen_modules`, on an interpreter that already exists.
@@ -504,6 +565,9 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
     fn tick(&mut self) -> Result<(), Error> {
         if self.abort.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
             return Err(Error::Interrupted);
+        }
+        if self.event_handler != Value::None && !self.in_event {
+            self.run_pending_events()?;
         }
         self.steps = self.steps.saturating_add(1);
         if self.step_limit.is_some_and(|limit| self.steps > limit) {
@@ -2896,11 +2960,17 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
             let view = self.heap.view();
             let hw_args = bridge_args(&view, args)?;
             let hw = self.hw.as_mut().ok_or(Error::UnknownIdentifier)?;
-            let result = match module {
-                Some(m) => hw.call_module(m, name, &hw_args[..args.len()])?,
-                None => hw.call_args(name, &hw_args[..args.len()])?,
+            let mut result = match module {
+                Some(m) => hw.call_module(m, name, &hw_args[..args.len()]),
+                None => hw.call_args(name, &hw_args[..args.len()]),
             };
-            return Ok(result.map_or(Value::None, Value::Int));
+            // A sleep stopped for events: run their handlers, then sleep on
+            while let Err(Error::Pending(remaining_ms)) = result {
+                self.run_pending_events()?;
+                let hw = self.hw.as_mut().ok_or(Error::UnknownIdentifier)?;
+                result = hw.resume_sleep(remaining_ms).map(|()| None);
+            }
+            return Ok(result?.map_or(Value::None, Value::Int));
         }
         // The result buffer is the newest object, so the arguments (older
         // objects) can be read while the bridge writes it
@@ -3895,7 +3965,7 @@ print(fact(6), fib(6))
         let code = core::mem::size_of::<Code<'_>>();
         let parser = core::mem::size_of::<Parser<'_>>();
         std::println!("interp={} code={} parser={}", interp, code, parser);
-        assert!(interp <= 34816, "Interpreter is {} bytes", interp);
+        assert!(interp <= 45056, "Interpreter is {} bytes", interp);
         assert!(code <= 1600, "Code is {} bytes", code);
         assert!(parser <= 128, "Parser is {} bytes", parser);
     }
@@ -4940,6 +5010,126 @@ print(outer(), count)
              0.1000000015 16777216 True 2.675 2\n\
              3.75 inf 123456.8 inf float\n"
         );
+    }
+
+    // ---- events: Pin.irq() / Timer callbacks (soft interrupts) ----------
+
+    /// A board whose events come from a queue; `nap(ms)` is a sleep that
+    /// stops with `Error::Pending` while events wait (and events may come).
+    struct EventBoard {
+        queue: std::vec::Vec<i64>,
+        /// Events added when a sleep starts (a "timer" firing during it)
+        on_sleep: std::vec::Vec<i64>,
+        events_on: bool,
+        slept_ms: u32,
+        log: std::string::String,
+    }
+
+    const EVENT_FNS: &[crate::HwFn] = &[
+        crate::HwFn::new("nap", "ms", ""),
+        crate::HwFn::new("fire", "n", ""),
+        crate::HwFn::new("ctrl_c", "", ""),
+    ];
+    /// The abort flag of the events test (Ctrl-C on a device).
+    static EVENT_ABORT: AtomicBool = AtomicBool::new(false);
+
+    impl HardwareBridge for EventBoard {
+        fn call_args(&mut self, name: &str, args: &[Arg<'_>]) -> Result<Option<i64>, Error> {
+            match name {
+                "fire" => {
+                    self.queue.push(args[0].int()?);
+                    Ok(None)
+                }
+                "ctrl_c" => {
+                    EVENT_ABORT.store(true, Ordering::Relaxed);
+                    Ok(None)
+                }
+                "nap" => {
+                    let ms = args[0].int()? as u32;
+                    self.queue.append(&mut self.on_sleep);
+                    self.resume_sleep(ms).map(|()| None)
+                }
+                _ => Err(Error::UnknownIdentifier),
+            }
+        }
+
+        fn functions(&self) -> &[crate::HwFn] {
+            EVENT_FNS
+        }
+
+        fn poll_event(&mut self) -> Option<i64> {
+            (!self.queue.is_empty()).then(|| self.queue.remove(0))
+        }
+
+        fn set_events(&mut self, on: bool) {
+            use core::fmt::Write;
+            let _ = write!(self.log, "{}", on as u8);
+            self.events_on = on;
+        }
+
+        fn resume_sleep(&mut self, remaining_ms: u32) -> Result<(), Error> {
+            // Half of the time passes, then the waiting events stop it
+            if self.events_on && !self.queue.is_empty() && remaining_ms > 1 {
+                self.slept_ms += remaining_ms / 2;
+                return Err(Error::Pending(remaining_ms - remaining_ms / 2));
+            }
+            self.slept_ms += remaining_ms;
+            Ok(())
+        }
+    }
+
+    fn event_board() -> EventBoard {
+        EventBoard {
+            queue: std::vec::Vec::new(),
+            on_sleep: std::vec::Vec::new(),
+            events_on: false,
+            slept_ms: 0,
+            log: std::string::String::new(),
+        }
+    }
+
+    #[test]
+    fn test_events_between_statements_and_during_sleeps() {
+        let mut out = MockOut::new();
+        let mut board = event_board();
+        board.on_sleep = std::vec![7, 8];
+        let mut heap = [0u8; 4096];
+        let mut vm = Interpreter::with_hardware(&mut out, &mut board).with_heap(&mut heap);
+        vm.eval(
+            "seen = []\ndef handler(n):\n    seen.append(n)\n    if n == 3:\n        fire(4)\n\
+             fire(1)\n_irq_handler(handler)\nfire(2)\nx = 1\nfire(3)\ny = 2\nprint(seen)\n\
+             nap(100)\nprint(seen)",
+        )
+        .unwrap();
+        // No handler yet: event 1 waits; then they run in order between
+        // statements; 4 (fired by a handler) after it, not nested
+        vm.eval("print(seen[:4])").unwrap();
+        // A handler's error is printed and the script goes on
+        vm.eval("def bad(n):\n    raise ValueError('boom')\n_irq_handler(bad)\nfire(9)\nz = 3\nprint('after', z)")
+            .unwrap();
+        // Ctrl-C while a handler runs stops the script
+        vm.set_abort_flag(&EVENT_ABORT);
+        vm.eval("def stop(n):\n    ctrl_c()\n    q = 1\n_irq_handler(stop)")
+            .unwrap();
+        assert_eq!(vm.eval("fire(1)\nw = 1"), Err(Error::Interrupted));
+        EVENT_ABORT.store(false, Ordering::Relaxed);
+        // Idle (the REPL waiting for input): the application runs them
+        vm.eval("seen = []\n_irq_handler(handler)").unwrap();
+        vm.eval("fire(5)").unwrap();
+        assert_eq!(vm.run_pending_events(), Ok(()));
+        vm.eval("print(seen)\n_irq_handler(None)\nfire(6)\nv = 1\nprint(seen)")
+            .unwrap();
+        let _ = vm;
+        assert_eq!(
+            out.as_str(),
+            "[1, 2, 3, 4]\n[1, 2, 3, 4, 7, 8]\n[1, 2, 3, 4]\n\
+             Unhandled exception in IRQ callback handler\nValueError: boom\nafter 3\n\
+             [5]\n[5]\n"
+        );
+        // The whole 100 ms were slept, in parts around the handlers
+        assert_eq!(board.slept_ms, 100);
+        // Sleeps may stop for events only while no handler runs
+        assert!(board.log.starts_with("1010"), "{}", board.log);
     }
 
     #[test]
