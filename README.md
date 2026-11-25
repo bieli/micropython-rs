@@ -1073,6 +1073,7 @@ terminal against it on a PC without a board.
 | [`scripts/button.py`](micropython-esp32/scripts/button.py) | Counting button presses with a pull-up and debouncing, timed with `ticks_ms` |
 | [`scripts/pwm_fade.py`](micropython-esp32/scripts/pwm_fade.py) | Fading an LED, and a 50 Hz servo pulse |
 | [`scripts/i2c_scan.py`](micropython-esp32/scripts/i2c_scan.py) | Scanning the I²C bus, and reading registers with `i2c_write_read` |
+| [`scripts/wifi_scanner.py`](micropython-esp32/scripts/wifi_scanner.py) | A Wi-Fi scanner app in the calculator's style: networks strongest first with signal bars, dBm, channel and security; a details page with signal quality and BSSID; two-button navigation (`FEATURES=tft,wifi`) |
 | [`scripts/wifi_ap.py`](micropython-esp32/scripts/wifi_ap.py) | `network.WLAN(network.AP_IF)`: the board's own Wi-Fi network, showing devices as they join and leave (`FEATURES=wifi`) |
 | [`scripts/wifi_connect.py`](micropython-esp32/scripts/wifi_connect.py) | `network.WLAN`: scan, connect with error handling, `ifconfig()` (`FEATURES=wifi`) |
 | [`scripts/machine_demo.py`](micropython-esp32/scripts/machine_demo.py) | `from machine import Pin, ADC, PWM, I2C, UART, SPI, WDT`: the `machine` module, checked with two jumper wires |
