@@ -70,17 +70,22 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # `id` names the build's cache (cache keys can't contain commas)
           - board: generic
+            id: generic-full
             features: ""
             level: full
           - board: TTGO T-Display
+            id: ttgo-full
             features: tft
             level: full
           - board: generic
+            id: generic-minimal
             features: ""
             level: minimal
           # Wi-Fi: its heap and driver take 70 KB of the stack's RAM
           - board: TTGO T-Display + Wi-Fi
+            id: ttgo-wifi
             features: tft,wifi
             level: full
             min_stack: 96
@@ -93,8 +98,8 @@ jobs:
         uses: actions/cache@v4
         with:
           path: micropython-esp32/target
-          key: firmware-${{ matrix.features }}-${{ matrix.level }}-${{ hashFiles('micropython-esp32/Cargo.lock', 'micropython-esp32/rust-toolchain.toml') }}
-          restore-keys: firmware-${{ matrix.features }}-${{ matrix.level }}-
+          key: firmware-${{ matrix.id }}-${{ hashFiles('micropython-esp32/Cargo.lock', 'micropython-esp32/rust-toolchain.toml') }}
+          restore-keys: firmware-${{ matrix.id }}-
 
       - name: Build the firmware
         working-directory: micropython-esp32
