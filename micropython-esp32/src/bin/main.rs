@@ -117,6 +117,10 @@ impl HardwareBridge for GenericHardware<'_> {
         self.board.soft_reset()
     }
 
+    fn idle(&mut self) {
+        self.board.idle()
+    }
+
     fn functions(&self) -> &[HwFn] {
         GENERIC_FNS
     }
@@ -302,6 +306,10 @@ impl HardwareBridge for TtgoHardware<'_, '_> {
         self.board.soft_reset()
     }
 
+    fn idle(&mut self) {
+        self.board.idle()
+    }
+
     fn functions(&self) -> &[HwFn] {
         TTGO_FNS
     }
@@ -381,10 +389,11 @@ const BOOT_SCRIPT: BootScript = BootScript {
 };
 
 /// The heap the Wi-Fi driver allocates from (`wifi` feature): 16 KB in the
-/// second data RAM region (what the REPL's buffers leave of it) and 48 KB of
-/// the main data RAM, which the stack gives up.
+/// second data RAM region (what the REPL's buffers leave of it) and 56 KB of
+/// the main data RAM, which the stack gives up. With the station and the
+/// access point busy, the driver used up to about 60 KB.
 #[cfg(feature = "wifi")]
 fn wifi_heap() {
     esp_alloc::heap_allocator!(#[link_section = ".dram2_uninit"] size: 16 * 1024);
-    esp_alloc::heap_allocator!(size: 48 * 1024);
+    esp_alloc::heap_allocator!(size: 56 * 1024);
 }

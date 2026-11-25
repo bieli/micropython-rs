@@ -146,6 +146,16 @@ macro_rules! board_functions {
             #[cfg(feature = "wifi")]
             micropython_rs::HwFn::new("wifi_mac", "", "The station's MAC address (6 bytes)").returning_bytes(),
             #[cfg(feature = "wifi")]
+            micropython_rs::HwFn::with_args("wifi_ap_active", 0, 1, "[on]", "Access point on/off; returns whether it's on"),
+            #[cfg(feature = "wifi")]
+            micropython_rs::HwFn::with_args("wifi_ap_config", 6, 6, "ssid, key, authmode, channel, hidden, max_clients", "Configure the access point"),
+            #[cfg(feature = "wifi")]
+            micropython_rs::HwFn::new("wifi_ap_ifconfig", "", "The access point's IP, netmask, gateway, DNS (16 bytes)").returning_bytes(),
+            #[cfg(feature = "wifi")]
+            micropython_rs::HwFn::new("wifi_ap_stations", "", "MAC addresses of the devices joined (6 bytes each)").returning_bytes(),
+            #[cfg(feature = "wifi")]
+            micropython_rs::HwFn::new("wifi_ap_mac", "", "The access point's MAC address (6 bytes)").returning_bytes(),
+            #[cfg(feature = "wifi")]
             micropython_rs::HwFn::new("wifi_rssi", "", "Signal strength of the connection, dBm"),
             $($extra),*
         ]
@@ -217,11 +227,11 @@ pub struct Board<'d> {
     /// UART1 and SPI3, once a script has set them up (`uart_init`, `spi_init`).
     uart: Option<Uart<'static, Blocking>>,
     spi: Option<Spi<'static, Blocking>>,
-    /// Wi-Fi: the peripherals until a script activates it, then the station
+    /// Wi-Fi: the peripherals until a script activates it, then the driver
     #[cfg(feature = "wifi")]
     wifi_parts: Option<crate::wifi::WifiParts>,
     #[cfg(feature = "wifi")]
-    station: Option<crate::wifi::Station>,
+    station: Option<crate::wifi::Wifi>,
     rtc: Rtc<'d>,
     /// `Pin.irq()` and `machine.Timer` events
     events: crate::events::Events,
@@ -373,18 +383,33 @@ impl<'d> Board<'d> {
             "wifi_active" => {
                 if let Some(on) = args.first() {
                     let on = on.int()? != 0;
-                    match (self.station.as_mut(), on) {
-                        (Some(station), _) => station.set_active(on)?,
-                        (None, true) => {
-                            let parts = self.wifi_parts.take().ok_or(Error::IoError)?;
-                            self.station = Some(crate::wifi::Station::start(parts)?);
-                        }
-                        (None, false) => {}
+                    if on || self.station.is_some() {
+                        self.wifi_started()?.set_active(on)?;
                     }
                 }
                 Ok(Some(
                     self.station.as_ref().is_some_and(|s| s.is_active()) as i64
                 ))
+            }
+            #[cfg(feature = "wifi")]
+            "wifi_ap_active" => {
+                if let Some(on) = args.first() {
+                    let on = on.int()? != 0;
+                    if on || self.station.is_some() {
+                        self.wifi_started()?.set_ap_active(on)?;
+                    }
+                }
+                Ok(Some(
+                    self.station.as_ref().is_some_and(|s| s.is_ap_active()) as i64,
+                ))
+            }
+            #[cfg(feature = "wifi")]
+            "wifi_ap_config" => {
+                let (ssid, key) = (args[0].str()?, args[1].str()?);
+                let (auth, channel, hidden, max) = (int(2)?, int(3)?, int(4)? != 0, int(5)?);
+                self.wifi_started()?
+                    .configure_ap(ssid, key, auth, channel, hidden, max)
+                    .map(|()| None)
             }
             #[cfg(feature = "wifi")]
             "wifi_connect" => {
@@ -529,6 +554,18 @@ impl<'d> Board<'d> {
                     Ok(16)
                 }
             },
+            #[cfg(feature = "wifi")]
+            "wifi_ap_ifconfig" => Ok(self.wifi_started()?.ap_ifconfig(out)),
+            #[cfg(feature = "wifi")]
+            "wifi_ap_stations" => match self.station.as_mut() {
+                Some(wifi) => Ok(wifi.ap_stations(out)),
+                None => Ok(0),
+            },
+            #[cfg(feature = "wifi")]
+            "wifi_ap_mac" => {
+                out[..6].copy_from_slice(&crate::wifi::ap_mac());
+                Ok(6)
+            }
             #[cfg(feature = "wifi")]
             "wifi_mac" => {
                 out[..6].copy_from_slice(&crate::wifi::sta_mac());
@@ -807,10 +844,29 @@ impl<'d> Board<'d> {
         self.events.on = false;
     }
 
-    /// The Wi-Fi station, once a script has activated it.
+    /// Wi-Fi, once a script has activated it.
     #[cfg(feature = "wifi")]
-    fn wifi(&mut self) -> Result<&mut crate::wifi::Station, Error> {
+    fn wifi(&mut self) -> Result<&mut crate::wifi::Wifi, Error> {
         self.station.as_mut().ok_or(Error::IoError) // "Wifi Not Started"
+    }
+
+    /// Wi-Fi, started now if it isn't yet (the scheduler and the driver).
+    #[cfg(feature = "wifi")]
+    fn wifi_started(&mut self) -> Result<&mut crate::wifi::Wifi, Error> {
+        if self.station.is_none() {
+            let parts = self.wifi_parts.take().ok_or(Error::IoError)?;
+            self.station = Some(crate::wifi::Wifi::start(parts)?);
+        }
+        self.wifi()
+    }
+
+    /// The REPL is waiting for input: network work goes on (the access
+    /// point's DHCP server, pings).
+    pub fn idle(&mut self) {
+        #[cfg(feature = "wifi")]
+        if let Some(wifi) = self.station.as_mut() {
+            wifi.poll();
+        }
     }
 
     fn check_allowed(&self, pin: u8) -> Result<(), Error> {

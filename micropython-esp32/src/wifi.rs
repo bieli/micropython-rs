@@ -1,32 +1,37 @@
-//! Wi-Fi station for MicroPython's `network.WLAN` (the `wifi` feature).
+//! Wi-Fi for MicroPython's `network.WLAN` (the `wifi` feature): a station
+//! (client) and an access point, each on its own or both at once.
 //!
-//! Started the first time a script activates it (`wlan.active(True)`), like
-//! MicroPython: the esp-rtos scheduler (the radio driver runs its own tasks),
-//! esp-radio's driver, and a smoltcp interface with a DHCP client. Scripts
-//! then use flat functions (`wifi_connect`, `wifi_status`, ...), which the
-//! frozen `network` module (modules/network.py) wraps in the `WLAN` class.
+//! Started the first time a script activates either (`wlan.active(True)`),
+//! like MicroPython: the esp-rtos scheduler (the radio driver runs its own
+//! tasks), esp-radio's driver, and two smoltcp interfaces: the station's with
+//! a DHCP client, and the access point's at 192.168.4.1/24 with a small DHCP
+//! server (`DhcpServer`) for the devices that join it. Scripts use flat
+//! functions (`wifi_connect`, `wifi_ap_config`, ...), which the frozen
+//! `network` module (modules/network.py) wraps in the `WLAN` class.
 //!
-//! There is no background network task: the interface is polled whenever a
-//! script asks (`status()`, `isconnected()`, `ifconfig()`) and while it
-//! sleeps (`sleep_ms`), which is when a MicroPython script waits for a
-//! connection anyway.
+//! There is no background network task: the interfaces are polled whenever
+//! a script asks (`status()`, `isconnected()`, `ifconfig()`), while it sleeps
+//! (`sleep_ms`), and while the REPL waits for input.
 
 extern crate alloc;
 
 use alloc::boxed::Box;
 use alloc::string::String;
+use core::cell::RefCell;
 use core::sync::atomic::{AtomicU8, Ordering};
 
+use critical_section::Mutex;
 use esp_hal::peripherals::{TIMG1, WIFI};
 use esp_hal::timer::timg::TimerGroup;
 use esp_radio::wifi::event::{self, EventExt};
 use esp_radio::wifi::{
-    AuthMethod, ClientConfig, ModeConfig, ScanConfig, ScanTypeConfig, WifiController, WifiDevice,
+    AccessPointConfig, AuthMethod, ClientConfig, ModeConfig, ScanConfig, ScanTypeConfig,
+    WifiController, WifiDevice,
 };
 use micropython_rs::Error;
 use smoltcp::iface::{Config as IfaceConfig, Interface, SocketHandle, SocketSet, SocketStorage};
-use smoltcp::socket::dhcpv4;
-use smoltcp::wire::{EthernetAddress, HardwareAddress, IpCidr, Ipv4Address, Ipv4Cidr};
+use smoltcp::socket::{dhcpv4, udp};
+use smoltcp::wire::{EthernetAddress, HardwareAddress, IpCidr, IpEndpoint, Ipv4Address, Ipv4Cidr};
 
 /// MicroPython's `network.STAT_*` values (its ESP32 port: the reasons of a
 /// failed connection are the driver's disconnect reasons).
@@ -39,9 +44,20 @@ pub const STAT_WRONG_PASSWORD: i64 = 202;
 pub const STAT_ASSOC_FAIL: i64 = 203;
 pub const STAT_HANDSHAKE_TIMEOUT: i64 = 204;
 
+/// The access point's address and network, as on MicroPython's ESP32 port.
+pub const AP_IP: Ipv4Address = Ipv4Address::new(192, 168, 4, 1);
+const AP_PREFIX: u8 = 24;
+/// Devices on the access point at once (and DHCP leases: 192.168.4.2 up).
+pub const MAX_AP_CLIENTS: usize = 8;
+
 /// The reason of the last disconnection (0: none), set by the driver's event
 /// handler.
 static LAST_REASON: AtomicU8 = AtomicU8::new(0);
+
+/// The devices joined to the access point (their MAC addresses), kept by the
+/// driver's event handlers.
+static AP_STATIONS: Mutex<RefCell<[Option<[u8; 6]>; MAX_AP_CLIENTS]>> =
+    Mutex::new(RefCell::new([None; MAX_AP_CLIENTS]));
 
 /// The peripherals Wi-Fi needs, kept until a script activates it.
 pub struct WifiParts {
@@ -49,18 +65,51 @@ pub struct WifiParts {
     pub timg1: TIMG1<'static>,
 }
 
-/// The running station.
-pub struct Station {
-    controller: WifiController<'static>,
+/// One network interface: the radio's side and smoltcp's.
+struct Net {
     device: WifiDevice<'static>,
     iface: Interface,
     sockets: SocketSet<'static>,
+}
+
+impl Net {
+    fn new(mut device: WifiDevice<'static>) -> Self {
+        let mac = EthernetAddress(device.mac_address());
+        let iface = Interface::new(
+            IfaceConfig::new(HardwareAddress::Ethernet(mac)),
+            &mut device,
+            now(),
+        );
+        let storage: &'static mut [SocketStorage<'static>; 4] =
+            Box::leak(Box::new(Default::default()));
+        Net {
+            device,
+            iface,
+            sockets: SocketSet::new(&mut storage[..]),
+        }
+    }
+
+    fn poll(&mut self) {
+        self.iface.poll(now(), &mut self.device, &mut self.sockets);
+    }
+}
+
+/// Wi-Fi: the controller, the station and the access point.
+pub struct Wifi {
+    controller: WifiController<'static>,
+    sta: Net,
     dhcp: SocketHandle,
-    /// Address and netmask, gateway, DNS server from DHCP.
+    ap: Net,
+    dhcp_server: DhcpServer,
+    sta_active: bool,
+    ap_active: bool,
+    started: bool,
+    client: ClientConfig,
+    ap_config: AccessPointConfig,
+    /// The station's address and netmask, gateway, DNS server from DHCP.
     ip: Option<(Ipv4Cidr, Option<Ipv4Address>, Option<Ipv4Address>)>,
     /// `connect()` was called (and not `disconnect()` since).
     connecting: bool,
-    active: bool,
 }
 
 fn now() -> smoltcp::time::Instant {
@@ -74,8 +123,9 @@ fn io<T>(_: T) -> Error {
     Error::IoError
 }
 
-impl Station {
-    /// Starts the scheduler, the radio and the station interface.
+impl Wifi {
+    /// Starts the scheduler, the radio driver and both interfaces (the radio
+    /// itself starts with the first `set_active` / `set_ap_active`).
     pub fn start(parts: WifiParts) -> Result<Self, Error> {
         // The radio driver's tasks run on esp-rtos (TIMG0 is esp-hal's clock)
         let timg1 = TimerGroup::new(parts.timg1);
@@ -83,69 +133,196 @@ impl Station {
         let radio = esp_radio::init().map_err(io)?;
         // The driver borrows its controller for as long as Wi-Fi runs
         let radio: &'static _ = Box::leak(Box::new(radio));
-        let (mut controller, interfaces) =
-            esp_radio::wifi::new(radio, parts.wifi, Default::default()).map_err(io)?;
-        controller
-            .set_config(&ModeConfig::Client(ClientConfig::default()))
-            .map_err(io)?;
+        // Fewer receive/transmit buffers than the driver's defaults (10 + 32 /
+        // 32, about 1.6 KB each), sized for a microcontroller with a few
+        // clients: with both interfaces busy, the default ones took the heap
+        // to 64 of 64 KB
+        let config = esp_radio::wifi::Config::default()
+            .with_static_rx_buf_num(6)
+            .with_dynamic_rx_buf_num(12)
+            .with_dynamic_tx_buf_num(12)
+            .with_rx_ba_win(4);
+        let (controller, interfaces) =
+            esp_radio::wifi::new(radio, parts.wifi, config).map_err(io)?;
         event::StaDisconnected::update_handler(|event| {
             LAST_REASON.store(event.reason(), Ordering::Relaxed);
         });
+        event::ApStaConnected::update_handler(|event| {
+            let mut mac = [0u8; 6];
+            mac.copy_from_slice(&event.mac()[..6]);
+            critical_section::with(|cs| {
+                let mut stations = AP_STATIONS.borrow_ref_mut(cs);
+                if !stations.contains(&Some(mac)) {
+                    if let Some(free) = stations.iter_mut().find(|s| s.is_none()) {
+                        *free = Some(mac);
+                    }
+                }
+            });
+        });
+        event::ApStaDisconnected::update_handler(|event| {
+            let mac = &event.mac()[..6];
+            critical_section::with(|cs| {
+                for s in AP_STATIONS.borrow_ref_mut(cs).iter_mut() {
+                    if s.is_some_and(|m| m == mac) {
+                        *s = None;
+                    }
+                }
+            });
+        });
 
-        let mut device = interfaces.sta;
-        let mac = EthernetAddress(device.mac_address());
-        let iface = Interface::new(
-            IfaceConfig::new(HardwareAddress::Ethernet(mac)),
-            &mut device,
-            now(),
-        );
-        let storage: &'static mut [SocketStorage<'static>; 4] =
-            Box::leak(Box::new(Default::default()));
-        let mut sockets = SocketSet::new(&mut storage[..]);
-        let dhcp = sockets.add(dhcpv4::Socket::new());
-        let mut station = Station {
+        let mut sta = Net::new(interfaces.sta);
+        let dhcp = sta.sockets.add(dhcpv4::Socket::new());
+        let mut ap = Net::new(interfaces.ap);
+        ap.iface.update_ip_addrs(|addrs| {
+            let _ = addrs.push(IpCidr::new(AP_IP.into(), AP_PREFIX));
+        });
+        let dhcp_server = DhcpServer::new(&mut ap.sockets);
+        let mac = ap.device.mac_address();
+        let ap_config = AccessPointConfig::default()
+            .with_ssid(default_ap_ssid(mac))
+            .with_max_connections(MAX_AP_CLIENTS as u16);
+        Ok(Wifi {
             controller,
-            device,
-            iface,
-            sockets,
+            sta,
             dhcp,
+            ap,
+            dhcp_server,
+            sta_active: false,
+            ap_active: false,
+            started: false,
+            client: ClientConfig::default(),
+            ap_config,
             ip: None,
             connecting: false,
-            active: false,
-        };
-        station.set_active(true)?;
-        Ok(station)
+        })
     }
 
     pub fn is_active(&self) -> bool {
-        self.active
+        self.sta_active
     }
 
-    /// `wlan.active(on)`: starts or stops the radio.
-    pub fn set_active(&mut self, on: bool) -> Result<(), Error> {
-        if on == self.active {
+    pub fn is_ap_active(&self) -> bool {
+        self.ap_active
+    }
+
+    /// The driver's configuration for the interfaces that are on.
+    fn mode_config(&self) -> ModeConfig {
+        match (self.sta_active, self.ap_active) {
+            (true, true) => ModeConfig::ApSta(self.client.clone(), self.ap_config.clone()),
+            (true, false) => ModeConfig::Client(self.client.clone()),
+            (false, true) => ModeConfig::AccessPoint(self.ap_config.clone()),
+            (false, false) => ModeConfig::None,
+        }
+    }
+
+    /// Gives the driver the configuration of the interfaces that are on, and
+    /// starts or stops the radio to match.
+    fn apply(&mut self) -> Result<(), Error> {
+        if !self.sta_active && !self.ap_active {
+            if self.started {
+                self.controller.stop().map_err(io)?;
+                self.started = false;
+            }
             return Ok(());
         }
-        if on {
-            self.controller.start().map_err(io)?;
-            // Not blocking: wait (up to 2 s) until the driver has started
-            let start = esp_hal::time::Instant::now();
-            while !self.controller.is_started().unwrap_or(false) {
-                if start.elapsed().as_millis() > 2000 {
-                    return Err(Error::IoError);
-                }
-            }
-        } else {
-            self.forget_ip();
-            self.connecting = false;
+        // A new mode (station, access point, both) needs the radio restarted
+        if self.started {
             self.controller.stop().map_err(io)?;
+            self.started = false;
         }
-        self.active = on;
+        self.controller
+            .set_config(&self.mode_config())
+            .map_err(|_| Error::ValueError)?;
+        self.controller.start().map_err(io)?;
+        // Not blocking: wait (up to 2 s) until the driver has started
+        let start = esp_hal::time::Instant::now();
+        while !self.controller.is_started().unwrap_or(false) {
+            if start.elapsed().as_millis() > 2000 {
+                return Err(Error::IoError);
+            }
+        }
+        self.started = true;
+        if self.sta_active && self.connecting {
+            // The station reconnects after the restart
+            LAST_REASON.store(0, Ordering::Relaxed);
+            self.controller.connect().map_err(io)?;
+        }
         Ok(())
     }
 
-    fn require_active(&self) -> Result<(), Error> {
-        if self.active {
+    /// `WLAN(STA_IF).active(on)`.
+    pub fn set_active(&mut self, on: bool) -> Result<(), Error> {
+        if on == self.sta_active {
+            return Ok(());
+        }
+        if !on {
+            self.forget_ip();
+            self.connecting = false;
+        }
+        self.sta_active = on;
+        self.apply()
+    }
+
+    /// `WLAN(AP_IF).active(on)`.
+    pub fn set_ap_active(&mut self, on: bool) -> Result<(), Error> {
+        if on == self.ap_active {
+            return Ok(());
+        }
+        self.ap_active = on;
+        if !on {
+            critical_section::with(|cs| *AP_STATIONS.borrow_ref_mut(cs) = [None; MAX_AP_CLIENTS]);
+            self.dhcp_server.leases = [None; MAX_AP_CLIENTS];
+        }
+        self.apply()
+    }
+
+    /// `WLAN(AP_IF).config(ssid=, key=, authmode=, channel=, hidden=,
+    /// max_clients=)`: an `authmode` of MicroPython's `AUTH_*` values.
+    pub fn configure_ap(
+        &mut self,
+        ssid: &str,
+        key: &str,
+        authmode: i64,
+        channel: i64,
+        hidden: bool,
+        max_clients: i64,
+    ) -> Result<(), Error> {
+        let auth = match authmode {
+            0 => AuthMethod::None,
+            2 => AuthMethod::Wpa,
+            3 => AuthMethod::Wpa2Personal,
+            4 => AuthMethod::WpaWpa2Personal,
+            6 => AuthMethod::Wpa3Personal,
+            7 => AuthMethod::Wpa2Wpa3Personal,
+            _ => return Err(Error::ValueError), // WEP and enterprise: not for an access point
+        };
+        if ssid.is_empty() || ssid.len() > 32 || !(1..=13).contains(&channel) {
+            return Err(Error::ValueError);
+        }
+        // WPA needs a password of 8-63 characters, an open network none
+        if auth != AuthMethod::None && !(8..=63).contains(&key.len()) {
+            return Err(Error::ValueError);
+        }
+        let max = max_clients.clamp(1, MAX_AP_CLIENTS as i64) as u16;
+        self.ap_config = AccessPointConfig::default()
+            .with_ssid(String::from(ssid))
+            .with_password(String::from(if auth == AuthMethod::None {
+                ""
+            } else {
+                key
+            }))
+            .with_auth_method(auth)
+            .with_channel(channel as u8)
+            .with_ssid_hidden(hidden)
+            .with_max_connections(max);
+        if self.ap_active {
+            self.apply()?;
+        }
+        Ok(())
+    }
+
+    fn require_sta(&self) -> Result<(), Error> {
+        if self.sta_active {
             Ok(())
         } else {
             Err(Error::IoError) // like MicroPython: "Wifi Not Started"
@@ -154,7 +331,7 @@ impl Station {
 
     /// `wlan.connect(ssid, key)`: starts connecting (doesn't wait).
     pub fn connect(&mut self, ssid: &str, key: &str) -> Result<(), Error> {
-        self.require_active()?;
+        self.require_sta()?;
         if self.connecting {
             let _ = self.controller.disconnect();
         }
@@ -165,12 +342,12 @@ impl Station {
         } else {
             AuthMethod::Wpa2Personal
         };
-        let config = ClientConfig::default()
+        self.client = ClientConfig::default()
             .with_ssid(String::from(ssid))
             .with_password(String::from(key))
             .with_auth_method(auth);
         self.controller
-            .set_config(&ModeConfig::Client(config))
+            .set_config(&self.mode_config())
             .map_err(|_| Error::ValueError)?;
         LAST_REASON.store(0, Ordering::Relaxed);
         self.controller.connect().map_err(io)?;
@@ -182,7 +359,7 @@ impl Station {
     pub fn disconnect(&mut self) -> Result<(), Error> {
         self.connecting = false;
         self.forget_ip();
-        if self.active {
+        if self.sta_active {
             let _ = self.controller.disconnect();
         }
         Ok(())
@@ -190,15 +367,25 @@ impl Station {
 
     fn forget_ip(&mut self) {
         if self.ip.take().is_some() {
-            self.iface.update_ip_addrs(|addrs| addrs.clear());
-            self.iface.routes_mut().remove_default_ipv4_route();
+            self.sta.iface.update_ip_addrs(|addrs| addrs.clear());
+            self.sta.iface.routes_mut().remove_default_ipv4_route();
         }
-        self.sockets.get_mut::<dhcpv4::Socket>(self.dhcp).reset();
+        self.sta
+            .sockets
+            .get_mut::<dhcpv4::Socket>(self.dhcp)
+            .reset();
     }
 
-    /// Processes received packets and timers: DHCP gets its address here.
+    /// Processes received packets and timers on both interfaces: the
+    /// station's DHCP gets its address, and the access point's DHCP server
+    /// answers here.
     pub fn poll(&mut self) {
-        if !self.active {
+        if self.ap_active {
+            self.ap.poll();
+            self.dhcp_server.serve(&mut self.ap.sockets);
+            self.ap.poll(); // send the answers now
+        }
+        if !self.sta_active {
             return;
         }
         let associated = self.controller.is_connected().unwrap_or(false);
@@ -208,25 +395,25 @@ impl Station {
             }
             return;
         }
-        self.iface.poll(now(), &mut self.device, &mut self.sockets);
-        match self.sockets.get_mut::<dhcpv4::Socket>(self.dhcp).poll() {
+        self.sta.poll();
+        match self.sta.sockets.get_mut::<dhcpv4::Socket>(self.dhcp).poll() {
             Some(dhcpv4::Event::Configured(config)) => {
                 let address = config.address;
-                self.iface.update_ip_addrs(|addrs| {
+                self.sta.iface.update_ip_addrs(|addrs| {
                     addrs.clear();
                     let _ = addrs.push(IpCidr::Ipv4(address));
                 });
                 if let Some(router) = config.router {
-                    let _ = self.iface.routes_mut().add_default_ipv4_route(router);
+                    let _ = self.sta.iface.routes_mut().add_default_ipv4_route(router);
                 } else {
-                    self.iface.routes_mut().remove_default_ipv4_route();
+                    self.sta.iface.routes_mut().remove_default_ipv4_route();
                 }
                 self.ip = Some((address, config.router, config.dns_servers.first().copied()));
             }
             Some(dhcpv4::Event::Deconfigured) => {
                 self.ip = None;
-                self.iface.update_ip_addrs(|addrs| addrs.clear());
-                self.iface.routes_mut().remove_default_ipv4_route();
+                self.sta.iface.update_ip_addrs(|addrs| addrs.clear());
+                self.sta.iface.routes_mut().remove_default_ipv4_route();
             }
             None => {}
         }
@@ -235,7 +422,7 @@ impl Station {
     /// `wlan.status()`, with MicroPython's codes.
     pub fn status(&mut self) -> i64 {
         self.poll();
-        if !self.active || !self.connecting {
+        if !self.sta_active || !self.connecting {
             return STAT_IDLE;
         }
         if self.ip.is_some() {
@@ -255,7 +442,8 @@ impl Station {
         }
     }
 
-    /// `wlan.ifconfig()`: address, netmask, gateway and DNS as 16 bytes.
+    /// `WLAN(STA_IF).ifconfig()`: address, netmask, gateway and DNS as 16
+    /// bytes.
     pub fn ifconfig(&mut self, out: &mut [u8]) -> usize {
         self.poll();
         let zero = Ipv4Address::new(0, 0, 0, 0);
@@ -268,16 +456,34 @@ impl Station {
             ),
             None => (zero, zero, zero, zero),
         };
-        for (i, a) in [ip, mask, gw, dns].iter().enumerate() {
-            out[4 * i..4 * i + 4].copy_from_slice(&a.octets());
+        write_addresses(out, [ip, mask, gw, dns])
+    }
+
+    /// `WLAN(AP_IF).ifconfig()`: 192.168.4.1/24, the access point is also the
+    /// gateway (there's no DNS server).
+    pub fn ap_ifconfig(&mut self, out: &mut [u8]) -> usize {
+        self.poll();
+        let mask = Ipv4Cidr::new(AP_IP, AP_PREFIX).netmask();
+        write_addresses(out, [AP_IP, mask, AP_IP, Ipv4Address::new(0, 0, 0, 0)])
+    }
+
+    /// `WLAN(AP_IF).status('stations')`: the MAC addresses of the devices
+    /// joined, 6 bytes each.
+    pub fn ap_stations(&mut self, out: &mut [u8]) -> usize {
+        self.poll();
+        let stations = critical_section::with(|cs| *AP_STATIONS.borrow_ref(cs));
+        let mut n = 0;
+        for mac in stations.iter().flatten() {
+            out[n..n + 6].copy_from_slice(mac);
+            n += 6;
         }
-        16
+        n
     }
 
     /// `wlan.scan()`: one record per access point:
     /// `len, ssid[len], bssid[6], channel, rssi (i8), authmode`.
     pub fn scan(&mut self, out: &mut [u8]) -> Result<usize, Error> {
-        self.require_active()?;
+        self.require_sta()?;
         // Up to 120 ms per channel, like ESP-IDF's default (which MicroPython
         // uses): the driver's 10-20 ms miss access points that answer slowly
         let scan_type = ScanTypeConfig::Active {
@@ -314,6 +520,24 @@ impl Station {
     }
 }
 
+fn write_addresses(out: &mut [u8], addresses: [Ipv4Address; 4]) -> usize {
+    for (i, a) in addresses.iter().enumerate() {
+        out[4 * i..4 * i + 4].copy_from_slice(&a.octets());
+    }
+    16
+}
+
+/// MicroPython's default access point name: `ESP_` and the end of its MAC.
+fn default_ap_ssid(mac: [u8; 6]) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut ssid = String::from("ESP_");
+    for b in &mac[3..] {
+        ssid.push(HEX[(b >> 4) as usize] as char);
+        ssid.push(HEX[(b & 15) as usize] as char);
+    }
+    ssid
+}
+
 /// MicroPython's `network.AUTH_*` value of an access point's security.
 fn auth_code(auth: Option<AuthMethod>) -> u8 {
     match auth {
@@ -332,4 +556,160 @@ fn auth_code(auth: Option<AuthMethod>) -> u8 {
 /// The station's MAC address (from eFuse; also before Wi-Fi starts).
 pub fn sta_mac() -> [u8; 6] {
     esp_radio::wifi::sta_mac()
+}
+
+/// The access point's MAC address.
+pub fn ap_mac() -> [u8; 6] {
+    esp_radio::wifi::ap_mac()
+}
+
+/// A small DHCP server for the access point (RFC 2131, what phones and
+/// laptops need): DISCOVER gets an OFFER, REQUEST an ACK (or a NAK for an
+/// address it didn't offer), RELEASE frees the address. Device `i` gets
+/// 192.168.4.(2 + i), for 2 hours; the access point is the router.
+struct DhcpServer {
+    socket: SocketHandle,
+    /// The MAC address that has each address.
+    leases: [Option<[u8; 6]>; MAX_AP_CLIENTS],
+}
+
+const DHCP_DISCOVER: u8 = 1;
+const DHCP_OFFER: u8 = 2;
+const DHCP_REQUEST: u8 = 3;
+const DHCP_ACK: u8 = 5;
+const DHCP_NAK: u8 = 6;
+const DHCP_RELEASE: u8 = 7;
+const DHCP_MAGIC: [u8; 4] = [99, 130, 83, 99];
+const LEASE_SECONDS: u32 = 7200;
+
+impl DhcpServer {
+    fn new(sockets: &mut SocketSet<'static>) -> Self {
+        let rx = udp::PacketBuffer::new(
+            Box::leak(Box::new([udp::PacketMetadata::EMPTY; 4])) as &mut [_],
+            Box::leak(Box::new([0u8; 1200])) as &mut [_],
+        );
+        let tx = udp::PacketBuffer::new(
+            Box::leak(Box::new([udp::PacketMetadata::EMPTY; 4])) as &mut [_],
+            Box::leak(Box::new([0u8; 1200])) as &mut [_],
+        );
+        let mut socket = udp::Socket::new(rx, tx);
+        let _ = socket.bind(67);
+        DhcpServer {
+            socket: sockets.add(socket),
+            leases: [None; MAX_AP_CLIENTS],
+        }
+    }
+
+    /// Answers the requests that came in.
+    fn serve(&mut self, sockets: &mut SocketSet<'static>) {
+        let socket = sockets.get_mut::<udp::Socket>(self.socket);
+        let mut request = [0u8; 576];
+        while let Ok((n, _)) = socket.recv_slice(&mut request) {
+            let mut reply = [0u8; 300];
+            if let Some(len) = self.answer(&request[..n], &mut reply) {
+                let to = IpEndpoint::new(Ipv4Address::BROADCAST.into(), 68);
+                let _ = socket.send_slice(&reply[..len], to);
+            }
+        }
+    }
+
+    /// The reply to one DHCP message, written into `reply`.
+    fn answer(&mut self, req: &[u8], reply: &mut [u8; 300]) -> Option<usize> {
+        // A BOOTP request with the DHCP magic cookie and an Ethernet address
+        if req.len() < 240
+            || req[0] != 1
+            || req[1] != 1
+            || req[2] != 6
+            || req[236..240] != DHCP_MAGIC
+        {
+            return None;
+        }
+        let mut mac = [0u8; 6];
+        mac.copy_from_slice(&req[28..34]);
+        let (mut kind, mut wanted) = (0u8, None);
+        let mut i = 240;
+        while i + 1 < req.len() && req[i] != 255 {
+            if req[i] == 0 {
+                i += 1;
+                continue;
+            }
+            let len = req[i + 1] as usize;
+            let value = req.get(i + 2..i + 2 + len)?;
+            match (req[i], len) {
+                (53, 1) => kind = value[0],
+                (50, 4) => wanted = Some(Ipv4Address::new(value[0], value[1], value[2], value[3])),
+                _ => {}
+            }
+            i += 2 + len;
+        }
+        if wanted.is_none() && req[12..16] != [0; 4] {
+            wanted = Some(Ipv4Address::new(req[12], req[13], req[14], req[15]));
+            // ciaddr: renewing
+        }
+        let (answer, slot) = match kind {
+            DHCP_DISCOVER => (DHCP_OFFER, self.lease_for(mac)?),
+            DHCP_REQUEST => match self.lease_for(mac) {
+                Some(slot) if wanted.is_none_or(|w| w == lease_ip(slot)) => (DHCP_ACK, slot),
+                _ => (DHCP_NAK, 0),
+            },
+            DHCP_RELEASE => {
+                for lease in self.leases.iter_mut() {
+                    if *lease == Some(mac) {
+                        *lease = None;
+                    }
+                }
+                return None;
+            }
+            _ => return None,
+        };
+
+        reply.fill(0);
+        reply[0] = 2; // BOOTREPLY
+        reply[1] = 1;
+        reply[2] = 6;
+        reply[4..8].copy_from_slice(&req[4..8]); // xid
+        reply[10..12].copy_from_slice(&req[10..12]); // flags
+        if answer != DHCP_NAK {
+            reply[16..20].copy_from_slice(&lease_ip(slot).octets()); // yiaddr
+            reply[20..24].copy_from_slice(&AP_IP.octets()); // siaddr
+        }
+        reply[28..44].copy_from_slice(&req[28..44]); // chaddr
+        reply[236..240].copy_from_slice(&DHCP_MAGIC);
+        let mut n = 240;
+        let mut option = |code: u8, value: &[u8], n: &mut usize| {
+            reply[*n] = code;
+            reply[*n + 1] = value.len() as u8;
+            reply[*n + 2..*n + 2 + value.len()].copy_from_slice(value);
+            *n += 2 + value.len();
+        };
+        option(53, &[answer], &mut n);
+        option(54, &AP_IP.octets(), &mut n); // server identifier
+        if answer != DHCP_NAK {
+            option(51, &LEASE_SECONDS.to_be_bytes(), &mut n);
+            option(
+                1,
+                &Ipv4Cidr::new(AP_IP, AP_PREFIX).netmask().octets(),
+                &mut n,
+            );
+            option(3, &AP_IP.octets(), &mut n); // router
+        }
+        reply[n] = 255;
+        Some(300) // BOOTP's minimum size
+    }
+
+    /// The slot of the address for `mac`: the one it has, or a free one.
+    fn lease_for(&mut self, mac: [u8; 6]) -> Option<usize> {
+        if let Some(slot) = self.leases.iter().position(|l| *l == Some(mac)) {
+            return Some(slot);
+        }
+        let slot = self.leases.iter().position(Option::is_none)?;
+        self.leases[slot] = Some(mac);
+        Some(slot)
+    }
+}
+
+/// The address of lease slot `i`: 192.168.4.(2 + i).
+fn lease_ip(slot: usize) -> Ipv4Address {
+    let o = AP_IP.octets();
+    Ipv4Address::new(o[0], o[1], o[2], 2 + slot as u8)
 }

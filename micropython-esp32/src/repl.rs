@@ -358,7 +358,19 @@ impl<'a, O: Output, H: HardwareBridge> Repl<'_, 'a, O, H> {
                 return byte;
             }
             // Ctrl-C arrives as a byte too, so errors end here
-            let _ = self.vm.run_pending_events();
+            let _ = self.vm.idle();
+        }
+    }
+
+    /// Waits for a byte in the raw REPL (Thonny, mpremote): the network
+    /// goes on meanwhile (the access point's DHCP server), but no callbacks
+    /// run, as their output would get into the tool's protocol.
+    fn wait_byte_raw(&mut self) -> u8 {
+        loop {
+            if let Some(byte) = crate::serial_input::read_byte() {
+                return byte;
+            }
+            self.vm.idle_hardware();
         }
     }
 
@@ -548,7 +560,7 @@ impl<'a, O: Output, H: HardwareBridge> Repl<'_, 'a, O, H> {
         let mut upload: Option<Writer> = None;
 
         loop {
-            match wait_byte() {
+            match self.wait_byte_raw() {
                 CTRL_A => {
                     self.arena.clear();
                     print!("\r\nraw REPL; CTRL-B to exit\r\n>");

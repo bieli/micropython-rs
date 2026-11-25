@@ -1073,6 +1073,7 @@ terminal against it on a PC without a board.
 | [`scripts/button.py`](micropython-esp32/scripts/button.py) | Counting button presses with a pull-up and debouncing, timed with `ticks_ms` |
 | [`scripts/pwm_fade.py`](micropython-esp32/scripts/pwm_fade.py) | Fading an LED, and a 50 Hz servo pulse |
 | [`scripts/i2c_scan.py`](micropython-esp32/scripts/i2c_scan.py) | Scanning the I²C bus, and reading registers with `i2c_write_read` |
+| [`scripts/wifi_ap.py`](micropython-esp32/scripts/wifi_ap.py) | `network.WLAN(network.AP_IF)`: the board's own Wi-Fi network, showing devices as they join and leave (`FEATURES=wifi`) |
 | [`scripts/wifi_connect.py`](micropython-esp32/scripts/wifi_connect.py) | `network.WLAN`: scan, connect with error handling, `ifconfig()` (`FEATURES=wifi`) |
 | [`scripts/machine_demo.py`](micropython-esp32/scripts/machine_demo.py) | `from machine import Pin, ADC, PWM, I2C, UART, SPI, WDT`: the `machine` module, checked with two jumper wires |
 | [`scripts/stack_budget.py`](micropython-esp32/scripts/stack_budget.py) | How much native stack calls, blocks and recursion take (`stack_peak()`) |
@@ -1281,7 +1282,7 @@ print(wlan.ifconfig())                   # ('192.168.0.111', '255.255.255.0', '1
 
 | Call | Does |
 |------|------|
-| `network.WLAN(network.STA_IF)` | The station (client) interface; `network.AP_IF` raises `ValueError` (no access point mode yet) |
+| `network.WLAN(network.STA_IF)` | The station (client) interface; `network.WLAN(network.AP_IF)` is the access point (see below) |
 | `active([on])` | Starts or stops the radio; returns whether it's on. The first `active(True)` starts the Wi-Fi stack (93 ms) |
 | `scan()` | `(ssid, bssid, channel, RSSI, security, hidden)` tuples, `ssid` and `bssid` as bytes, `security` an `AUTH_*` value; up to 120 ms per channel like ESP-IDF (0.5-1 s) |
 | `connect(ssid, key)` | Starts connecting and returns, like MicroPython; DHCP follows. WPA2 or better (WPA3 too), or an open network with no key |
@@ -1298,25 +1299,53 @@ Measured on the TTGO T-Display (80 MHz) with a WPA2 home network: the radio star
 answers pings from the network while a script runs or sleeps (39-139 ms round trips: it's polled every 100 ms); the
 connection stays up across soft resets and Thonny sessions.
 
+**Access point.** The board can also run its own Wi-Fi network, or both at once (`ApSta`: the access point then uses
+the station's channel):
+
+```python
+ap = network.WLAN(network.AP_IF)
+ap.config(ssid='my-board', key='change-me-123')    # WPA2 with a key, an open network without
+ap.active(True)                                     # the board is 192.168.4.1
+print(ap.ifconfig(), ap.status('stations'))         # (..), [(b'\x02\x00\x00\x00\x00\x01',)]: the devices joined
+```
+
+| Call (`AP_IF`) | Does |
+|------|------|
+| `active([on])` | Starts or stops the access point; the default name is `ESP_` and the end of its MAC address, open, channel 1 |
+| `config(ssid=, key=, authmode=, channel=, hidden=, max_clients=)` | Also `essid=`, `password=`, `security=`; a `key` without `authmode` means `AUTH_WPA2_PSK` (8-63 characters), `AUTH_OPEN` without a key; channels 1-13; up to 8 devices. `config('ssid')`, `'channel'`, `'authmode'`, `'hidden'`, `'max_clients'`, `'mac'` read them back |
+| `ifconfig()` | `('192.168.4.1', '255.255.255.0', '192.168.4.1', '0.0.0.0')` |
+| `status('stations')`, `isconnected()` | `(mac,)` for each device joined; whether any has |
+
+Devices that join get an address from a small DHCP server in the firmware (192.168.4.2 and up, 2-hour leases; the
+board is their router, with no DNS). Tested on the TTGO with a Linux laptop: it found `my-board` (WPA2) and
+`mpy-rs-open` (open) at full signal, got 192.168.4.2 from the board in a few seconds, and pinged it: 50/50 (2.8-27 ms
+while the board waited in the raw REPL), 20/20 with 1400-byte packets; with the station connected to the home
+network at the same time, the board answered on both (192.168.0.111 and 192.168.4.1) and the laptop's own wired
+connection stayed its default route. `status('stations')` showed the laptop's MAC address while it was joined.
+
 How it works ([`src/wifi.rs`](micropython-esp32/src/wifi.rs), [`modules/network.py`](micropython-esp32/modules/network.py)):
 the driver is [`esp-radio`](https://crates.io/crates/esp-radio) (Espressif's Wi-Fi library) on the
 [`esp-rtos`](https://crates.io/crates/esp-rtos) scheduler, both started by the first `active(True)`, and DHCP and IP
-come from [`smoltcp`](https://crates.io/crates/smoltcp). There's no background network task: the interface is polled
-when a script calls `status()`, `isconnected()` or `ifconfig()`, and while it sleeps. `network` is a frozen Python
-module over the firmware's `wifi_*` functions (`wifi_connect(ssid, key)`, `wifi_status()`, ...).
+come from [`smoltcp`](https://crates.io/crates/smoltcp) (two interfaces, the station's with a DHCP client and the
+access point's with the firmware's DHCP server). There's no background network task: the interfaces are polled when a
+script calls `status()`, `isconnected()` or `ifconfig()`, while it sleeps, and while the REPL waits for input (also
+the raw REPL, so the access point keeps serving under Thonny), but not while a script computes without sleeping.
+`network` is a frozen Python module over the firmware's `wifi_*` functions (`wifi_connect(ssid, key)`,
+`wifi_ap_config(...)`, ...). The driver gets fewer buffers than its defaults (6 + 12 receive, 12 transmit), sized
+for a microcontroller with a few devices.
 
 What Wi-Fi costs (the reason it's a feature, not in every build):
 
 | | Without `wifi` | With `wifi` |
 |-|---------------:|------------:|
-| App image (TTGO) | 424 KB | 859 KB |
+| App image (TTGO) | 424 KB | 882 KB |
 | IRAM | 48 KB | 101 KB (the driver's interrupt code) |
-| Static RAM | 11 KB | 81 KB (a 64 KB heap for the driver: 37 KB used when active, 46 KB connected, 57 KB at most) |
-| Main stack | 181 KB | 111 KB (recursion ends with `RecursionError` at about 99 KB instead of 153 KB) |
+| Static RAM | 11 KB | 89 KB (a 72 KB heap for the driver: 37 KB used with the station, 49 KB with the station and the access point, 55 KB at most with a device joined, pings and scans) |
+| Main stack | 181 KB | 102 KB (recursion ends with `RecursionError` at about 95 KB instead of 154 KB) |
 | Speed with Wi-Fi off / connected | | the same / 2 % slower (the scheduler's ticks) |
 
-Not there yet: access point mode, static addresses (`ifconfig((...))`), and sockets (`socket`, `urequests`), which are
-next. `network` takes 11 function slots, so a script using both `machine` and `network` has 37 of the 96 left.
+Not there yet: static addresses (`ifconfig((...))`), and sockets (`socket`, `urequests`), which are next. `network`
+takes 12 function slots, so a script using both `machine` and `network` has 36 of the 96 left.
 
 #### Modules
 

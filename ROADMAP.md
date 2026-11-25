@@ -173,6 +173,7 @@ Open after Phase 6 (the `machine` module is done in 7.1): `bytearray`
 | 7.5 | **Single precision floats** (`float32`, `make flash FLOAT=32`), like MicroPython's ESP32 port | Its digits and rounding; the FPU | ✅ measured on the TTGO (README, "Single precision") |
 | 7.6 | **Wi-Fi: `network.WLAN`** (station mode) like MicroPython's ESP32 port: `active`, `scan`, `connect`, `isconnected`, `status`, `ifconfig`, `config`, `disconnect` (`FEATURES=wifi`) | Connected boards; the base for sockets and HTTP | ✅ on a TTGO with a WPA2 network |
 | 7.7 | **`Pin.irq()` and `machine.Timer`**: soft interrupts like MicroPython's (callbacks between statements, during sleeps and at the prompt) | Buttons, periodic tasks, event-driven code from MicroPython tutorials | ✅ on a TTGO (edges on a looped-back pin, timers) |
+| 7.8 | **Wi-Fi access point**: `network.WLAN(network.AP_IF)` with `config(ssid=, key=, authmode=, channel=, hidden=, max_clients=)`, `ifconfig()`, `status('stations')`, alone or with the station; a DHCP server in the firmware | The board's own network for setup pages and phones | ✅ on a TTGO, joined from a Linux laptop |
 | 7.3 | **Feature levels** (`minimal`, `medium`, `full`; `full` by default) for the core library and the firmware (`make flash LEVEL=...`) | Smaller builds and less RAM for small chips | ✅ (README, "Feature levels") |
 
 Done for 7.1:
@@ -232,7 +233,20 @@ Done for 7.6:
   (Thonny, conformance, buses), 2 % slower while connected.
 * Costs: +435 KB flash, +53 KB IRAM, 70 KB of the stack (111 KB left), so it's a feature (`FEATURES=wifi`), not
   in every build; CI builds it with a 96 KB stack minimum.
-* Next: `socket` (TCP/UDP over the same smoltcp interface), then `urequests`; access point mode; static addresses.
+* Next: `socket` (TCP/UDP over the same smoltcp interface), then `urequests`; static addresses. (Access point mode:
+  done in 7.8.)
+
+Done for 7.8:
+
+* One driver configuration for the station, the access point or both (`ModeConfig::ApSta`); a second smoltcp
+  interface at 192.168.4.1/24 with a DHCP server in the firmware (DISCOVER/OFFER, REQUEST/ACK/NAK, RELEASE;
+  192.168.4.2 and up, 2-hour leases); joined devices from the driver's events; `network.py` with `AP_IF`.
+* The network is also polled while the REPL waits for input (raw REPL included), so the access point keeps serving
+  after a script ended and under Thonny.
+* Found under load (both interfaces, a device joined, pings, scans): the driver's default buffers took the 64 KB heap
+  to its limit. Now 6 + 12 receive and 12 transmit buffers and a 72 KB heap: 55 KB at most; the stack is 102 KB.
+* Tested from a Linux laptop: WPA2 and open networks found, address 192.168.4.2 by DHCP, 50/50 pings (2.8-27 ms),
+  1400-byte pings, both interfaces answering at once; the laptop's wired default route untouched.
 
 Done for 7.7:
 

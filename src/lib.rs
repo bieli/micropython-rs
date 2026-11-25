@@ -331,6 +331,10 @@ pub trait HardwareBridge {
     /// running one already (handlers don't nest).
     fn set_events(&mut self, _on: bool) {}
 
+    /// The application is idle (a REPL waiting for input; see
+    /// `Interpreter::idle`): background work, like serving a network.
+    fn idle(&mut self) {}
+
     /// A soft reset (the application calls it before a new session): the
     /// last session's pin interrupts and timers stop.
     fn soft_reset(&mut self) {}

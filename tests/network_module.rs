@@ -19,6 +19,17 @@ const FUNCTIONS: &[HwFn] = &[
     HwFn::new("wifi_mac", "", "").returning_bytes(),
     HwFn::new("wifi_rssi", "", ""),
     HwFn::new("sleep_ms", "ms", ""),
+    HwFn::with_args("wifi_ap_active", 0, 1, "[on]", ""),
+    HwFn::with_args(
+        "wifi_ap_config",
+        6,
+        6,
+        "ssid, key, authmode, channel, hidden, max_clients",
+        "",
+    ),
+    HwFn::new("wifi_ap_ifconfig", "", "").returning_bytes(),
+    HwFn::new("wifi_ap_stations", "", "").returning_bytes(),
+    HwFn::new("wifi_ap_mac", "", "").returning_bytes(),
 ];
 
 /// A radio that connects after three status polls, unless the key is wrong.
@@ -29,6 +40,7 @@ struct MockRadio {
     polls: u32,
     key_ok: bool,
     connecting: bool,
+    ap_active: bool,
 }
 
 impl HardwareBridge for MockRadio {
@@ -71,6 +83,13 @@ impl HardwareBridge for MockRadio {
                 }))
             }
             "wifi_rssi" => Ok(Some(-67)),
+            "wifi_ap_active" => {
+                if let Some(on) = args.first() {
+                    self.ap_active = on.int()? != 0;
+                }
+                Ok(Some(self.ap_active as i64))
+            }
+            "wifi_ap_config" => Ok(None),
             "sleep_ms" => Ok(None),
             _ => Err(Error::UnknownIdentifier),
         }
@@ -100,6 +119,13 @@ impl HardwareBridge for MockRadio {
             }
             "wifi_ifconfig" => vec![0; 16],
             "wifi_mac" => vec![0x88, 0x13, 0xbf, 0x97, 0xb9, 0xd0],
+            "wifi_ap_mac" => vec![0x8a, 0x13, 0xbf, 0x97, 0xb9, 0xd0],
+            "wifi_ap_ifconfig" => {
+                vec![192, 168, 4, 1, 255, 255, 255, 0, 192, 168, 4, 1, 0, 0, 0, 0]
+            }
+            // One device joined while the access point is on
+            "wifi_ap_stations" if self.ap_active => vec![2, 0, 0, 0, 0, 1],
+            "wifi_ap_stations" => vec![],
             _ => return Err(Error::UnknownIdentifier),
         };
         out[..data.len()].copy_from_slice(&data);
@@ -153,7 +179,7 @@ fn connect_like_micropython() {
          print(wlan.status() == network.STAT_WRONG_PASSWORD, network.WLAN.IF_STA, network.AUTH_WPA2_PSK)\n\
          wlan.config(hostname='sensor-1')\n\
          print(network.hostname(), wlan.config('hostname'))\n\
-         try:\n    network.WLAN(network.AP_IF)\nexcept ValueError as e:\n    print('AP_IF:', e)\n",
+         try:\n    network.WLAN(5)\nexcept ValueError as e:\n    print('WLAN(5):', e)\n",
     );
     assert_eq!(
         out,
@@ -164,7 +190,7 @@ fn connect_like_micropython() {
          False 0.0.0.0\n\
          True 0 3\n\
          sensor-1 sensor-1\n\
-         AP_IF: only network.STA_IF (no access point mode yet)\n"
+         WLAN(5): network.STA_IF or network.AP_IF\n"
     );
     assert!(
         log.starts_with("wifi_active()\nwifi_active(1)\n"),
@@ -177,4 +203,47 @@ fn connect_like_micropython() {
         log
     );
     assert!(log.contains("wifi_disconnect()\n"), "{}", log);
+}
+
+#[test]
+fn access_point_like_micropython() {
+    let (out, log) = run(
+        "import network\n\
+         ap = network.WLAN(network.AP_IF)\n\
+         print(ap.config('ssid'), ap.active(), ap.isconnected(), ap.status('stations'))\n\
+         ap.config(ssid='my-board', key='12345678')\n\
+         print(ap.config('authmode') == network.AUTH_WPA2_PSK, ap.config('channel'))\n\
+         print(ap.active(True), ap.ifconfig(), ap.isconnected(), ap.status('stations'), ap.status())\n\
+         ap.config(channel=6, hidden=True, max_clients=4)\n\
+         ap.config(essid='open-board', password='', security=network.AUTH_OPEN)\n\
+         print(ap.config('essid'), ap.config('hidden'), ap.config('max_clients'), ap.config('mac').hex())\n\
+         try:\n    ap.connect('x', 'y')\nexcept OSError:\n    print('connect on AP_IF: OSError')\n\
+         print(ap.active(False), ap.status('stations'))\n",
+    );
+    assert_eq!(
+        out,
+        "ESP_97B9D0 False False []\n\
+         True 1\n\
+         True ('192.168.4.1', '255.255.255.0', '192.168.4.1', '0.0.0.0') True [(b'\\x02\\x00\\x00\\x00\\x00\\x01',)] None\n\
+         open-board True 4 8a13bf97b9d0\n\
+         connect on AP_IF: OSError\n\
+         False []\n"
+    );
+    // The settings go to the firmware when it's activated, and on a change
+    // while it's on
+    assert!(
+        log.contains("wifi_ap_config(\"my-board\",\"12345678\",3,1,0,8)\nwifi_ap_active(1)\n"),
+        "{}",
+        log
+    );
+    assert!(
+        log.contains("wifi_ap_config(\"my-board\",\"12345678\",3,6,1,4)\n"),
+        "{}",
+        log
+    );
+    assert!(
+        log.contains("wifi_ap_config(\"open-board\",\"\",0,6,1,4)\n"),
+        "{}",
+        log
+    );
 }

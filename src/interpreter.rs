@@ -409,6 +409,22 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
         }
     }
 
+    /// For an application that waits (a REPL waiting for input): lets the
+    /// hardware do its background work (`HardwareBridge::idle`) and runs the
+    /// callbacks of the events that came (`run_pending_events`).
+    pub fn idle(&mut self) -> Result<(), Error> {
+        self.idle_hardware();
+        self.run_pending_events()
+    }
+
+    /// Only the hardware's background work (`HardwareBridge::idle`), no
+    /// callbacks: for a protocol that mustn't get their output (a raw REPL).
+    pub fn idle_hardware(&mut self) {
+        if let Some(hw) = self.hw.as_mut() {
+            hw.idle();
+        }
+    }
+
     /// `_irq_handler(f)`: the Python function the firmware's `machine`
     /// module gives for its events (`None` to stop).
     pub(super) fn set_event_handler(&mut self, f: Value<'a>) {
