@@ -5,14 +5,30 @@
 #   RIGHT button (GPIO35): show / close details   (hold: scan again)
 #
 # Uses the native `display` and `buttons` modules and MicroPython's `network`.
+# No print() while the UI is up: on the TTGO, printed text is also drawn on
+# the screen (the console), which would write over the UI and scroll it away.
 # Drawing calls no Python functions of its own (labels, bars and colors are
 # worked out once per scan): with Wi-Fi the stack has room for only about 5
 # nested Python calls, and a redraw is then at most 3 levels deep.
 # Make it start at every boot:  tools/mpy.py save scripts/wifi_scanner.py
 import display
 import buttons
-import network
 from display import WIDTH, HEIGHT, rgb
+
+try:
+    import network
+except ImportError:
+    # Firmware without Wi-Fi: say so on the screen (a traceback would end
+    # at the REPL, which looks like a crash)
+    print('wifi scanner: this firmware has no Wi-Fi; flash it with: make flash FEATURES=tft,wifi')
+    display.fill(display.BLACK)
+    display.font(2)
+    display.text(8, 30, 'No Wi-Fi in this', display.RED)
+    display.text(8, 50, 'firmware. Flash it with', display.RED)
+    display.font(1)
+    display.text(8, 85, 'make flash FEATURES=tft,wifi', display.YELLOW)
+    while True:
+        buttons.wait()
 
 # Layout (screen is 240 x 135): a title line on top, 4 network rows below
 TOP = 24
@@ -178,9 +194,6 @@ def scan():
                      fit(ssid, 136), fit(ssid, WIDTH - 16), n, bar_color(n)))
     sel = 0
     first = 0
-    print('%d networks:' % len(nets))
-    for net in nets:
-        print('  %4d dBm  ch %2d  %-7s %s' % (net[0], net[3], net[4], net[1]))
     title('%d networks' % len(nets), display.GREEN)
 
 
@@ -211,10 +224,11 @@ def rescan():
     draw_list()
 
 
+# The banner first: display.fill() then clears it from the screen
+print('wifi scanner: LEFT = next (hold: previous), RIGHT = details (hold: scan again)')
 display.fill(display.BLACK)
 wlan.active(True)
 rescan()
-print('wifi scanner: LEFT = next (hold: previous), RIGHT = details (hold: scan again)')
 
 # --- main loop (tests replace everything below this line) ---
 while True:
