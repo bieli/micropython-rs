@@ -124,6 +124,7 @@ macro_rules! board_functions {
             micropython_rs::HwFn::with_args("i2c_init", 2, 3, "sda, scl, [freq]", "Move the I2C bus (default 21, 22 at 100 kHz)"),
             micropython_rs::HwFn::new("i2c_probe", "addr", "True if a device answers at addr"),
             micropython_rs::HwFn::new("i2c_scan", "", "Addresses of the devices on the bus (bytes)").returning_bytes(),
+            micropython_rs::HwFn::new("cpu_info", "", "Chip, CPU, memory and build details as key=value lines (use machine.lscpu())").returning_bytes(),
             micropython_rs::HwFn::new("i2c_write", "addr, data", "Send bytes; returns how many"),
             micropython_rs::HwFn::new("i2c_read", "addr, n", "Receive n bytes").returning_bytes(),
             micropython_rs::HwFn::new("i2c_write_read", "addr, data, n", "Send, then receive n bytes (e.g. a register)").returning_bytes(),
@@ -654,6 +655,7 @@ impl<'d> Board<'d> {
                 out[..mac.len()].copy_from_slice(&mac);
                 Ok(mac.len())
             }
+            "cpu_info" => Ok(cpu_info(out)),
             "i2c_scan" => {
                 let mut n = 0;
                 for addr in 0x08..0x78 {
@@ -1245,6 +1247,78 @@ pub fn raw_to_mv(raw: u32, vref_mv: u32) -> u32 {
     const OFFSET_11DB: u64 = 142;
     let coeff_a = vref_mv as u64 * SCALE_11DB / 4096;
     ((coeff_a * raw as u64 + 32_768) / 65_536 + OFFSET_11DB) as u32
+}
+
+/// `cpu_info()`: what `machine.lscpu()` shows, as `key=value` lines (the
+/// bridge passes bytes, not dicts; machine.py turns them into a dict).
+fn cpu_info(out: &mut [u8]) -> usize {
+    use chip::about;
+    use core::fmt::Write;
+
+    struct Cursor<'b>(&'b mut [u8], usize);
+    impl Write for Cursor<'_> {
+        fn write_str(&mut self, s: &str) -> core::fmt::Result {
+            let end = (self.1 + s.len()).min(self.0.len());
+            self.0[self.1..end].copy_from_slice(&s.as_bytes()[..end - self.1]);
+            self.1 = end;
+            Ok(())
+        }
+    }
+    let mut c = Cursor(out, 0);
+    let rev = esp_hal::efuse::Efuse::chip_revision();
+    let mac = esp_hal::efuse::Efuse::mac_address();
+    let level = if cfg!(feature = "minimal") {
+        "minimal"
+    } else if cfg!(feature = "medium") {
+        "medium"
+    } else {
+        "full"
+    };
+    let _ = write!(
+        c,
+        "arch={}\nmodel={}\ncore={}\nrev=v{}.{}\ncores={}\nmhz={}\nmax_mhz={}\nflags={}\n\
+         flash={}\nsram={}\nstack={}\n",
+        about::ARCH,
+        chip::NAME,
+        about::CORE,
+        rev / 100,
+        rev % 100,
+        about::CORES,
+        CPU_CLOCK as u32,
+        about::MAX_MHZ,
+        about::FLAGS,
+        crate::storage::flash_size(),
+        about::SRAM,
+        crate::stack::size(),
+    );
+    let _ =
+        write!(
+        c,
+        "mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}\nboard={}\nfirmware={}\nbuild={}{}{}{}\n\
+         uptime_ms={}\nreset={}\n",
+        mac[0],
+        mac[1],
+        mac[2],
+        mac[3],
+        mac[4],
+        mac[5],
+        chip::BOARD,
+        env!("CARGO_PKG_VERSION"),
+        level,
+        if cfg!(feature = "wifi") { " wifi" } else { "" },
+        if cfg!(feature = "tft") { " tft" } else { "" },
+        if cfg!(feature = "float32") { " float32" } else { "" },
+        now_ms(),
+        reset_cause(),
+    );
+    #[cfg(feature = "wifi")]
+    let _ = write!(
+        c,
+        "wifi_heap={}\nwifi_heap_free={}\n",
+        esp_alloc::HEAP.used() + esp_alloc::HEAP.free(),
+        esp_alloc::HEAP.free()
+    );
+    c.1
 }
 
 /// Why the chip started, as one of the `*_RESET` constants.

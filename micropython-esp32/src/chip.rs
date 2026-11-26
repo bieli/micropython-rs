@@ -93,6 +93,46 @@ mod pins {
 
 pub use pins::*;
 
+/// For `lscpu`: the CPU core, cores, top clock, FPU, radios, internal SRAM.
+#[cfg(feature = "esp32")]
+pub mod about {
+    pub const ARCH: &str = "xtensa";
+    pub const CORE: &str = "Xtensa LX6";
+    pub const CORES: u32 = 2;
+    pub const MAX_MHZ: u32 = 240;
+    pub const FLAGS: &str = "fpu wifi bt ble";
+    pub const SRAM: u32 = 520 * 1024;
+}
+#[cfg(feature = "esp32s3")]
+pub mod about {
+    pub const ARCH: &str = "xtensa";
+    pub const CORE: &str = "Xtensa LX7";
+    pub const CORES: u32 = 2;
+    pub const MAX_MHZ: u32 = 240;
+    pub const FLAGS: &str = "fpu wifi ble usb-jtag";
+    pub const SRAM: u32 = 512 * 1024;
+}
+#[cfg(feature = "esp32c3")]
+pub mod about {
+    pub const ARCH: &str = "riscv32";
+    pub const CORE: &str = "RISC-V RV32IMC";
+    pub const CORES: u32 = 1;
+    pub const MAX_MHZ: u32 = 160;
+    pub const FLAGS: &str = "wifi ble usb-jtag";
+    pub const SRAM: u32 = 400 * 1024;
+}
+
+/// The board the pins are chosen for.
+pub const BOARD: &str = if cfg!(feature = "tft") {
+    "LilyGO TTGO T-Display"
+} else if cfg!(feature = "esp32s3") {
+    "Seeed XIAO ESP32-S3 (or another ESP32-S3)"
+} else if cfg!(feature = "esp32c3") {
+    "ESP32-C3 Super Mini (or another ESP32-C3)"
+} else {
+    "ESP32 DevKit (generic)"
+};
+
 /// How the ADC readings are calibrated. ESP32: none in esp-hal (raw values,
 /// converted with the eFuse reference voltage, see `board::raw_to_mv`).
 /// ESP32-S3 and C3: esp-hal's curve fitting with the chip's eFuse

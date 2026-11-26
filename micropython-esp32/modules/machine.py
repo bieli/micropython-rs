@@ -1,5 +1,5 @@
 # machine: MicroPython's hardware classes (Pin, ADC, PWM, I2C, SoftI2C, UART,
-# SPI, SoftSPI, Timer, WDT, RTC), written in Python on top of the firmware's functions
+# SPI, SoftSPI, Timer, WDT, RTC; and lscpu()), written in Python on top of the firmware's functions
 # (pin_write, adc_read, pwm_u16, i2c_write, uart_read, spi_read, ...), so
 # code from MicroPython tutorials runs unchanged. Built into the firmware
 # (a frozen module); a machine.py on the board's file system comes first.
@@ -365,6 +365,54 @@ class RTC:
         d = datetimetuple
         secs = time.mktime((d[0], d[1], d[2], d[4], d[5], d[6], 0, 0))
         rtc_set(secs, d[7] if len(d) > 7 else 0)
+
+
+# lscpu(): the chip, CPU, memory and build as a dict, with the names Linux's
+# lscpu uses where they fit; lscpu(True) prints them as a table instead.
+# Not in MicroPython (its closest are os.uname() and machine.freq()).
+# (firmware key, name; '' for a value made here), in a few statements: one
+# expression of all of them is too big for the parser
+_LSCPU = [('arch', 'Architecture'), ('', 'Byte Order'), ('cores', 'CPU(s)'), ('', 'Vendor ID')]
+_LSCPU += [('model', 'Model name'), ('core', 'CPU core'), ('rev', 'Revision'), ('mhz', 'CPU MHz')]
+_LSCPU += [('max_mhz', 'CPU max MHz'), ('flags', 'Flags'), ('flash', 'Flash size'), ('sram', 'SRAM size')]
+_LSCPU += [('stack', 'Stack size'), ('', 'Python heap size'), ('', 'Python heap free')]
+_LSCPU += [('wifi_heap', 'Wi-Fi heap size'), ('wifi_heap_free', 'Wi-Fi heap free'), ('mac', 'MAC address')]
+_LSCPU += [('board', 'Board'), ('firmware', 'Firmware'), ('build', 'Build')]
+_LSCPU += [('uptime_ms', 'Uptime (ms)'), ('reset', 'Reset cause')]
+_RESETS = {1: 'power on', 2: 'hard reset', 3: 'watchdog', 4: 'deep sleep', 5: 'soft reset'}
+
+
+def lscpu(show=False):
+    raw = {}
+    for line in cpu_info().decode().split('\n'):
+        kv = line.split('=', 1)
+        if len(kv) == 2:
+            raw[kv[0]] = int(kv[1]) if kv[1].isdigit() else kv[1]
+    try:
+        import gc
+        raw['_heap'] = gc.mem_free() + gc.mem_alloc()
+        raw['_heap_free'] = gc.mem_free()
+    except ImportError:
+        pass
+    extra = {'Byte Order': 'Little Endian', 'Vendor ID': 'Espressif',
+             'Python heap size': raw.get('_heap'), 'Python heap free': raw.get('_heap_free')}
+    info = {}
+    for key, name in _LSCPU:
+        value = raw.get(key) if key else extra.get(name)
+        if name == 'Reset cause':
+            value = _RESETS.get(value, value)
+        if value is not None:
+            info[name] = value
+    if not show:
+        return info
+    for name in info:
+        value = info[name]
+        if isinstance(value, int) and (name.endswith('size') or name.endswith('free')):
+            if value >= 1048576 and value % 1048576 == 0:
+                value = '%d MiB' % (value // 1048576)
+            else:
+                value = '%d KiB' % (value // 1024)
+        print('%-18s %s' % (name + ':', value))
 
 
 class WDT:

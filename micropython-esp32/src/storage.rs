@@ -46,11 +46,24 @@ impl Flash for VfsFlash {
     }
 }
 
+/// The flash chip's size in bytes, from the bootloader's image header (set
+/// by `mount`; `lscpu` reports it).
+static FLASH_SIZE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// The flash chip's size in bytes (0 before `mount`).
+pub fn flash_size() -> u32 {
+    FLASH_SIZE.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 /// Mounts the file system, or returns `None` (with a message) if the flash
 /// has no `vfs` partition, e.g. when flashed without `partitions.csv`.
 #[inline(never)]
 pub fn mount(flash: FLASH<'static>) -> Option<Files> {
     let mut storage = FlashStorage::new(flash);
+    FLASH_SIZE.store(
+        storage.capacity() as u32,
+        core::sync::atomic::Ordering::Relaxed,
+    );
 
     let mut table_buf = [0u8; PARTITION_TABLE_MAX_LEN];
     let region = read_partition_table(&mut storage, &mut table_buf)

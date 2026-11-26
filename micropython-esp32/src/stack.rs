@@ -12,7 +12,14 @@ extern "C" {
     // watchpoint: a write to it stops the board with "Stack corruption
     // detected". Painting stays above it.
     static _stack_start_cpu0: u8;
+    static _stack_end_cpu0: u8;
     static __stack_chk_guard: u32;
+}
+
+/// The main stack's size in bytes (what the statics leave of the data RAM).
+pub fn size() -> usize {
+    // Only the addresses of the symbols are taken (they're never read)
+    addr_of!(_stack_start_cpu0) as usize - addr_of!(_stack_end_cpu0) as usize
 }
 
 const PAINT: u32 = 0x5AA5_C33C;

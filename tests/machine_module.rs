@@ -65,6 +65,7 @@ const FUNCTIONS: &[HwFn] = &[
     HwFn::new("timer_deinit", "id", ""),
     HwFn::new("fire", "event", ""),
     HwFn::with_args("rtc_set", 1, 2, "seconds, [microseconds]", ""),
+    HwFn::new("cpu_info", "", "").returning_bytes(),
 ];
 
 const CONSTANTS: &[(&str, i64)] = &[
@@ -154,6 +155,11 @@ impl HardwareBridge for MockBoard {
                 self.rx.drain(..n.min(5)).collect() // arrives 5 bytes at a time
             }
             "unique_id" => vec![0x24, 0x0a, 0xc4, 1, 2, 3],
+            "cpu_info" => b"arch=xtensa\nmodel=ESP32-S3\ncore=Xtensa LX7\nrev=v0.2\ncores=2\nmhz=80\n\
+                max_mhz=240\nflags=fpu wifi ble usb-jtag\nflash=8388608\nsram=524288\nstack=144308\n\
+                mac=d8:3b:da:75:f0:a4\nboard=XIAO\nfirmware=0.1.0\nbuild=full wifi\nuptime_ms=1234\n\
+                reset=5\nwifi_heap=73728\nwifi_heap_free=40000\n"
+                .to_vec(),
             _ => return Err(Error::UnknownIdentifier),
         };
         out[..data.len()].copy_from_slice(&data);
@@ -389,4 +395,28 @@ fn rtc_datetime() {
         "{}",
         log
     );
+}
+
+#[test]
+fn lscpu_like_linux() {
+    let (out, _) = run(
+        "import machine\n\
+         info = machine.lscpu()\n\
+         print(info['Architecture'], info['CPU(s)'], info['Model name'], info['CPU MHz'], info['Flash size'])\n\
+         print(info['Reset cause'], info['Byte Order'], 'Python heap size' in info, info['Wi-Fi heap free'])\n\
+         print(list(info)[:4])\n\
+         machine.lscpu(True)\n",
+        b"",
+    );
+    let mut lines = out.lines();
+    assert_eq!(lines.next(), Some("xtensa 2 ESP32-S3 80 8388608"));
+    assert_eq!(lines.next(), Some("soft reset Little Endian True 40000"));
+    assert_eq!(
+        lines.next(),
+        Some("['Architecture', 'Byte Order', 'CPU(s)', 'Vendor ID']")
+    );
+    assert_eq!(lines.next(), Some("Architecture:      xtensa"));
+    assert!(out.contains("Flash size:        8 MiB\n"), "{}", out);
+    assert!(out.contains("Stack size:        140 KiB\n"), "{}", out);
+    assert!(out.contains("Reset cause:       soft reset\n"), "{}", out);
 }

@@ -1316,7 +1316,7 @@ Pins are plain GPIO numbers.
 | SPI | `spi_init(sck, mosi, miso, [khz], [mode])`, `spi_write(data)`, `spi_transfer(data)`, `spi_read(n, [fill])` | SPI3 master, default 1000 kHz (10 to 40 000) and mode 0 (0–3). Chip select is yours: a GPIO with `pin_write`. `spi_transfer` returns the bytes read while sending; `spi_read` sends `fill` (default 0) |
 | Watchdog | `wdt_enable(timeout_ms)`, `wdt_feed()`, `wdt_disable()` | The RTC watchdog resets the whole board when it isn't fed in time. `sleep_ms` feeds it automatically every 100 ms; the `>>>` prompt doesn't, so after a script ends (an error, Ctrl-C) the board resets and runs `main.py` again |
 | Clock | `rtc_set(seconds, [microseconds])`, `wifi_ntp(host, [timeout_ms])` (`wifi` only) | The wall clock behind `time.time()`, in seconds since 2000-01-01 UTC (MicroPython's ESP32 epoch). It starts at 2000-01-01 after a reset (no battery) and survives soft resets. `wifi_ntp` asks an NTP server (a name, looked up with the router's DNS server, or an IP address) and returns microseconds since 2000; `OSError` when it doesn't answer. Use them through `ntptime` and `machine.RTC` |
-| System | `reset()`, `reset_cause()`, `stack_peak()`, `unique_id()`, `cpu_freq()` | `reset_cause()` returns `PWRON_RESET`, `HARD_RESET`, `WDT_RESET`, `DEEPSLEEP_RESET` or `SOFT_RESET` (MicroPython's values). The firmware also prints the reset reason at boot. `stack_peak()`: the most bytes of the main stack used since its previous call (or boot), see [Stack budget](#stack-budget-measured-on-the-esp32). `unique_id()`: the chip's MAC address (6 bytes). `cpu_freq()`: the CPU clock in Hz (`CPU_MHZ`, 80 MHz by default) |
+| System | `reset()`, `reset_cause()`, `stack_peak()`, `unique_id()`, `cpu_freq()`, `cpu_info()` | `reset_cause()` returns `PWRON_RESET`, `HARD_RESET`, `WDT_RESET`, `DEEPSLEEP_RESET` or `SOFT_RESET` (MicroPython's values). The firmware also prints the reset reason at boot. `stack_peak()`: the most bytes of the main stack used since its previous call (or boot), see [Stack budget](#stack-budget-measured-on-the-esp32). `unique_id()`: the chip's MAC address (6 bytes). `cpu_freq()`: the CPU clock in Hz (`CPU_MHZ`, 80 MHz by default) |
 | Battery (`tft` only) | `battery_mv([samples])` | Battery voltage in mV: switches on the TTGO's divider (`ADC_EN`, GPIO14), reads GPIO34, doubles it, switches the divider off |
 | TFT (`tft` only) | `cls()`, `color(r, g, b)`, `text(x, y, s)`, `rect(x, y, w, h)`, `backlight(on)` | `color` sets the text and fill color (0–255 per channel). `text` and `rect` draw at pixel positions. `WIDTH` and `HEIGHT` are 240 and 135 |
 
@@ -1391,8 +1391,51 @@ hours, minutes, seconds, microseconds)`, `rtc.datetime((2026, 11, 26, 0, 7, 32, 
 ignored). The ESP32 has no battery for it: after a reset or power-up it starts at 2000-01-01 again, so set it from
 NTP (`ntptime.settime()`) or keep another clock (a DS3231 module on I²C). It drifts a few seconds a day.
 
+`machine.lscpu()` describes the board like Linux's `lscpu`: a dict with `Architecture`, `CPU(s)`, `Model name`,
+`Revision`, `CPU MHz`, `Flags`, `Flash size`, `Stack size`, the Python and Wi-Fi heaps, `MAC address`, `Board`, `Build`,
+`Reset cause` and more (sizes in bytes); `machine.lscpu(True)` prints it as a table instead (sizes in KiB/MiB). It's
+not in MicroPython. The firmware's `cpu_info()` gives the raw `key=value` lines. On the three boards it was tried on
+(each matched what `espflash board-info` reads from the chip):
+
+| | TTGO T-Display | Seeed XIAO ESP32-S3 | ESP32-C3 Super Mini |
+|-|----------------|---------------------|---------------------|
+| Architecture, CPU core | xtensa, Xtensa LX6 | xtensa, Xtensa LX7 | riscv32, RISC-V RV32IMC |
+| Model name, Revision | ESP32, v1.1 | ESP32-S3, v0.2 | ESP32-C3, v0.4 |
+| CPU(s), CPU max MHz | 2, 240 | 2, 240 | 1, 160 |
+| Flags | fpu wifi bt ble | fpu wifi ble usb-jtag | wifi ble usb-jtag |
+| Flash size, SRAM size | 16 MiB, 520 KiB | 8 MiB, 512 KiB | 4 MiB, 400 KiB |
+| Stack size (Wi-Fi builds) | 102 KiB | 140 KiB | 115 KiB |
+
+```text
+>>> import machine
+>>> machine.lscpu(True)
+Architecture:      riscv32
+Byte Order:        Little Endian
+CPU(s):            1
+Vendor ID:         Espressif
+Model name:        ESP32-C3
+CPU core:          RISC-V RV32IMC
+Revision:          v0.4
+CPU MHz:           80
+CPU max MHz:       160
+Flags:             wifi ble usb-jtag
+Flash size:        4 MiB
+SRAM size:         400 KiB
+Stack size:        115 KiB
+Python heap size:  32 KiB
+Python heap free:  15 KiB
+Wi-Fi heap size:   72 KiB
+Wi-Fi heap free:   72 KiB
+MAC address:       34:b7:da:f8:c7:dc
+Board:             ESP32-C3 Super Mini (or another ESP32-C3)
+Firmware:          0.1.0
+Build:             full wifi
+Uptime (ms):       4709
+Reset cause:       soft reset
+```
+
 Not there yet: level triggers, `Signal`, and the `*_into` methods (`readinto`, `write_readinto`,
-`readfrom_mem_into`), which need `bytearray`. The module takes 51 of the 96 function slots (`MAX_FUNCS`), and each
+`readfrom_mem_into`), which need `bytearray`. The module takes 52 of the 96 function slots (`MAX_FUNCS`), and each
 method call runs Python code: `led.value(1)` takes 1.2 ms
 on the ESP32 at 80 MHz (0.43 ms at 240 MHz), `pin_write(2, 1)` 0.27 ms (0.12 ms). Fine for blinking, sensors and
 buses, too slow for bit-banging.
@@ -1494,7 +1537,7 @@ request. Measured on the TTGO: `settime()` takes 23-77 ms, an unknown name fails
 no answer (UDP), and NTP servers ignore a repeat within a few seconds, so retry after a pause.
 
 Not there yet: static addresses (`ifconfig((...))`), and sockets (`socket`, `urequests`), which are next. `network`
-takes 12 function slots, `time` and `ntptime` 2 each, so a script using `machine`, `network` and `ntptime` has 29 of
+takes 12 function slots, `time` and `ntptime` 2 each, so a script using `machine`, `network` and `ntptime` has 28 of
 the 96 left.
 
 #### Modules
