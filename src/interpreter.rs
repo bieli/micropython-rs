@@ -77,7 +77,7 @@ pub const MAX_NESTING: usize = level(24, 40, 40);
 pub const VALUE_STACK: usize = level(64, 128, 128);
 
 /// The value of a limit for the feature level being built.
-const fn level(minimal: usize, medium: usize, full: usize) -> usize {
+pub(crate) const fn level(minimal: usize, medium: usize, full: usize) -> usize {
     if cfg!(feature = "full") {
         full
     } else if cfg!(feature = "medium") {
@@ -3122,6 +3122,8 @@ const CORE_MODULES: &[Module] = &[
     #[cfg(feature = "stdlib")]
     bytes::BINASCII,
     builtins::BUILTINS_MODULE,
+    #[cfg(feature = "stdlib")]
+    builtins::GC_MODULE,
     #[cfg(feature = "float")]
     floats::MATH,
     #[cfg(feature = "files")]
@@ -3981,7 +3983,7 @@ print(fact(6), fib(6))
         let code = core::mem::size_of::<Code<'_>>();
         let parser = core::mem::size_of::<Parser<'_>>();
         std::println!("interp={} code={} parser={}", interp, code, parser);
-        assert!(interp <= 45056, "Interpreter is {} bytes", interp);
+        assert!(interp <= 47104, "Interpreter is {} bytes", interp);
         assert!(code <= 1600, "Code is {} bytes", code);
         assert!(parser <= 128, "Parser is {} bytes", parser);
     }
@@ -4233,6 +4235,7 @@ print(fact(6), fib(6))
         let names = [
             (cfg!(feature = "stdlib"), "binascii"),
             (true, "builtins"),
+            (cfg!(feature = "stdlib"), "gc"),
             (cfg!(feature = "float"), "math"),
             (cfg!(feature = "files"), "os"),
             (cfg!(feature = "stdlib"), "sys"),

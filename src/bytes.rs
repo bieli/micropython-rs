@@ -225,6 +225,19 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
     ) -> Result<Value<'a>, Error> {
         match (module, name, args) {
             ("os", _, _) => self.os_call(name, args),
+            ("gc", "collect", _) => {
+                self.collect();
+                Ok(Value::None)
+            }
+            ("gc", "mem_free", _) => {
+                Ok(Value::Int((self.heap.capacity() - self.heap.used()) as i64))
+            }
+            ("gc", "mem_alloc", _) => Ok(Value::Int(self.heap.used() as i64)),
+            ("gc", "objects_free", _) => Ok(Value::Int(
+                (crate::heap::MAX_OBJECTS - self.heap.objects()) as i64,
+            )),
+            ("gc", "isenabled", _) => Ok(Value::Bool(true)),
+            ("gc", "enable" | "disable", _) => Ok(Value::None),
             ("math", _, _) => self.math_call(name, args),
             ("sys", "exit", _) => {
                 let class = super::exceptions::class_by_name("SystemExit").unwrap_or(0);

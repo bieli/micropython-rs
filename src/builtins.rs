@@ -101,6 +101,35 @@ pub(crate) const SYS_MODULE: crate::Module = crate::Module {
     constants: &[("maxsize", i64::MAX)],
 };
 
+/// `import gc`: MicroPython's `collect()`, `mem_free()`, `mem_alloc()`,
+/// `enable()`/`disable()`/`isenabled()` (collection can't be switched off:
+/// it runs whenever the heap is full), and `objects_free()`, this
+/// interpreter's own: free entries of the heap's object table, which can run
+/// out while bytes are still free.
+#[cfg(feature = "stdlib")]
+pub(crate) const GC_MODULE: crate::Module = crate::Module {
+    name: "gc",
+    doc: "The heap: collect(), mem_free(), mem_alloc(), objects_free()",
+    functions: &[
+        crate::HwFn::new("collect", "", "Free unreachable objects now"),
+        crate::HwFn::new("mem_free", "", "Free heap bytes"),
+        crate::HwFn::new(
+            "mem_alloc",
+            "",
+            "Heap bytes in use (garbage too, until collect())",
+        ),
+        crate::HwFn::new(
+            "objects_free",
+            "",
+            "Free object-table entries (not in MicroPython)",
+        ),
+        crate::HwFn::new("enable", "", "Does nothing: collection is always on"),
+        crate::HwFn::new("disable", "", "Does nothing: collection is always on"),
+        crate::HwFn::new("isenabled", "", "True"),
+    ],
+    constants: &[],
+};
+
 pub(super) fn builtin_by_name(name: &str) -> Option<u8> {
     NAMES.iter().position(|&n| n == name).map(|i| i as u8)
 }

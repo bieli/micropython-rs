@@ -12,8 +12,11 @@
 // table), not through addresses, so moving an object's bytes during
 // compaction never invalidates a value.
 
-/// Maximum number of objects alive at the same time.
-pub const MAX_OBJECTS: usize = 256;
+/// Maximum number of objects alive at the same time: 12 bytes of table each.
+/// The full level has room for more: its frozen modules alone keep about 250
+/// alive (`machine` 160, `network` 65), while their bytes fill under a third
+/// of a 32 KB heap.
+pub const MAX_OBJECTS: usize = crate::interpreter::level(256, 256, 512);
 
 /// Handle of a heap object.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
