@@ -21,4 +21,5 @@ pub fn write_serial(s: &str) {
     for line in lines {
         print!("\r\n{}", line);
     }
+    crate::serial_input::output_written();
 }

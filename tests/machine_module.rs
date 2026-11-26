@@ -79,6 +79,8 @@ const CONSTANTS: &[(&str, i64)] = &[
     ("WDT_RESET", 3),
     ("DEEPSLEEP_RESET", 4),
     ("SOFT_RESET", 5),
+    ("I2C_SDA", 21),
+    ("I2C_SCL", 22),
 ];
 
 #[derive(Default)]

@@ -208,11 +208,12 @@ def _mem(memaddr, addrsize):
 
 
 class I2C:
-    # One bus: the id is accepted, the pins default to the board's 21 and 22
+    # One bus: the id is accepted, the pins default to the chip's (I2C_SDA,
+    # I2C_SCL: 21 and 22 on the ESP32, 5 and 6 on the ESP32-S3)
     def __init__(self, id=0, scl=None, sda=None, freq=400000, timeout=None):
         if id not in (0, 1):
             raise ValueError('I2C id must be 0 or 1')
-        i2c_init(21 if sda is None else _pin(sda), 22 if scl is None else _pin(scl), freq)
+        i2c_init(I2C_SDA if sda is None else _pin(sda), I2C_SCL if scl is None else _pin(scl), freq)
 
     def scan(self):
         return list(i2c_scan())

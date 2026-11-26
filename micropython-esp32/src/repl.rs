@@ -337,9 +337,10 @@ impl<'a, O: Output, H: HardwareBridge> Repl<'_, 'a, O, H> {
     }
 
     fn banner(&mut self) {
+        self.write("\nmicropython-rs REPL on ");
+        self.write(crate::chip::NAME);
         self.write(
-            "\nmicropython-rs REPL on ESP32\n\
-             help() lists functions. Ctrl-C stops a script, Ctrl-D soft resets, Ctrl-E pastes.\n",
+            "\nhelp() lists functions. Ctrl-C stops a script, Ctrl-D soft resets, Ctrl-E pastes.\n",
         );
     }
 

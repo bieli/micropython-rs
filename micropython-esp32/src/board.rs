@@ -201,6 +201,9 @@ macro_rules! board_constants {
             ("WDT_RESET", $crate::board::WDT_RESET),
             ("DEEPSLEEP_RESET", $crate::board::DEEPSLEEP_RESET),
             ("SOFT_RESET", $crate::board::SOFT_RESET),
+            // The chip's default I2C pins (machine.I2C() without pins)
+            ("I2C_SDA", $crate::board::I2C_SDA as i64),
+            ("I2C_SCL", $crate::board::I2C_SCL as i64),
             $($extra),*
         ]
     };

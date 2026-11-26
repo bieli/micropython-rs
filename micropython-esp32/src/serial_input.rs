@@ -98,8 +98,48 @@ fn received(ring: &mut Ring, bytes: &[u8]) {
     }
 }
 
+/// When output was last written to the USB-Serial/JTAG port (microseconds
+/// since boot, wrapping at 32 bits), or 0 when it has been flushed since.
+#[cfg(feature = "esp32s3")]
+static OUTPUT_AT_US: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+#[cfg(feature = "esp32s3")]
+fn now_us() -> u32 {
+    esp_hal::time::Instant::now()
+        .duration_since_epoch()
+        .as_micros() as u32
+}
+
+/// Notes that output was written (`serial_console`). On the ESP32-S3, the
+/// USB-Serial/JTAG port ignores a flush that comes while its previous packet
+/// is still being sent: a short write right after another one (the raw
+/// REPL's `\x04>`) would wait in its buffer until the next write. So while
+/// the board waits for input, `read_byte` flushes once more.
+pub fn output_written() {
+    #[cfg(feature = "esp32s3")]
+    OUTPUT_AT_US.store(now_us().max(1), Ordering::Relaxed);
+}
+
+/// The second flush of `output_written`, 1 ms after the last write (the
+/// USB frame time, by when the previous packet has gone).
+#[cfg(feature = "esp32s3")]
+fn flush_pending_output() {
+    let at = OUTPUT_AT_US.load(Ordering::Relaxed);
+    if at == 0 {
+        return;
+    }
+    if now_us().wrapping_sub(at) >= 1000 {
+        OUTPUT_AT_US.store(0, Ordering::Relaxed);
+        esp_hal::peripherals::USB_DEVICE::regs()
+            .ep1_conf()
+            .write(|w| w.wr_done().set_bit());
+    }
+}
+
 /// The next received byte, if any.
 pub fn read_byte() -> Option<u8> {
+    #[cfg(feature = "esp32s3")]
+    flush_pending_output();
     critical_section::with(|cs| RING.borrow_ref_mut(cs).pop())
 }
 

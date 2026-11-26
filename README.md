@@ -841,8 +841,22 @@ Makefile picks both from `CHIP`. What differs ([`src/chip.rs`](micropython-esp32
 
 The first flash of a board that runs other firmware (Arduino, CircuitPython) needs its bootloader: hold BOOT (the
 XIAO's B button), press and release RESET (R), keep BOOT down a second more, then release it. The chip then shows up
-as `303a:1001` (`lsusb`) and `make flash CHIP=esp32s3` works; after that, espflash resets it over USB by itself. Not
-there yet on the S3: the PSRAM (8 MB on the XIAO), its second core, and the TTGO's display build.
+as `303a:1001` (`lsusb`) and `make flash CHIP=esp32s3` works. If it then prints `waiting for download`, press R once:
+the reset after that first flash can land in the bootloader again. From then on espflash resets it over USB by
+itself. The XIAO has no antenna on the board: snap the one from its box onto the U.FL connector, or Wi-Fi hears
+almost nothing (scans find no networks, its own access point is weak).
+
+Measured on a Seeed XIAO ESP32-S3 (`CHIP=esp32s3 FEATURES=wifi`, 80 MHz): the REPL, `tools/mpy.py` (exec, run,
+files), Ctrl-C, the LED, pins with pull-ups and pull-downs, `machine.Timer` (a 50 ms timer fires 20 times a second),
+the I2C bus, the ADC pins; Wi-Fi: a scan found 6 networks in 0.9 s, connected with DHCP in 4.5 s, NTP in 58 ms, the
+access point next to the station. Stack: a top-level statement takes 43.5 KB, recursion stops at `MAX_CALL_DEPTH` (8
+calls, 113 KB) before the stack guard, and the worst case found takes 130 KB of the 141 KB.
+
+The S3's USB-Serial/JTAG port ignores a flush while its previous packet is still going out, so a short write right
+after another one would wait for the next write (the raw REPL's closing `\x04>`, and `mpy.py` timed out). The
+firmware flushes once more while it waits for input ([`serial_input.rs`](micropython-esp32/src/serial_input.rs)).
+
+Not there yet on the S3: the PSRAM (8 MB on the XIAO), its second core, and the TTGO's display build.
 
 > [!IMPORTANT]
 > On a TTGO T-Display, build with `FEATURES=tft`. The default build doesn't start the display or its backlight, so the screen stays dark.
