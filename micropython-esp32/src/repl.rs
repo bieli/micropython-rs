@@ -54,7 +54,7 @@ static mut BUFFERS: core::mem::MaybeUninit<Buffers> = core::mem::MaybeUninit::un
 
 /// The buffers, zeroed; can be taken only once.
 fn take_buffers() -> &'static mut Buffers {
-    static TAKEN: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+    static TAKEN: portable_atomic::AtomicBool = portable_atomic::AtomicBool::new(false);
     assert!(
         !TAKEN.swap(true, Ordering::Relaxed),
         "REPL buffers taken twice"

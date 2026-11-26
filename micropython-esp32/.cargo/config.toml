@@ -3,14 +3,19 @@ include = ["esp-config.toml"]
 
 [target.xtensa-esp32-none-elf]
 runner = "espflash flash --monitor --chip esp32"
+rustflags = ["-C", "link-arg=-nostartfiles"]
 
 [target.xtensa-esp32s3-none-elf]
 runner = "espflash flash --monitor --chip esp32s3"
+rustflags = ["-C", "link-arg=-nostartfiles"]
+
+# ESP32-C3: RISC-V, linked by rust-lld (no espup linker needed). Frame
+# pointers keep esp-backtrace's panic backtraces readable.
+[target.riscv32imc-unknown-none-elf]
+runner = "espflash flash --monitor --chip esp32c3"
+rustflags = ["-C", "force-frame-pointers"]
 
 [build]
-rustflags = [
-  "-C", "link-arg=-nostartfiles",
-]
 
 target = "xtensa-esp32-none-elf"
 

@@ -218,6 +218,8 @@ pub struct BoardPeripherals<'d> {
     pub wifi: esp_hal::peripherals::WIFI<'static>,
     #[cfg(feature = "wifi")]
     pub timg1: esp_hal::peripherals::TIMG1<'static>,
+    #[cfg(all(feature = "wifi", feature = "esp32c3"))]
+    pub sw_int0: esp_hal::interrupt::software::SoftwareInterrupt<'static, 0>,
     pub adc1: ADC1<'d>,
     /// The ADC inputs, `ADC_PINS` (ESP32: GPIO34/36/39, ESP32-S3: GPIO1-3)
     pub adc_a: chip::AdcA<'d>,
@@ -241,8 +243,8 @@ struct Analog<'d> {
 impl<'d> Analog<'d> {
     fn new(adc1: ADC1<'d>, a: chip::AdcA<'d>, b: chip::AdcB<'d>, c: chip::AdcC<'d>) -> Self {
         let mut config = AdcConfig::new();
-        // ESP32-S3: calibrated with the chip's eFuse values (`chip::AdcCal`)
-        #[cfg(feature = "esp32s3")]
+        // ESP32-S3 and C3: calibrated with the chip's eFuse values (`chip::AdcCal`)
+        #[cfg(any(feature = "esp32s3", feature = "esp32c3"))]
         let (pin_a, pin_b, pin_c) = (
             config.enable_pin_with_cal(a, Attenuation::_11dB),
             config.enable_pin_with_cal(b, Attenuation::_11dB),
@@ -335,6 +337,8 @@ impl<'d> Board<'d> {
             wifi_parts: Some(crate::wifi::WifiParts {
                 wifi: p.wifi,
                 timg1: p.timg1,
+                #[cfg(feature = "esp32c3")]
+                sw_int0: p.sw_int0,
             }),
             #[cfg(feature = "wifi")]
             station: None,
@@ -786,7 +790,8 @@ impl<'d> Board<'d> {
     }
 
     /// `spi_init(sck, mosi, miso, khz, mode)`: SPI3 as master (SPI2 drives
-    /// the TTGO's display). Chip select is up to the script (`pin_write`).
+    /// the TTGO's display); SPI2 on the ESP32-C3, its only general-purpose
+    /// SPI. Chip select is up to the script (`pin_write`).
     fn spi_init(&mut self, [sck, mosi, miso]: [u8; 3], khz: i64, mode: i64) -> Result<(), Error> {
         let khz = u32::try_from(khz)
             .ok()
@@ -805,8 +810,11 @@ impl<'d> Board<'d> {
             self.take_pin(mosi)?,
             self.take_pin(miso)?,
         );
-        // SAFETY: the previous SPI3 driver was dropped just above
+        // SAFETY: the previous SPI driver was dropped just above
+        #[cfg(not(feature = "esp32c3"))]
         let spi3 = unsafe { esp_hal::peripherals::SPI3::steal() };
+        #[cfg(feature = "esp32c3")]
+        let spi3 = unsafe { esp_hal::peripherals::SPI2::steal() };
         let config = SpiConfig::default()
             .with_frequency(Rate::from_khz(khz))
             .with_mode(mode);
@@ -1210,7 +1218,7 @@ const MAX_ADC_SAMPLES: i64 = 1024;
 /// The ADC reference voltage of this chip in mV, from eFuse. The factory
 /// stores the deviation from 1100 mV in 7 mV steps (sign-magnitude, 5 bits);
 /// chips without it read as 0 deviation, i.e. 1100 mV.
-#[cfg(feature = "esp32s3")]
+#[cfg(any(feature = "esp32s3", feature = "esp32c3"))]
 pub fn adc_vref_mv() -> u32 {
     1100 // the nominal value: the S3's calibration is per attenuation (esp-hal applies it)
 }
@@ -1256,6 +1264,13 @@ pub fn reset_cause() -> i64 {
         // The chip's USB port resets it too (espflash, the USB-Serial/JTAG)
         #[cfg(feature = "esp32s3")]
         Some(CoreSw | CpuSw | CoreUsbUart | CoreUsbJtag) => SOFT_RESET,
+        #[cfg(feature = "esp32c3")]
+        Some(
+            CoreMwdt0 | CoreMwdt1 | CoreRtcWdt | Cpu0Mwdt0 | Cpu0Mwdt1 | Cpu0RtcWdt | SysRtcWdt
+            | SysSuperWdt,
+        ) => WDT_RESET,
+        #[cfg(feature = "esp32c3")]
+        Some(CoreSw | Cpu0Sw | CoreUsbUart | CoreUsbJtag) => SOFT_RESET,
         Some(CoreDeepSleep) => DEEPSLEEP_RESET,
         _ => HARD_RESET,
     }

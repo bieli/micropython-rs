@@ -1,9 +1,10 @@
 # Docker and target configuration
 DOCKER_IMAGE := espressif/idf-rust:esp32_latest
-# The chip: esp32 (default: DevKits, TTGO T-Display) or esp32s3 (e.g. Seeed XIAO
-# ESP32-S3, console on the chip's USB port)
+# The chip: esp32 (default: DevKits, TTGO T-Display), esp32s3 (e.g. Seeed XIAO
+# ESP32-S3) or esp32c3 (RISC-V, e.g. ESP32-C3 Super Mini); the S3 and C3 have
+# the console on the chip's own USB port
 CHIP         ?= esp32
-TARGET       := xtensa-$(CHIP)-none-elf
+TARGET       := $(if $(filter esp32c3,$(CHIP)),riscv32imc-unknown-none-elf,xtensa-$(CHIP)-none-elf)
 BIN_NAME     := micropython-esp32
 ELF_PATH     := target/$(TARGET)/release/$(BIN_NAME)
 

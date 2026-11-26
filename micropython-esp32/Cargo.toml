@@ -21,6 +21,9 @@ esp-backtrace = { version = "=0.18.1", features = [
 esp-println = { version = "=0.16.1" }
 # `nb::block!` for the blocking ADC read
 nb = "1.1"
+# Atomic read-modify-write (fetch_or, swap) also on the ESP32-C3, whose RISC-V
+# core has no atomic instructions (esp-hal sets portable-atomic up for it)
+portable-atomic = { version = "1.11", default-features = false }
 # Flash access for main.py saved in the nvs partition
 esp-storage = { version = "=0.8.1" }
 embedded-storage = "0.3"
@@ -47,6 +50,12 @@ default = ["full", "esp32"]
 esp32 = [
   "esp-hal/esp32", "esp-bootloader-esp-idf/esp32", "esp-backtrace/esp32", "esp-println/esp32",
   "esp-storage/esp32", "esp-radio?/esp32", "esp-rtos?/esp32", "esp-alloc?/esp32",
+]
+# ESP32-C3 (RISC-V; target riscv32imc-unknown-none-elf), console on the chip's
+# own USB port, such as the ESP32-C3 Super Mini (LED on GPIO8, BOOT on GPIO9)
+esp32c3 = [
+  "esp-hal/esp32c3", "esp-bootloader-esp-idf/esp32c3", "esp-backtrace/esp32c3", "esp-println/esp32c3",
+  "esp-storage/esp32c3", "esp-radio?/esp32c3", "esp-rtos?/esp32c3", "esp-alloc?/esp32c3",
 ]
 # ESP32-S3 boards with the console on the chip's own USB port (USB-Serial/JTAG),
 # such as the Seeed XIAO ESP32-S3 (user LED on GPIO21)

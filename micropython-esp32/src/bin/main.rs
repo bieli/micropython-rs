@@ -39,6 +39,9 @@ macro_rules! board_peripherals {
             wifi: $p.WIFI,
             #[cfg(feature = "wifi")]
             timg1: $p.TIMG1,
+            #[cfg(all(feature = "wifi", feature = "esp32c3"))]
+            sw_int0: esp_hal::interrupt::software::SoftwareInterruptControl::new($p.SW_INTERRUPT)
+                .software_interrupt0,
             adc1: $p.ADC1,
             #[cfg(feature = "esp32")]
             adc_a: $p.GPIO34,
@@ -52,6 +55,12 @@ macro_rules! board_peripherals {
             adc_b: $p.GPIO2,
             #[cfg(feature = "esp32s3")]
             adc_c: $p.GPIO3,
+            #[cfg(feature = "esp32c3")]
+            adc_a: $p.GPIO0,
+            #[cfg(feature = "esp32c3")]
+            adc_b: $p.GPIO1,
+            #[cfg(feature = "esp32c3")]
+            adc_c: $p.GPIO3,
             ledc: $p.LEDC,
             i2c0: $p.I2C0,
             #[cfg(feature = "esp32")]
@@ -62,6 +71,10 @@ macro_rules! board_peripherals {
             sda: $p.GPIO5,
             #[cfg(feature = "esp32s3")]
             scl: $p.GPIO6,
+            #[cfg(feature = "esp32c3")]
+            sda: $p.GPIO6,
+            #[cfg(feature = "esp32c3")]
+            scl: $p.GPIO7,
             lpwr: $p.LPWR,
         }
     };
@@ -88,14 +101,25 @@ const GENERIC_PINS: &[u8] = &[
     48,
 ];
 
+/// ESP32-C3: everything except the ADC inputs (0, 1, 3), I2C (6, 7), flash
+/// (11-17) and USB (18, 19): the ESP32-C3 Super Mini's header pins 2, 4, 5,
+/// 8 (its LED), 9 (its BOOT button), 10, 20 and 21.
+#[cfg(feature = "esp32c3")]
+const GENERIC_PINS: &[u8] = &[2, 4, 5, 8, 9, 10, 20, 21];
+
 /// Most ESP32 DevKit boards wire the onboard LED to GPIO2; the XIAO ESP32-S3's
-/// user LED is GPIO21, lit when the pin is low.
+/// user LED is GPIO21, the ESP32-C3 Super Mini's GPIO8, both lit when low.
 #[cfg(all(feature = "esp32", not(feature = "tft")))]
 const LED_PIN: i64 = 2;
 #[cfg(feature = "esp32s3")]
 const LED_PIN: i64 = 21;
+#[cfg(feature = "esp32c3")]
+const LED_PIN: i64 = 8;
 #[cfg(not(feature = "tft"))]
-const LED_ON_LEVEL: i64 = if cfg!(feature = "esp32s3") { 0 } else { 1 };
+const LED_ON_LEVEL: i64 = if cfg!(feature = "esp32") { 1 } else { 0 };
+/// The BOOT button, LEFT of the `buttons` module (GPIO9 on the ESP32-C3)
+#[cfg(not(feature = "tft"))]
+const BOOT_PIN: u8 = if cfg!(feature = "esp32c3") { 9 } else { 0 };
 
 #[cfg(all(feature = "esp32", not(feature = "tft")))]
 const GENERIC_FNS: &[HwFn] = micropython_esp32::board_functions!(
@@ -107,10 +131,19 @@ const GENERIC_FNS: &[HwFn] = micropython_esp32::board_functions!(
     HwFn::new("led_on", "", "Onboard LED on (GPIO21 on the XIAO ESP32-S3)"),
     HwFn::new("led_off", "", "Onboard LED off"),
 );
+#[cfg(feature = "esp32c3")]
+const GENERIC_FNS: &[HwFn] = micropython_esp32::board_functions!(
+    HwFn::new(
+        "led_on",
+        "",
+        "Onboard LED on (GPIO8 on the ESP32-C3 Super Mini)"
+    ),
+    HwFn::new("led_off", "", "Onboard LED off"),
+);
 
 #[cfg(not(feature = "tft"))]
 const GENERIC_CONSTS: &[(&str, i64)] =
-    micropython_esp32::board_constants!(("LED", LED_PIN), ("BOOT_BUTTON", 0));
+    micropython_esp32::board_constants!(("LED", LED_PIN), ("BOOT_BUTTON", BOOT_PIN as i64));
 
 #[cfg(not(feature = "tft"))]
 struct GenericHardware<'d> {
@@ -192,15 +225,16 @@ fn main() -> ! {
     // Set up serial input first: it resets UART0, which drops unsent output
     #[cfg(feature = "esp32")]
     serial_input::init(peripherals.UART0, peripherals.GPIO3);
-    #[cfg(feature = "esp32s3")]
+    #[cfg(any(feature = "esp32s3", feature = "esp32c3"))]
     serial_input::init(peripherals.USB_DEVICE);
     print_reset_reason();
     // Shared by the REPL's file commands and the scripts (`open()`, `os`)
     let files = storage::mount(peripherals.FLASH).map(core::cell::RefCell::new);
 
     let mut board = Board::new(board_peripherals!(peripherals), GENERIC_PINS);
-    // Most DevKits only have the BOOT button (GPIO0) as a user button: LEFT
-    let buttons = Buttons::new(&mut board, Some((0, true)), None);
+    // Most DevKits only have the BOOT button (GPIO0, GPIO9 on the C3) as a
+    // user button: LEFT
+    let buttons = Buttons::new(&mut board, Some((BOOT_PIN, true)), None);
     let mut out = micropython_esp32::serial_console::EspSerialOut;
     let mut hw = GenericHardware { board, buttons };
 
@@ -437,6 +471,13 @@ const BOOT_SCRIPT: BootScript = BootScript {
 fn wifi_heap() {
     esp_alloc::heap_allocator!(#[link_section = ".dram2_uninit"] size: 16 * 1024);
     esp_alloc::heap_allocator!(size: 56 * 1024);
+}
+
+/// ESP32-C3: 64 KB in `dram2` (66 KB there) and 8 KB of the main data RAM.
+#[cfg(all(feature = "wifi", feature = "esp32c3"))]
+fn wifi_heap() {
+    esp_alloc::heap_allocator!(#[link_section = ".dram2_uninit"] size: 64 * 1024);
+    esp_alloc::heap_allocator!(size: 8 * 1024);
 }
 
 /// ESP32-S3: all 72 KB in `dram2` (72.0 KB there; the REPL's buffers use

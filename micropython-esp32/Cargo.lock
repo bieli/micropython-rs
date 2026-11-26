@@ -1110,6 +1110,7 @@ dependencies = [
  "micropython-rs",
  "mipidsi",
  "nb 1.1.0",
+ "portable-atomic",
  "smoltcp",
 ]
 

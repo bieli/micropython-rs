@@ -14,7 +14,7 @@ use core::sync::atomic::Ordering;
 
 use critical_section::Mutex;
 use esp_hal::{handler, Blocking};
-#[cfg(feature = "esp32s3")]
+#[cfg(any(feature = "esp32s3", feature = "esp32c3"))]
 use esp_hal::{peripherals::USB_DEVICE, usb_serial_jtag::UsbSerialJtag};
 #[cfg(feature = "esp32")]
 use esp_hal::{
@@ -55,7 +55,7 @@ impl Ring {
 
 #[cfg(feature = "esp32")]
 static UART: Mutex<RefCell<Option<Uart<'static, Blocking>>>> = Mutex::new(RefCell::new(None));
-#[cfg(feature = "esp32s3")]
+#[cfg(any(feature = "esp32s3", feature = "esp32c3"))]
 static USB: Mutex<RefCell<Option<UsbSerialJtag<'static, Blocking>>>> =
     Mutex::new(RefCell::new(None));
 static RING: Mutex<RefCell<Ring>> = Mutex::new(RefCell::new(Ring {
@@ -78,7 +78,7 @@ pub fn init(uart0: UART0<'static>, rx: GPIO3<'static>) {
 
 /// Starts receiving on the USB-Serial/JTAG port. Call once at boot. Output
 /// keeps going through `esp_println`, which writes to the same port.
-#[cfg(feature = "esp32s3")]
+#[cfg(any(feature = "esp32s3", feature = "esp32c3"))]
 pub fn init(usb: USB_DEVICE<'static>) {
     let mut usb = UsbSerialJtag::new(usb);
     usb.set_interrupt_handler(on_usb_rx);
@@ -100,10 +100,10 @@ fn received(ring: &mut Ring, bytes: &[u8]) {
 
 /// When output was last written to the USB-Serial/JTAG port (microseconds
 /// since boot, wrapping at 32 bits), or 0 when it has been flushed since.
-#[cfg(feature = "esp32s3")]
+#[cfg(any(feature = "esp32s3", feature = "esp32c3"))]
 static OUTPUT_AT_US: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
-#[cfg(feature = "esp32s3")]
+#[cfg(any(feature = "esp32s3", feature = "esp32c3"))]
 fn now_us() -> u32 {
     esp_hal::time::Instant::now()
         .duration_since_epoch()
@@ -116,13 +116,13 @@ fn now_us() -> u32 {
 /// REPL's `\x04>`) would wait in its buffer until the next write. So while
 /// the board waits for input, `read_byte` flushes once more.
 pub fn output_written() {
-    #[cfg(feature = "esp32s3")]
+    #[cfg(any(feature = "esp32s3", feature = "esp32c3"))]
     OUTPUT_AT_US.store(now_us().max(1), Ordering::Relaxed);
 }
 
 /// The second flush of `output_written`, 1 ms after the last write (the
 /// USB frame time, by when the previous packet has gone).
-#[cfg(feature = "esp32s3")]
+#[cfg(any(feature = "esp32s3", feature = "esp32c3"))]
 fn flush_pending_output() {
     let at = OUTPUT_AT_US.load(Ordering::Relaxed);
     if at == 0 {
@@ -138,7 +138,7 @@ fn flush_pending_output() {
 
 /// The next received byte, if any.
 pub fn read_byte() -> Option<u8> {
-    #[cfg(feature = "esp32s3")]
+    #[cfg(any(feature = "esp32s3", feature = "esp32c3"))]
     flush_pending_output();
     critical_section::with(|cs| RING.borrow_ref_mut(cs).pop())
 }
@@ -181,7 +181,7 @@ fn on_uart_rx() {
     });
 }
 
-#[cfg(feature = "esp32s3")]
+#[cfg(any(feature = "esp32s3", feature = "esp32c3"))]
 #[handler]
 fn on_usb_rx() {
     critical_section::with(|cs| {

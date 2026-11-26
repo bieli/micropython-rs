@@ -820,24 +820,38 @@ You pick the board with a **Cargo feature** and the script with **`SCRIPT=`**.
 | Any ESP32 board (DevKit, WROOM, WROVER, ...) | *(none, default)* | `make flash` | USB/UART serial monitor | `led_on()`, `led_off()` (GPIO2) |
 | LilyGO TTGO T-Display (ST7789 1.14" TFT) | `tft` | `make flash FEATURES=tft` | TFT screen **and** serial monitor | `cls`, `color`, `text`, `rect`, `backlight` |
 | ESP32-S3 boards, e.g. Seeed XIAO ESP32-S3 | `esp32s3` (chip) | `make flash CHIP=esp32s3` | the chip's own USB port (USB-Serial/JTAG) | `led_on()`, `led_off()` (GPIO21, the XIAO's user LED, lit when low) |
+| ESP32-C3 boards (RISC-V), e.g. ESP32-C3 Super Mini | `esp32c3` (chip) | `make flash CHIP=esp32c3` | the chip's own USB port (USB-Serial/JTAG) | `led_on()`, `led_off()` (GPIO8, the Super Mini's blue LED, lit when low) |
 
 All builds share every function in [Hardware API](#hardware-api). Run `help()` from a script to list what your build has.
 `FEATURES=wifi` and `LEVEL=...` work on every board (`make flash CHIP=esp32s3 FEATURES=wifi`).
 
-#### ESP32-S3 (`CHIP=esp32s3`)
+#### ESP32-S3 and ESP32-C3 (`CHIP=esp32s3`, `CHIP=esp32c3`)
 
-The chip is a Cargo feature (`esp32`, the default, or `esp32s3`) and a build target (`xtensa-esp32s3-none-elf`); the
-Makefile picks both from `CHIP`. What differs ([`src/chip.rs`](micropython-esp32/src/chip.rs)):
+The chip is a Cargo feature (`esp32`, the default, `esp32s3` or `esp32c3`) and a build target
+(`xtensa-esp32s3-none-elf`; the C3 is RISC-V: `riscv32imc-unknown-none-elf`, linked by rust-lld); the Makefile picks
+both from `CHIP`. What differs ([`src/chip.rs`](micropython-esp32/src/chip.rs)):
 
-| | ESP32 | ESP32-S3 (pins as on the XIAO ESP32-S3) |
-|-|-------|-----------------------------------------|
-| Console | UART0 through the board's USB-to-serial chip | The chip's own USB port (USB-Serial/JTAG); no other chip needed |
-| GPIO | 0-39; 34-39 input-only | 0-21, 26-48, all can be outputs; 19/20 are USB, 26-37 flash and PSRAM |
-| ADC (`adc_read`, `adc_mv`, `machine.ADC`) | GPIO34, 36, 39 | GPIO1, 2, 3 (the XIAO's A0-A2), calibrated by esp-hal from the chip's eFuse values |
-| I2C (default pins) | SDA 21, SCL 22 | SDA 5, SCL 6 (the XIAO's D4/D5) |
-| Script pins | see `GENERIC_PINS` | 0, 4, 7-18, 21, 38-48 (the XIAO's D3 = 4, D6/D7 = 43/44, D8-D10 = 7-9) |
-| Main stack | 181 KB, 102 KB with Wi-Fi | 195 KB, 141 KB with Wi-Fi (the driver's heap goes in `dram2`) |
-| App image | 380 KB, 882 KB with Wi-Fi | 396 KB, 808 KB with Wi-Fi |
+| | ESP32 | ESP32-S3 (pins as on the XIAO ESP32-S3) | ESP32-C3 (pins as on the ESP32-C3 Super Mini) |
+|-|-------|-----------------------------------------|-----------------------------------------------|
+| CPU | Xtensa, 2 cores, FPU | Xtensa, 2 cores, FPU | RISC-V, 1 core, no FPU (floats in software), 80 or 160 MHz |
+| Console | UART0 through the board's USB-to-serial chip | The chip's own USB port (USB-Serial/JTAG); no other chip needed | The same |
+| GPIO | 0-39; 34-39 input-only | 0-21, 26-48, all can be outputs; 19/20 are USB, 26-37 flash and PSRAM | 0-21; 11-17 flash, 18/19 USB |
+| ADC (`adc_read`, `adc_mv`, `machine.ADC`) | GPIO34, 36, 39 | GPIO1, 2, 3 (the XIAO's A0-A2), calibrated by esp-hal from the chip's eFuse values | GPIO0, 1, 3, calibrated the same way; full scale about 2.5 V |
+| I2C (default pins) | SDA 21, SCL 22 | SDA 5, SCL 6 (the XIAO's D4/D5) | SDA 6, SCL 7 (8 is the LED, 9 the BOOT button) |
+| Script pins | see `GENERIC_PINS` | 0, 4, 7-18, 21, 38-48 (the XIAO's D3 = 4, D6/D7 = 43/44, D8-D10 = 7-9) | 2, 4, 5, 8 (LED), 9 (BOOT, the `buttons` LEFT), 10, 20, 21 |
+| SPI (`spi_init`) | SPI3 | SPI3 | SPI2 (its only one for scripts) |
+| Main stack | 181 KB, 102 KB with Wi-Fi | 195 KB, 141 KB with Wi-Fi (the driver's heap goes in `dram2`) | 178 KB, 115 KB with Wi-Fi |
+| App image | 380 KB, 882 KB with Wi-Fi | 396 KB, 808 KB with Wi-Fi | 417 KB, 851 KB with Wi-Fi |
+
+The C3's core has no atomic instructions: the firmware's read-modify-write atomics go through `portable-atomic`, which
+esp-hal sets up for a single core. `make report` reads RISC-V stack frames too.
+
+Measured on an ESP32-C3 Super Mini (`CHIP=esp32c3 FEATURES=wifi`, 80 MHz): flashed and ran at the first try, with no
+buttons (it comes up as `303a:1001`); the REPL, `tools/mpy.py`, the LED, pins, pull-ups, `Pin.irq()` (5 edges, 5
+callbacks), `machine.Timer`, I2C, ADC; Wi-Fi with its small on-board antenna: 14 networks in 0.74 s, connected in 4.7
+s, NTP in 59 ms, the access point next to the station. Speed: a 20 000-pass loop in 3.3 s, the same as the S3 (1.5 s with
+`CPU_MHZ=160`, the C3's top speed); 2000 float operations in 0.44 s (software floats). Stack with Wi-Fi: 42.8 KB for a top-level statement, 6.6 KB per call
+(RISC-V frames are smaller), the worst case found 109 KB of the 115 KB.
 
 The first flash of a board that runs other firmware (Arduino, CircuitPython) needs its bootloader: hold BOOT (the
 XIAO's B button), press and release RESET (R), keep BOOT down a second more, then release it. The chip then shows up

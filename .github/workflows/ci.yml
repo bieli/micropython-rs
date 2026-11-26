@@ -100,6 +100,20 @@ jobs:
             chip: esp32s3
             features: wifi
             level: full
+          # ESP32-C3 (RISC-V; ESP32-C3 Super Mini): console on the chip's USB port
+          - board: ESP32-C3 Super Mini
+            id: c3-full
+            chip: esp32c3
+            target: riscv32imc-unknown-none-elf
+            features: ""
+            level: full
+          - board: ESP32-C3 Super Mini + Wi-Fi
+            id: c3-wifi
+            chip: esp32c3
+            target: riscv32imc-unknown-none-elf
+            features: wifi
+            level: full
+            min_stack: 96
 
     steps:
       - name: Checkout repository
@@ -122,7 +136,7 @@ jobs:
         working-directory: micropython-esp32
         shell: bash
         run: |
-          python3 tools/fw_report.py target/xtensa-${{ matrix.chip || 'esp32' }}-none-elf/release/micropython-esp32 \
+          python3 tools/fw_report.py target/${{ matrix.target || format('xtensa-{0}-none-elf', matrix.chip || 'esp32') }}/release/micropython-esp32 \
             --min-stack-kb ${{ matrix.min_stack || 128 }} --max-frame-kb 32 --markdown | tee -a "$GITHUB_STEP_SUMMARY"
 
   # Random scripts through the whole interpreter (fuzz/fuzz_targets/eval.rs):

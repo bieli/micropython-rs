@@ -12,6 +12,10 @@ fn check_xtensa_linker_available() {
     println!("cargo:rerun-if-env-changed=PATH");
 
     let target = std::env::var("TARGET").unwrap_or_default();
+    // RISC-V chips (ESP32-C3) link with rust-lld, which comes with Rust
+    if !target.starts_with("xtensa-") {
+        return;
+    }
     println!(
         "cargo:rerun-if-env-changed={}",
         cargo_linker_env_var(&target)
@@ -127,8 +131,17 @@ fn linker_be_nice() {
         std::process::exit(0);
     }
 
+    // Xtensa links through gcc (`-Wl,`), RISC-V with rust-lld directly
+    let prefix = if std::env::var("TARGET")
+        .unwrap_or_default()
+        .starts_with("xtensa-")
+    {
+        "-Wl,"
+    } else {
+        ""
+    };
     println!(
-        "cargo:rustc-link-arg=-Wl,--error-handling-script={}",
+        "cargo:rustc-link-arg={prefix}--error-handling-script={}",
         std::env::current_exe().unwrap().display()
     );
 }

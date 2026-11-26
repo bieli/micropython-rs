@@ -7,7 +7,9 @@
 //! MicroPython's soft IRQs (`hard=False`, its default). Event numbers: a pin
 //! is its GPIO number (0-39), timer `i` is `TIMER_EVENT + i`.
 
-use core::sync::atomic::{AtomicU32, Ordering};
+// portable-atomic: `fetch_or`/`fetch_and` also on the ESP32-C3 (no atomic
+// instructions; a critical section there, the native ones elsewhere)
+use portable_atomic::{AtomicU32, Ordering};
 
 use esp_hal::gpio::Event;
 
@@ -24,11 +26,15 @@ pub const TIMERS: usize = 8;
 pub fn gpio_interrupt() {
     let gpio = esp_hal::peripherals::GPIO::regs();
     let low = gpio.status().read().bits();
-    let high = gpio.status1().read().bits();
     gpio.status_w1tc().write(|w| unsafe { w.bits(low) });
-    gpio.status1_w1tc().write(|w| unsafe { w.bits(high) });
     PENDING[0].fetch_or(low, Ordering::Relaxed);
-    PENDING[1].fetch_or(high, Ordering::Relaxed);
+    // GPIO32 and up (the ESP32-C3 has GPIO0-21 only)
+    #[cfg(not(feature = "esp32c3"))]
+    {
+        let high = gpio.status1().read().bits();
+        gpio.status1_w1tc().write(|w| unsafe { w.bits(high) });
+        PENDING[1].fetch_or(high, Ordering::Relaxed);
+    }
 }
 
 /// MicroPython's `Pin.IRQ_RISING` (1), `IRQ_FALLING` (2), both (3).

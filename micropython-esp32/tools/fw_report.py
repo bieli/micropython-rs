@@ -67,6 +67,56 @@ def read_at(data, sections, address, n):
     return None
 
 
+def riscv_frame_size(data, sections, address):
+    """RISC-V (ESP32-C3): the stack pointer moves down in the prologue, by
+    `addi sp, sp, -N` (or the compressed `c.addi16sp`), and for frames over
+    2 KB by `sub sp, sp, rX` with rX built by `lui` (or `c.lui`) and `addi`
+    just before."""
+    code = read_at(data, sections, address, 96)
+    if not code:
+        return None
+    regs = {}
+    size = 0
+    i = 0
+    while i + 2 <= len(code):
+        half = code[i] | code[i + 1] << 8
+        if half & 3 != 3:                     # 16-bit (compressed)
+            if half & 0xef83 == 0x6101:       # c.addi16sp sp, nzimm
+                imm = ((half >> 12 & 1) << 9 | (half >> 6 & 1) << 4 | (half >> 5 & 1) << 6
+                       | (half >> 3 & 3) << 7 | (half >> 2 & 1) << 5)
+                if imm & 0x200:
+                    size += 0x400 - imm
+            elif half & 0xe003 == 0x0001 and (half >> 7 & 31) == 2:   # c.addi sp, imm
+                imm = (half >> 12 & 1) << 5 | (half >> 2 & 31)
+                if imm & 0x20:
+                    size += 0x40 - imm
+            elif half & 0xe003 == 0x6001 and (half >> 7 & 31) not in (0, 2):   # c.lui rd, imm
+                imm = (half >> 12 & 1) << 5 | (half >> 2 & 31)
+                regs[half >> 7 & 31] = (imm - 64 if imm & 0x20 else imm) << 12
+            elif half & 0x6003 == 0x2001:     # c.jal / c.j: the prologue is over
+                break
+            i += 2
+            continue
+        if i + 4 > len(code):
+            break
+        word = struct.unpack_from('<I', code, i)[0]
+        op, rd, f3, rs1 = word & 0x7f, word >> 7 & 31, word >> 12 & 7, word >> 15 & 31
+        imm12 = (word >> 20) - (1 << 12 if word >> 31 else 0)
+        if op == 0x13 and f3 == 0 and rd == 2 and rs1 == 2:          # addi sp, sp, imm
+            if imm12 < 0:
+                size -= imm12
+        elif op == 0x37:                                              # lui rd, imm
+            regs[rd] = (word & 0xfffff000) - (1 << 32 if word >> 31 else 0)
+        elif op == 0x13 and f3 == 0 and rs1 in regs:                  # addi rd, rs1, imm
+            regs[rd] = regs[rs1] + imm12
+        elif word & 0xfe0fffff == 0x40010133 and (word >> 20 & 31) in regs:   # sub sp, sp, rX
+            size += regs[word >> 20 & 31]
+        elif op == 0x67 or op == 0x6f:                                # jalr / jal: prologue over
+            break
+        i += 4
+    return size or None
+
+
 def frame_size(data, sections, address):
     """Bytes of stack the function at `address` takes.
 
@@ -142,6 +192,22 @@ def demangle(names):
     return [v0_names(n) if n.startswith('_R') else n for n in out]
 
 
+def region_c3(addr):
+    # ESP32-C3: flash code and data through the cache, IRAM and DRAM views of
+    # the same internal SRAM, dram2 (what the bootloader leaves) above DRAM
+    if 0x42000000 <= addr < 0x42800000:
+        return 'flash code'
+    if 0x3c000000 <= addr < 0x3c800000:
+        return 'flash data'
+    if 0x4037c000 <= addr < 0x403e0000:
+        return 'IRAM'
+    if 0x3fcce400 <= addr < 0x3fcde710:
+        return 'dram2'
+    if 0x3fc80000 <= addr < 0x3fce0000:
+        return 'DRAM'
+    return None
+
+
 def region(addr):
     # ESP32-S3 (its address ranges don't overlap the ESP32's): flash code and
     # data through the cache, IRAM and DRAM views of the same internal SRAM
@@ -180,12 +246,15 @@ def main():
     args = ap.parse_args()
 
     data, sections, symbols, functions = read_elf(args.elf)
+    riscv = struct.unpack_from('<H', data, 0x12)[0] == 243    # e_machine: EM_RISCV
+    region_of = region_c3 if riscv else region
+    frame_of = riscv_frame_size if riscv else frame_size
     regions = {}
     flash_image = 0
     for s in sections:
         if s['size'] == 0 or s['name'] in ('.stack',) or not s['addr']:
             continue
-        r = region(s['addr'])
+        r = region_of(s['addr'])
         if r:
             regions[r] = regions.get(r, 0) + s['size']
             if s['type'] != SHT_NOBITS:
@@ -194,7 +263,7 @@ def main():
 
     frames = []
     for name, addr, size in functions:
-        n = frame_size(data, sections, addr & ~1)
+        n = frame_of(data, sections, addr & ~1)
         if n:
             frames.append((n, name))
     frames.sort(reverse=True)

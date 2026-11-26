@@ -66,6 +66,9 @@ static AP_STATIONS: Mutex<RefCell<[Option<[u8; 6]>; MAX_AP_CLIENTS]>> =
 pub struct WifiParts {
     pub wifi: WIFI<'static>,
     pub timg1: TIMG1<'static>,
+    /// RISC-V (ESP32-C3): the scheduler switches tasks with software interrupt 0
+    #[cfg(feature = "esp32c3")]
+    pub sw_int0: esp_hal::interrupt::software::SoftwareInterrupt<'static, 0>,
 }
 
 /// One network interface: the radio's side and smoltcp's.
@@ -135,7 +138,11 @@ impl Wifi {
     pub fn start(parts: WifiParts) -> Result<Self, Error> {
         // The radio driver's tasks run on esp-rtos (TIMG0 is esp-hal's clock)
         let timg1 = TimerGroup::new(parts.timg1);
-        esp_rtos::start(timg1.timer0);
+        esp_rtos::start(
+            timg1.timer0,
+            #[cfg(feature = "esp32c3")]
+            parts.sw_int0,
+        );
         let radio = esp_radio::init().map_err(io)?;
         // The driver borrows its controller for as long as Wi-Fi runs
         let radio: &'static _ = Box::leak(Box::new(radio));
