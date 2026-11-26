@@ -1,4 +1,6 @@
-//! Keyboard input from the USB serial port (UART0 RX, GPIO3).
+//! Keyboard input from the USB serial port: UART0 RX (GPIO3) on the ESP32,
+//! whose boards have a USB-to-UART chip; the chip's own USB port
+//! (USB-Serial/JTAG) on the ESP32-S3.
 //!
 //! An RX interrupt moves incoming bytes into a ring buffer, so nothing is
 //! lost while a script runs, and sets [`crate::ABORT`] when Ctrl-C arrives.
@@ -11,11 +13,13 @@ use core::cell::RefCell;
 use core::sync::atomic::Ordering;
 
 use critical_section::Mutex;
+use esp_hal::{handler, Blocking};
+#[cfg(feature = "esp32s3")]
+use esp_hal::{peripherals::USB_DEVICE, usb_serial_jtag::UsbSerialJtag};
+#[cfg(feature = "esp32")]
 use esp_hal::{
-    handler,
     peripherals::{GPIO3, UART0},
     uart::{Config, RxConfig, Uart, UartInterrupt},
-    Blocking,
 };
 
 /// Ctrl-C
@@ -49,7 +53,11 @@ impl Ring {
     }
 }
 
+#[cfg(feature = "esp32")]
 static UART: Mutex<RefCell<Option<Uart<'static, Blocking>>>> = Mutex::new(RefCell::new(None));
+#[cfg(feature = "esp32s3")]
+static USB: Mutex<RefCell<Option<UsbSerialJtag<'static, Blocking>>>> =
+    Mutex::new(RefCell::new(None));
 static RING: Mutex<RefCell<Ring>> = Mutex::new(RefCell::new(Ring {
     buf: [0; RING_SIZE],
     head: 0,
@@ -57,6 +65,7 @@ static RING: Mutex<RefCell<Ring>> = Mutex::new(RefCell::new(Ring {
 }));
 
 /// Starts receiving on UART0. Call once at boot.
+#[cfg(feature = "esp32")]
 pub fn init(uart0: UART0<'static>, rx: GPIO3<'static>) {
     let config = Config::default().with_rx(RxConfig::default().with_fifo_full_threshold(32));
     let mut uart = Uart::new(uart0, config).unwrap().with_rx(rx);
@@ -65,6 +74,28 @@ pub fn init(uart0: UART0<'static>, rx: GPIO3<'static>) {
         uart.listen(UartInterrupt::RxFifoFull | UartInterrupt::RxTimeout);
         UART.borrow_ref_mut(cs).replace(uart);
     });
+}
+
+/// Starts receiving on the USB-Serial/JTAG port. Call once at boot. Output
+/// keeps going through `esp_println`, which writes to the same port.
+#[cfg(feature = "esp32s3")]
+pub fn init(usb: USB_DEVICE<'static>) {
+    let mut usb = UsbSerialJtag::new(usb);
+    usb.set_interrupt_handler(on_usb_rx);
+    critical_section::with(|cs| {
+        usb.listen_rx_packet_recv_interrupt();
+        USB.borrow_ref_mut(cs).replace(usb);
+    });
+}
+
+/// Queues received bytes; Ctrl-C also sets the abort flag.
+fn received(ring: &mut Ring, bytes: &[u8]) {
+    for &byte in bytes {
+        if byte == CTRL_C {
+            crate::ABORT.store(true, Ordering::Relaxed);
+        }
+        ring.push(byte);
+    }
 }
 
 /// The next received byte, if any.
@@ -93,6 +124,7 @@ pub fn wait_byte() -> u8 {
     }
 }
 
+#[cfg(feature = "esp32")]
 #[handler]
 fn on_uart_rx() {
     critical_section::with(|cs| {
@@ -103,13 +135,24 @@ fn on_uart_rx() {
         let mut ring = RING.borrow_ref_mut(cs);
         let mut buf = [0u8; 64];
         while let Ok(n @ 1..) = uart.read_buffered(&mut buf) {
-            for &byte in &buf[..n] {
-                if byte == CTRL_C {
-                    crate::ABORT.store(true, Ordering::Relaxed);
-                }
-                ring.push(byte);
-            }
+            received(&mut ring, &buf[..n]);
         }
         uart.clear_interrupts(UartInterrupt::RxFifoFull | UartInterrupt::RxTimeout);
+    });
+}
+
+#[cfg(feature = "esp32s3")]
+#[handler]
+fn on_usb_rx() {
+    critical_section::with(|cs| {
+        let mut usb = USB.borrow_ref_mut(cs);
+        let Some(usb) = usb.as_mut() else {
+            return;
+        };
+        let mut ring = RING.borrow_ref_mut(cs);
+        while let Ok(byte) = usb.read_byte() {
+            received(&mut ring, &[byte]);
+        }
+        usb.reset_rx_packet_recv_interrupt();
     });
 }

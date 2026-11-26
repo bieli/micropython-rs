@@ -40,13 +40,28 @@ macro_rules! board_peripherals {
             #[cfg(feature = "wifi")]
             timg1: $p.TIMG1,
             adc1: $p.ADC1,
-            gpio34: $p.GPIO34,
-            gpio36: $p.GPIO36,
-            gpio39: $p.GPIO39,
+            #[cfg(feature = "esp32")]
+            adc_a: $p.GPIO34,
+            #[cfg(feature = "esp32")]
+            adc_b: $p.GPIO36,
+            #[cfg(feature = "esp32")]
+            adc_c: $p.GPIO39,
+            #[cfg(feature = "esp32s3")]
+            adc_a: $p.GPIO1,
+            #[cfg(feature = "esp32s3")]
+            adc_b: $p.GPIO2,
+            #[cfg(feature = "esp32s3")]
+            adc_c: $p.GPIO3,
             ledc: $p.LEDC,
             i2c0: $p.I2C0,
+            #[cfg(feature = "esp32")]
             sda: $p.GPIO21,
+            #[cfg(feature = "esp32")]
             scl: $p.GPIO22,
+            #[cfg(feature = "esp32s3")]
+            sda: $p.GPIO5,
+            #[cfg(feature = "esp32s3")]
+            scl: $p.GPIO6,
             lpwr: $p.LPWR,
         }
     };
@@ -58,18 +73,38 @@ macro_rules! board_peripherals {
 
 /// Pins scripts may use: everything except flash (6-11), UART0 (1, 3),
 /// I2C (21, 22) and the ADC inputs (34, 36, 39).
-#[cfg(not(feature = "tft"))]
+#[cfg(all(feature = "esp32", not(feature = "tft")))]
 const GENERIC_PINS: &[u8] = &[
     0, 2, 4, 5, 12, 13, 14, 15, 16, 17, 18, 19, 23, 25, 26, 27, 32, 33, 35,
 ];
 
-/// Most ESP32 DevKit boards wire the onboard LED to GPIO2.
-#[cfg(not(feature = "tft"))]
-const LED_PIN: i64 = 2;
+/// ESP32-S3: everything except the ADC inputs (1-3), I2C (5, 6), USB (19,
+/// 20) and the flash and PSRAM pins (26-37, octal PSRAM as on the XIAO's
+/// module). The XIAO ESP32-S3's header: D0-D2 = GPIO1-3 (ADC), D3 = 4,
+/// D4/D5 = 5/6 (I2C), D6/D7 = 43/44, D8-D10 = 7-9; its LED is GPIO21.
+#[cfg(feature = "esp32s3")]
+const GENERIC_PINS: &[u8] = &[
+    0, 4, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 21, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47,
+    48,
+];
 
+/// Most ESP32 DevKit boards wire the onboard LED to GPIO2; the XIAO ESP32-S3's
+/// user LED is GPIO21, lit when the pin is low.
+#[cfg(all(feature = "esp32", not(feature = "tft")))]
+const LED_PIN: i64 = 2;
+#[cfg(feature = "esp32s3")]
+const LED_PIN: i64 = 21;
 #[cfg(not(feature = "tft"))]
+const LED_ON_LEVEL: i64 = if cfg!(feature = "esp32s3") { 0 } else { 1 };
+
+#[cfg(all(feature = "esp32", not(feature = "tft")))]
 const GENERIC_FNS: &[HwFn] = micropython_esp32::board_functions!(
     HwFn::new("led_on", "", "Onboard LED on (GPIO2)"),
+    HwFn::new("led_off", "", "Onboard LED off"),
+);
+#[cfg(feature = "esp32s3")]
+const GENERIC_FNS: &[HwFn] = micropython_esp32::board_functions!(
+    HwFn::new("led_on", "", "Onboard LED on (GPIO21 on the XIAO ESP32-S3)"),
     HwFn::new("led_off", "", "Onboard LED off"),
 );
 
@@ -89,10 +124,11 @@ impl HardwareBridge for GenericHardware<'_> {
         match name {
             "led_on" => self
                 .board
-                .call("pin_write", &[Arg::Int(LED_PIN), Arg::Int(1)]),
-            "led_off" => self
-                .board
-                .call("pin_write", &[Arg::Int(LED_PIN), Arg::Int(0)]),
+                .call("pin_write", &[Arg::Int(LED_PIN), Arg::Int(LED_ON_LEVEL)]),
+            "led_off" => self.board.call(
+                "pin_write",
+                &[Arg::Int(LED_PIN), Arg::Int(1 - LED_ON_LEVEL)],
+            ),
             _ => self.board.call(name, args),
         }
     }
@@ -154,7 +190,10 @@ fn main() -> ! {
     #[cfg(feature = "wifi")]
     wifi_heap();
     // Set up serial input first: it resets UART0, which drops unsent output
+    #[cfg(feature = "esp32")]
     serial_input::init(peripherals.UART0, peripherals.GPIO3);
+    #[cfg(feature = "esp32s3")]
+    serial_input::init(peripherals.USB_DEVICE);
     print_reset_reason();
     // Shared by the REPL's file commands and the scripts (`open()`, `os`)
     let files = storage::mount(peripherals.FLASH).map(core::cell::RefCell::new);
@@ -394,8 +433,15 @@ const BOOT_SCRIPT: BootScript = BootScript {
 /// second data RAM region (what the REPL's buffers leave of it) and 56 KB of
 /// the main data RAM, which the stack gives up. With the station and the
 /// access point busy, the driver used up to about 60 KB.
-#[cfg(feature = "wifi")]
+#[cfg(all(feature = "wifi", feature = "esp32"))]
 fn wifi_heap() {
     esp_alloc::heap_allocator!(#[link_section = ".dram2_uninit"] size: 16 * 1024);
     esp_alloc::heap_allocator!(size: 56 * 1024);
+}
+
+/// ESP32-S3: all 72 KB in `dram2` (72.0 KB there; the REPL's buffers use
+/// the main data RAM on this chip), so the stack keeps its size.
+#[cfg(all(feature = "wifi", feature = "esp32s3"))]
+fn wifi_heap() {
+    esp_alloc::heap_allocator!(#[link_section = ".dram2_uninit"] size: 72 * 1024);
 }

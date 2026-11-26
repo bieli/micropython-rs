@@ -1,6 +1,9 @@
 # Docker and target configuration
 DOCKER_IMAGE := espressif/idf-rust:esp32_latest
-TARGET       := xtensa-esp32-none-elf
+# The chip: esp32 (default: DevKits, TTGO T-Display) or esp32s3 (e.g. Seeed XIAO
+# ESP32-S3, console on the chip's USB port)
+CHIP         ?= esp32
+TARGET       := xtensa-$(CHIP)-none-elf
 BIN_NAME     := micropython-esp32
 ELF_PATH     := target/$(TARGET)/release/$(BIN_NAME)
 
@@ -22,7 +25,7 @@ LEVEL        ?= full
 # MicroPython's ESP32 port; computed by the FPU)
 FLOAT        ?= 64
 comma        := ,
-FEATURES_FLAG := --no-default-features --features $(LEVEL)$(if $(FEATURES),$(comma)$(FEATURES))$(if $(filter 32,$(FLOAT)),$(comma)float32)
+FEATURES_FLAG := --target $(TARGET) --no-default-features --features $(CHIP),$(LEVEL)$(if $(FEATURES),$(comma)$(FEATURES))$(if $(filter 32,$(FLOAT)),$(comma)float32)
 
 # Optional Python script to embed (e.g., make flash SCRIPT=scripts/blink.py), relative to this
 # directory; leave empty for the board's demo (scripts/demo.py or scripts/ttgo_demo.py)

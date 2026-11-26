@@ -143,6 +143,19 @@ def demangle(names):
 
 
 def region(addr):
+    # ESP32-S3 (its address ranges don't overlap the ESP32's): flash code and
+    # data through the cache, IRAM and DRAM views of the same internal SRAM
+    if 0x42000000 <= addr < 0x44000000:
+        return 'flash code'
+    if 0x3c000000 <= addr < 0x3e000000:
+        return 'flash data'
+    if 0x40370000 <= addr < 0x403e0000:
+        return 'IRAM'
+    if 0x3fcdb700 <= addr < 0x3fced710:
+        return 'dram2'
+    if 0x3fc88000 <= addr < 0x3fd00000:
+        return 'DRAM'
+    # ESP32
     if 0x400d0000 <= addr < 0x40400000:
         return 'flash code'
     if 0x3f400000 <= addr < 0x3f800000:

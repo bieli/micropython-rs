@@ -819,8 +819,30 @@ You pick the board with a **Cargo feature** and the script with **`SCRIPT=`**.
 |-------|---------------|--------------|--------------------------|-----------------|
 | Any ESP32 board (DevKit, WROOM, WROVER, ...) | *(none, default)* | `make flash` | USB/UART serial monitor | `led_on()`, `led_off()` (GPIO2) |
 | LilyGO TTGO T-Display (ST7789 1.14" TFT) | `tft` | `make flash FEATURES=tft` | TFT screen **and** serial monitor | `cls`, `color`, `text`, `rect`, `backlight` |
+| ESP32-S3 boards, e.g. Seeed XIAO ESP32-S3 | `esp32s3` (chip) | `make flash CHIP=esp32s3` | the chip's own USB port (USB-Serial/JTAG) | `led_on()`, `led_off()` (GPIO21, the XIAO's user LED, lit when low) |
 
-Both builds share every function in [Hardware API](#hardware-api). Run `help()` from a script to list what your build has.
+All builds share every function in [Hardware API](#hardware-api). Run `help()` from a script to list what your build has.
+`FEATURES=wifi` and `LEVEL=...` work on every board (`make flash CHIP=esp32s3 FEATURES=wifi`).
+
+#### ESP32-S3 (`CHIP=esp32s3`)
+
+The chip is a Cargo feature (`esp32`, the default, or `esp32s3`) and a build target (`xtensa-esp32s3-none-elf`); the
+Makefile picks both from `CHIP`. What differs ([`src/chip.rs`](micropython-esp32/src/chip.rs)):
+
+| | ESP32 | ESP32-S3 (pins as on the XIAO ESP32-S3) |
+|-|-------|-----------------------------------------|
+| Console | UART0 through the board's USB-to-serial chip | The chip's own USB port (USB-Serial/JTAG); no other chip needed |
+| GPIO | 0-39; 34-39 input-only | 0-21, 26-48, all can be outputs; 19/20 are USB, 26-37 flash and PSRAM |
+| ADC (`adc_read`, `adc_mv`, `machine.ADC`) | GPIO34, 36, 39 | GPIO1, 2, 3 (the XIAO's A0-A2), calibrated by esp-hal from the chip's eFuse values |
+| I2C (default pins) | SDA 21, SCL 22 | SDA 5, SCL 6 (the XIAO's D4/D5) |
+| Script pins | see `GENERIC_PINS` | 0, 4, 7-18, 21, 38-48 (the XIAO's D3 = 4, D6/D7 = 43/44, D8-D10 = 7-9) |
+| Main stack | 181 KB, 102 KB with Wi-Fi | 195 KB, 141 KB with Wi-Fi (the driver's heap goes in `dram2`) |
+| App image | 380 KB, 882 KB with Wi-Fi | 396 KB, 808 KB with Wi-Fi |
+
+The first flash of a board that runs other firmware (Arduino, CircuitPython) needs its bootloader: hold BOOT (the
+XIAO's B button), press and release RESET (R), keep BOOT down a second more, then release it. The chip then shows up
+as `303a:1001` (`lsusb`) and `make flash CHIP=esp32s3` works; after that, espflash resets it over USB by itself. Not
+there yet on the S3: the PSRAM (8 MB on the XIAO), its second core, and the TTGO's display build.
 
 > [!IMPORTANT]
 > On a TTGO T-Display, build with `FEATURES=tft`. The default build doesn't start the display or its backlight, so the screen stays dark.

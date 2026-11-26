@@ -17,7 +17,7 @@ use esp_hal::{
         timer::{self, TimerIFace},
         LSGlobalClkSource, Ledc, LowSpeed,
     },
-    peripherals::{ADC1, GPIO21, GPIO22, GPIO34, GPIO36, GPIO39, I2C0, LEDC, LPWR},
+    peripherals::{ADC1, I2C0, LEDC, LPWR},
     rtc_cntl::{Rtc, RwdtStage, RwdtStageAction, SocResetReason},
     spi::{
         master::{Config as SpiConfig, Spi},
@@ -28,6 +28,8 @@ use esp_hal::{
     Blocking,
 };
 use micropython_rs::{Arg, Error, HwFn, Module};
+
+use crate::chip;
 
 /// Pin modes for `pin_mode(pin, mode)`; also exported as script constants.
 pub const OUT: i64 = 1;
@@ -87,12 +89,10 @@ pub const TIME_MODULE: Module = Module {
 /// since then: MicroPython's ESP32 epoch is 2000, not 1970.
 const CLOCK_AT_BOOT_US: i64 = 0;
 
-/// Pins wired to the ADC: the input-only GPIO34/36/39, so analog inputs
-/// never collide with digital outputs.
-pub const ADC_PINS: [u8; 3] = [34, 36, 39];
-/// I2C bus pins (the ESP32 defaults).
-pub const I2C_SDA: u8 = 21;
-pub const I2C_SCL: u8 = 22;
+/// Pins wired to the ADC (ESP32: the input-only GPIO34/36/39, so analog
+/// inputs never collide with digital outputs; ESP32-S3: GPIO1-3), and the
+/// default I2C bus pins: see `chip`.
+pub use crate::chip::{ADC_PINS, I2C_SCL, I2C_SDA};
 
 /// Number of PWM outputs that can run at the same time (one LEDC timer each,
 /// so every output can have its own frequency).
@@ -115,7 +115,7 @@ macro_rules! board_functions {
             micropython_rs::HwFn::new("pin_write", "pin, value", "Set an output pin to 0 or 1"),
             micropython_rs::HwFn::new("pin_read", "pin", "Read a pin: 0 or 1"),
             micropython_rs::HwFn::new("pin_toggle", "pin", "Invert an output pin"),
-            micropython_rs::HwFn::new("adc_read", "pin", "Raw 12-bit ADC value (pins 34, 36, 39)"),
+            micropython_rs::HwFn::new("adc_read", "pin", "Raw 12-bit ADC value (ESP32: pins 34, 36, 39; ESP32-S3: 1, 2, 3)"),
             micropython_rs::HwFn::with_args("adc_mv", 1, 2, "pin, [samples]", "Calibrated millivolts, averaged (default 16 samples)"),
             micropython_rs::HwFn::new("adc_vref", "", "ADC reference voltage from eFuse, mV"),
             micropython_rs::HwFn::new("pwm", "pin, freq, duty", "PWM output, duty in percent (0-100)"),
@@ -216,13 +216,14 @@ pub struct BoardPeripherals<'d> {
     #[cfg(feature = "wifi")]
     pub timg1: esp_hal::peripherals::TIMG1<'static>,
     pub adc1: ADC1<'d>,
-    pub gpio34: GPIO34<'d>,
-    pub gpio36: GPIO36<'d>,
-    pub gpio39: GPIO39<'d>,
+    /// The ADC inputs, `ADC_PINS` (ESP32: GPIO34/36/39, ESP32-S3: GPIO1-3)
+    pub adc_a: chip::AdcA<'d>,
+    pub adc_b: chip::AdcB<'d>,
+    pub adc_c: chip::AdcC<'d>,
     pub ledc: LEDC<'d>,
     pub i2c0: I2C0<'d>,
-    pub sda: GPIO21<'d>,
-    pub scl: GPIO22<'d>,
+    pub sda: chip::Sda<'d>,
+    pub scl: chip::Scl<'d>,
     pub lpwr: LPWR<'d>,
 }
 
@@ -236,11 +237,11 @@ pub struct Board<'d> {
     delay: Delay,
     /// Pins scripts may use.
     allowed: &'static [u8],
-    pins: [Option<(Flex<'d>, PinMode)>; 40],
+    pins: [Option<(Flex<'d>, PinMode)>; chip::GPIO_COUNT],
     adc: Adc<'d, ADC1<'d>, Blocking>,
-    adc34: AdcPin<GPIO34<'d>, ADC1<'d>>,
-    adc36: AdcPin<GPIO36<'d>, ADC1<'d>>,
-    adc39: AdcPin<GPIO39<'d>, ADC1<'d>>,
+    adc_a: AdcPin<chip::AdcA<'d>, ADC1<'d>, chip::AdcCal<'d>>,
+    adc_b: AdcPin<chip::AdcB<'d>, ADC1<'d>, chip::AdcCal<'d>>,
+    adc_c: AdcPin<chip::AdcC<'d>, ADC1<'d>, chip::AdcCal<'d>>,
     ledc: Ledc<'d>,
     pwm_pins: [Option<u8>; PWM_SLOTS],
     /// The I2C bus (`None` only while `i2c_init` replaces it).
@@ -266,13 +267,24 @@ impl<'d> Board<'d> {
     /// `allowed` lists the GPIO numbers scripts may use with `pin_*` and `pwm`.
     pub fn new(p: BoardPeripherals<'d>, allowed: &'static [u8]) -> Self {
         let mut adc_config = AdcConfig::new();
-        let adc34 = adc_config.enable_pin(p.gpio34, Attenuation::_11dB);
-        let adc36 = adc_config.enable_pin(p.gpio36, Attenuation::_11dB);
-        let adc39 = adc_config.enable_pin(p.gpio39, Attenuation::_11dB);
+        // ESP32-S3: calibrated with the chip's eFuse values (`chip::AdcCal`)
+        #[cfg(feature = "esp32s3")]
+        let (adc_a, adc_b, adc_c) = (
+            adc_config.enable_pin_with_cal(p.adc_a, Attenuation::_11dB),
+            adc_config.enable_pin_with_cal(p.adc_b, Attenuation::_11dB),
+            adc_config.enable_pin_with_cal(p.adc_c, Attenuation::_11dB),
+        );
+        #[cfg(feature = "esp32")]
+        let (adc_a, adc_b, adc_c) = (
+            adc_config.enable_pin(p.adc_a, Attenuation::_11dB),
+            adc_config.enable_pin(p.adc_b, Attenuation::_11dB),
+            adc_config.enable_pin(p.adc_c, Attenuation::_11dB),
+        );
         let adc = Adc::new(p.adc1, adc_config);
         // esp-hal 1.0 bug workaround: on the ESP32, ADC1 results from the RTC
         // controller come out inverted (4095 - value) unless SAR1_DATA_INV is
         // set, like ESP-IDF does. `Adc::new` only sets the ADC2 bit.
+        #[cfg(feature = "esp32")]
         esp_hal::peripherals::SENS::regs()
             .sar_read_ctrl()
             .modify(|_, w| w.sar1_data_inv().set_bit());
@@ -291,11 +303,11 @@ impl<'d> Board<'d> {
         Self {
             delay: Delay::new(),
             allowed,
-            pins: [const { None }; 40],
+            pins: [const { None }; chip::GPIO_COUNT],
             adc,
-            adc34,
-            adc36,
-            adc39,
+            adc_a,
+            adc_b,
+            adc_c,
             ledc,
             pwm_pins: [None; PWM_SLOTS],
             i2c: Some(i2c),
@@ -940,7 +952,7 @@ impl<'d> Board<'d> {
         let pull = match mode {
             OUT | OUT_OD | OUT_OD_PULLUP => {
                 // GPIO34-39 are input-only on the ESP32
-                if pin >= 34 {
+                if !chip::can_output(pin) {
                     return Err(Error::ValueError);
                 }
                 let config = match mode {
@@ -993,35 +1005,54 @@ impl<'d> Board<'d> {
         Ok(&mut self.pins[pin as usize].as_mut().unwrap().0)
     }
 
-    fn adc_read(&mut self, pin: i64) -> Result<i64, Error> {
+    /// One reading as the ADC gives it: a raw 12-bit value on the ESP32,
+    /// calibrated millivolts on the ESP32-S3 (`chip::ADC_READS_MV`).
+    fn adc_sample(&mut self, pin: i64) -> Result<i64, Error> {
         let value = match pin {
-            34 => nb::block!(self.adc.read_oneshot(&mut self.adc34)),
-            36 => nb::block!(self.adc.read_oneshot(&mut self.adc36)),
-            39 => nb::block!(self.adc.read_oneshot(&mut self.adc39)),
+            p if p == ADC_PINS[0] as i64 => nb::block!(self.adc.read_oneshot(&mut self.adc_a)),
+            p if p == ADC_PINS[1] as i64 => nb::block!(self.adc.read_oneshot(&mut self.adc_b)),
+            p if p == ADC_PINS[2] as i64 => nb::block!(self.adc.read_oneshot(&mut self.adc_c)),
             _ => return Err(Error::ValueError),
         };
         value.map(i64::from).map_err(|_| Error::IoError)
     }
 
-    /// Average of `samples` readings, converted to millivolts with the chip's
-    /// eFuse reference voltage (see `raw_to_mv`).
+    /// A raw 12-bit reading (0-4095). On the ESP32-S3 it comes from the
+    /// calibrated millivolts, scaled to the 11 dB range.
+    fn adc_read(&mut self, pin: i64) -> Result<i64, Error> {
+        let value = self.adc_sample(pin)?;
+        if chip::ADC_READS_MV {
+            return Ok((value * 4095 / chip::ADC_FULL_SCALE_MV).clamp(0, 4095));
+        }
+        Ok(value)
+    }
+
+    /// Average of `samples` readings in millivolts: converted with the
+    /// chip's eFuse reference voltage on the ESP32 (see `raw_to_mv`), by
+    /// esp-hal's calibration on the ESP32-S3.
     pub fn adc_mv(&mut self, pin: i64, samples: i64) -> Result<i64, Error> {
         if !(1..=MAX_ADC_SAMPLES).contains(&samples) {
             return Err(Error::ValueError);
         }
         let mut total = 0;
         for _ in 0..samples {
-            total += self.adc_read(pin)?;
+            total += self.adc_sample(pin)?;
         }
         // Round to the nearest raw value before converting
-        let raw = (total + samples / 2) / samples;
-        Ok(raw_to_mv(raw as u32, adc_vref_mv()) as i64)
+        let value = (total + samples / 2) / samples;
+        if chip::ADC_READS_MV {
+            return Ok(value);
+        }
+        Ok(raw_to_mv(value as u32, adc_vref_mv()) as i64)
     }
 
     /// PWM on `pin` with `duty` as a 16-bit fraction (0 = off, 65535 = on).
     fn pwm(&mut self, pin: u8, freq: i64, duty: i64) -> Result<(), Error> {
         self.check_allowed(pin)?;
-        if pin >= 34 || !(1..=40_000_000).contains(&freq) || !(0..=65535).contains(&duty) {
+        if !chip::can_output(pin)
+            || !(1..=40_000_000).contains(&freq)
+            || !(0..=65535).contains(&duty)
+        {
             return Err(Error::ValueError);
         }
         let slot = match self.pwm_pins.iter().position(|&p| p == Some(pin)) {
@@ -1133,6 +1164,12 @@ const MAX_ADC_SAMPLES: i64 = 1024;
 /// The ADC reference voltage of this chip in mV, from eFuse. The factory
 /// stores the deviation from 1100 mV in 7 mV steps (sign-magnitude, 5 bits);
 /// chips without it read as 0 deviation, i.e. 1100 mV.
+#[cfg(feature = "esp32s3")]
+pub fn adc_vref_mv() -> u32 {
+    1100 // the nominal value: the S3's calibration is per attenuation (esp-hal applies it)
+}
+
+#[cfg(feature = "esp32")]
 pub fn adc_vref_mv() -> u32 {
     let bits: u8 = esp_hal::efuse::Efuse::read_field_le(esp_hal::efuse::ADC_VREF);
     let magnitude = (bits & 0x0F) as i32;
@@ -1161,8 +1198,18 @@ pub fn reset_cause() -> i64 {
     use SocResetReason::*;
     match esp_hal::system::reset_reason() {
         Some(ChipPowerOn | SysBrownOut) => PWRON_RESET,
+        #[cfg(feature = "esp32")]
         Some(CoreMwdt0 | CoreMwdt1 | CoreRtcWdt | CpuMwdt0 | Cpu0RtcWdt | SysRtcWdt) => WDT_RESET,
+        #[cfg(feature = "esp32")]
         Some(CoreSw | Cpu0Sw) => SOFT_RESET,
+        #[cfg(feature = "esp32s3")]
+        Some(
+            CoreMwdt0 | CoreMwdt1 | CoreRtcWdt | CpuMwdt0 | CpuMwdt1 | CpuRtcWdt | SysRtcWdt
+            | SysSuperWdt,
+        ) => WDT_RESET,
+        // The chip's USB port resets it too (espflash, the USB-Serial/JTAG)
+        #[cfg(feature = "esp32s3")]
+        Some(CoreSw | CpuSw | CoreUsbUart | CoreUsbJtag) => SOFT_RESET,
         Some(CoreDeepSleep) => DEEPSLEEP_RESET,
         _ => HARD_RESET,
     }
@@ -1198,7 +1245,7 @@ fn non_negative(n: i64) -> Result<i64, Error> {
 fn pin_number(n: i64) -> Result<u8, Error> {
     u8::try_from(n)
         .ok()
-        .filter(|&p| p < 40)
+        .filter(|&p| (p as usize) < chip::GPIO_COUNT && chip::gpio_exists(p))
         .ok_or(Error::ValueError)
 }
 

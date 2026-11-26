@@ -64,7 +64,7 @@ jobs:
   # stack shrinks below 128 KB or one function takes over 32 KB of it (the
   # board-only problems of Phase 5 would have failed both)
   firmware:
-    name: ESP32 firmware (${{ matrix.board }}, ${{ matrix.level }}), size and stack report
+    name: Firmware (${{ matrix.board }}, ${{ matrix.level }}), size and stack report
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -89,6 +89,17 @@ jobs:
             features: tft,wifi
             level: full
             min_stack: 96
+          # ESP32-S3 (Seeed XIAO ESP32-S3): console on the chip's USB port
+          - board: XIAO ESP32-S3
+            id: s3-full
+            chip: esp32s3
+            features: ""
+            level: full
+          - board: XIAO ESP32-S3 + Wi-Fi
+            id: s3-wifi
+            chip: esp32s3
+            features: wifi
+            level: full
 
     steps:
       - name: Checkout repository
@@ -104,14 +115,14 @@ jobs:
       - name: Build the firmware
         working-directory: micropython-esp32
         run: >
-          make build FEATURES=${{ matrix.features }} LEVEL=${{ matrix.level }}
+          make build CHIP=${{ matrix.chip || 'esp32' }} FEATURES=${{ matrix.features }} LEVEL=${{ matrix.level }}
           DOCKER_FLAGS="--user root -e RUSTUP_HOME=/home/esp/.rustup -e CARGO_HOME=/home/esp/.cargo"
 
       - name: Memory report
         working-directory: micropython-esp32
         shell: bash
         run: |
-          python3 tools/fw_report.py target/xtensa-esp32-none-elf/release/micropython-esp32 \
+          python3 tools/fw_report.py target/xtensa-${{ matrix.chip || 'esp32' }}-none-elf/release/micropython-esp32 \
             --min-stack-kb ${{ matrix.min_stack || 128 }} --max-frame-kb 32 --markdown | tee -a "$GITHUB_STEP_SUMMARY"
 
   # Random scripts through the whole interpreter (fuzz/fuzz_targets/eval.rs):

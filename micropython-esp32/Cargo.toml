@@ -9,29 +9,28 @@ name = "micropython-esp32"
 path = "./src/bin/main.rs"
 
 [dependencies]
-esp-hal = { version = "=1.0.0", features = ["esp32", "unstable"] }
+esp-hal = { version = "=1.0.0", features = ["unstable"] }
 micropython-rs = { path = "..", default-features = false, features = ["iram"] }
 
-esp-bootloader-esp-idf = { version = "=0.4.0", features = ["esp32"] }
+esp-bootloader-esp-idf = { version = "=0.4.0" }
 critical-section = "1.2.0"
 esp-backtrace = { version = "=0.18.1", features = [
-  "esp32",
   "panic-handler",
   "println",
 ] }
-esp-println = { version = "=0.16.1", features = ["esp32"] }
+esp-println = { version = "=0.16.1" }
 # `nb::block!` for the blocking ADC read
 nb = "1.1"
 # Flash access for main.py saved in the nvs partition
-esp-storage = { version = "=0.8.1", features = ["esp32"] }
+esp-storage = { version = "=0.8.1" }
 embedded-storage = "0.3"
 # Static buffers for the REPL source arena and the interpreter heap
 
 # Wi-Fi (only with `--features wifi`): the radio driver, the scheduler it runs
 # its tasks on, a heap for it, and smoltcp for DHCP and IP
-esp-radio = { version = "=0.17.0", features = ["esp32", "wifi", "smoltcp", "esp-alloc", "unstable"], optional = true }
-esp-rtos = { version = "=0.2.0", features = ["esp32", "esp-radio", "esp-alloc"], optional = true }
-esp-alloc = { version = "=0.9.0", features = ["esp32"], optional = true }
+esp-radio = { version = "=0.17.0", features = ["wifi", "smoltcp", "esp-alloc", "unstable"], optional = true }
+esp-rtos = { version = "=0.2.0", features = ["esp-radio", "esp-alloc"], optional = true }
+esp-alloc = { version = "=0.9.0", optional = true }
 smoltcp = { version = "0.12", default-features = false, features = ["medium-ethernet", "proto-ipv4", "proto-dhcpv4", "proto-dns", "socket-dhcpv4", "socket-dns", "socket-udp", "socket-tcp"], optional = true }
 
 # TFT ST7789 display & 2D text rendering (only pulled in with `--features tft`)
@@ -42,7 +41,19 @@ embedded-hal-bus = { version = "0.3.0", optional = true }
 [features]
 # Default build: any ESP32 board, Python print() goes to the USB/UART serial monitor,
 # led_on()/led_off() drive the onboard LED (GPIO2 on most DevKit boards).
-default = ["full"]
+default = ["full", "esp32"]
+# The chip (`make flash CHIP=esp32s3`): exactly one. The build target must match
+# (xtensa-esp32-none-elf / xtensa-esp32s3-none-elf; the Makefile picks it).
+esp32 = [
+  "esp-hal/esp32", "esp-bootloader-esp-idf/esp32", "esp-backtrace/esp32", "esp-println/esp32",
+  "esp-storage/esp32", "esp-radio?/esp32", "esp-rtos?/esp32", "esp-alloc?/esp32",
+]
+# ESP32-S3 boards with the console on the chip's own USB port (USB-Serial/JTAG),
+# such as the Seeed XIAO ESP32-S3 (user LED on GPIO21)
+esp32s3 = [
+  "esp-hal/esp32s3", "esp-bootloader-esp-idf/esp32s3", "esp-backtrace/esp32s3", "esp-println/esp32s3",
+  "esp-storage/esp32s3", "esp-radio?/esp32s3", "esp-rtos?/esp32s3", "esp-alloc?/esp32s3",
+]
 # The interpreter's feature level (`make flash LEVEL=...`, see the README):
 # minimal: no classes, formatting, files or .py modules; smallest RAM use
 # medium: + classes and string formatting

@@ -38,17 +38,18 @@ pub const HEAP_SIZE: usize = 32 * 1024;
 /// `sensors.py` from flash into it); emptied by every soft reset.
 pub const MODULE_MEMORY_SIZE: usize = 16 * 1024;
 
-/// The REPL's big buffers (80 KB). They live in the ESP32's second data RAM
-/// region (`dram2`, 96 KB the bootloader leaves free), not in the main data
-/// RAM: there, they would come out of the stack, which takes all the main
-/// data RAM that statics leave.
+/// The REPL's big buffers (80 KB). On the ESP32 they live in the second data
+/// RAM region (`dram2`, 96 KB the bootloader leaves free), not in the main
+/// data RAM: there, they would come out of the stack, which takes all the
+/// main data RAM that statics leave. The ESP32-S3's `dram2` is smaller (74 KB),
+/// and its main RAM bigger: there they are ordinary statics.
 struct Buffers {
     arena: [u8; ARENA_SIZE],
     heap: [u8; HEAP_SIZE],
     modules: [u8; MODULE_MEMORY_SIZE],
 }
 
-#[link_section = ".dram2_uninit"]
+#[cfg_attr(feature = "esp32", link_section = ".dram2_uninit")]
 static mut BUFFERS: core::mem::MaybeUninit<Buffers> = core::mem::MaybeUninit::uninit();
 
 /// The buffers, zeroed; can be taken only once.
