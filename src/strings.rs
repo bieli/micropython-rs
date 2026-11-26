@@ -71,6 +71,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
             self.module_env,
             self.py_modules,
             self.event_handler,
+            self.memory_error,
         ] {
             self.mark_value(v, &mut work, &mut n);
             self.trace(&mut work, &mut n);

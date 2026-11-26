@@ -116,6 +116,11 @@ pub struct Lexer<'a> {
 }
 
 impl<'a> Lexer<'a> {
+    /// The whole source text being lexed.
+    pub const fn source(&self) -> &'a str {
+        self.src
+    }
+
     pub const fn new(src: &'a str) -> Self {
         Self {
             src,

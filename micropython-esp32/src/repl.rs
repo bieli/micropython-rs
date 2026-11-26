@@ -331,14 +331,7 @@ impl<'a, O: Output, H: HardwareBridge> Repl<'_, 'a, O, H> {
 
     /// Prints a Python-style traceback (Thonny and mpremote show it as is).
     fn report_error(&mut self, err: Error) {
-        let line = self.vm.error_line();
-        let mut out = Fmt(self.vm.output());
-        let _ = out.write_str("Traceback (most recent call last):\n");
-        let _ = match line {
-            Some(line) => write!(out, "  File \"<stdin>\", line {}, in <module>\n", line),
-            None => out.write_str("  File \"<stdin>\", in <module>\n"),
-        };
-        self.vm.print_exception(err);
+        self.vm.print_traceback(err, "<stdin>");
         self.write("\n");
     }
 

@@ -90,6 +90,7 @@ fn error_class(err: Error) -> u8 {
         | Error::UnexpectedToken
         | Error::UnterminatedString
         | Error::InvalidSyntax
+        | Error::TooComplex
         | Error::TooManyArguments => "SyntaxError",
         Error::IndentationError => "IndentationError",
         Error::UnknownIdentifier => "NameError",
@@ -119,6 +120,7 @@ fn uncatchable(err: Error) -> bool {
             | Error::UnexpectedToken
             | Error::UnterminatedString
             | Error::InvalidSyntax
+            | Error::TooComplex
             | Error::TooManyArguments
             | Error::IndentationError
             | Error::StepLimit
@@ -231,6 +233,9 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
         if err == Error::Exception && self.exc_class(self.exc).is_some() {
             return Ok(self.exc);
         }
+        if err == Error::OutOfMemory && self.memory_error != Value::None {
+            return Ok(self.memory_error); // the heap may be full: no allocation
+        }
         let message = err.message();
         let args = [Value::Str(message)];
         let args: &[Value<'a>] = if message.is_empty() { &[] } else { &args };
@@ -304,6 +309,85 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
         let view = self.heap.view();
         write_exception(&view, hw_modules, hw_funcs, self.exc, err, &mut *self.out);
     }
+
+    /// A whole Python traceback for the error `eval` returned, as MicroPython
+    /// prints it (Thonny and mpremote show it as is), without the final
+    /// newline. `script` names the code `eval` ran (`"<stdin>"`, `"main.py"`).
+    /// An error in an imported module's code gets two lines: the script's
+    /// statement that led there, then the module's file and line:
+    ///
+    /// ```text
+    /// Traceback (most recent call last):
+    ///   File "<stdin>", line 3, in <module>
+    ///   File "sensors.py", line 12, in <module>
+    /// ValueError: bad reading
+    /// ```
+    pub fn write_traceback(&self, err: Error, script: &str, out: &mut dyn Output) {
+        write_frames(
+            out,
+            script,
+            self.error_file(),
+            self.error_line(),
+            self.error_caller_line(),
+        );
+        self.write_exception(err, out);
+    }
+
+    /// `write_traceback` to the interpreter's own `Output`.
+    pub fn print_traceback(&mut self, err: Error, script: &str) {
+        let (file, line, caller) = (
+            self.error_file(),
+            self.error_line(),
+            self.error_caller_line(),
+        );
+        write_frames(&mut *self.out, script, file, line, caller);
+        self.print_exception(err);
+    }
+}
+
+/// The header and `File` lines of a traceback (see `write_traceback`).
+fn write_frames(
+    out: &mut dyn Output,
+    script: &str,
+    module: Option<&str>,
+    line: Option<u32>,
+    caller: Option<u32>,
+) {
+    out.write_str("Traceback (most recent call last):\n");
+    match (module, line) {
+        (Some(module), Some(line)) => {
+            if caller.is_some() {
+                write_frame(out, script, "", caller);
+            }
+            write_frame(out, module, ".py", Some(line));
+        }
+        (_, line) => write_frame(out, script, "", line),
+    }
+}
+
+/// `  File "name", line 3, in <module>` (no line: `  File "name", in <module>`).
+fn write_frame(out: &mut dyn Output, name: &str, ext: &str, line: Option<u32>) {
+    out.write_str("  File \"");
+    out.write_str(name);
+    out.write_str(ext);
+    out.write_str("\", ");
+    if let Some(line) = line {
+        let mut digits = [0u8; 10];
+        let mut i = digits.len();
+        let mut n = line;
+        loop {
+            i -= 1;
+            digits[i] = b'0' + (n % 10) as u8;
+            n /= 10;
+            if n == 0 {
+                break;
+            }
+        }
+        out.write_str("line ");
+        out.write_str(core::str::from_utf8(&digits[i..]).unwrap_or("?"));
+        out.write_str(", ");
+    }
+    out.write_str("in <module>\n");
 }
 
 fn write_exception(

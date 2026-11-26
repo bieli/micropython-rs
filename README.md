@@ -504,6 +504,21 @@ if let Err(err) = vm.eval(script) {
 interpreter's own `Output`).
 
 Syntax errors point at the offending token, and runtime errors at the statement that failed.
+`write_traceback(err, "<stdin>", &mut uart)` prints the whole traceback as MicroPython does (the firmware's REPL,
+the host REPL and `mpy-cli` use it). An error in an imported module's code names that module's file and line, under
+the script's line that led there; `error_file()` and `error_caller_line()` give the same in code:
+
+```text
+Traceback (most recent call last):
+  File "<stdin>", line 3, in <module>
+  File "sensors.py", line 5, in <module>
+ZeroDivisionError: division by zero
+```
+
+A statement too big for the parser's fixed buffers (64 RPN items, 16 levels of nesting) is a
+`SyntaxError: expression too complex: split it into smaller statements` (`Error::TooComplex`) at the statement's
+first line. A `MemoryError` can be caught even when the heap is completely full: the interpreter keeps one
+exception object for it, made while there was room (as MicroPython does).
 
 Two guards stop a script that runs too long, such as an accidental `while True:`:
 

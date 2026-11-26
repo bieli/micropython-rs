@@ -60,12 +60,7 @@ fn main() {
 
     if let Err(err) = vm.eval(&script) {
         // Like Python: the traceback goes to stderr
-        eprintln!("Traceback (most recent call last):");
-        match vm.error_line() {
-            Some(line) => eprintln!("  File \"{}\", line {}, in <module>", path, line),
-            None => eprintln!("  File \"{}\", in <module>", path),
-        }
-        vm.write_exception(err, &mut StderrSink);
+        vm.write_traceback(err, path, &mut StderrSink);
         eprintln!();
         process::exit(1);
     }

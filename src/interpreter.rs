@@ -151,6 +151,29 @@ struct Ctx {
 }
 
 /// A `def` function: its signature and a parser positioned at its body.
+/// Where an error happened: a line of `source` (the main script, or an
+/// imported module's text), and for an error in a module, the main script's
+/// line that led there.
+#[derive(Clone, Copy)]
+struct ErrorAt<'a> {
+    line: u32,
+    source: &'a str,
+    caller_line: Option<u32>,
+}
+
+impl<'a> ErrorAt<'a> {
+    fn at(line: u32, parser: &Parser<'a>) -> Self {
+        Self {
+            line,
+            source: parser.source(),
+            caller_line: None,
+        }
+    }
+}
+
+/// `.py` modules from the file system that tracebacks can name.
+const MAX_FILE_MODULES: usize = 8;
+
 #[derive(Debug, Clone, Copy)]
 struct FuncDef<'a> {
     /// The name, or for a lambda its source text (which identifies it).
@@ -211,8 +234,17 @@ pub struct Interpreter<'a, O: Output, H: HardwareBridge = NoHardware> {
     steps: u32,
     /// Maximum statements one `eval` call may execute (`None` = unlimited).
     step_limit: Option<u32>,
-    /// Line of the last error returned by `eval`, if any.
-    error_line: Option<u32>,
+    /// Where the last error returned by `eval` happened, if it did.
+    error_line: Option<ErrorAt<'a>>,
+    /// A `MemoryError` made while the heap had room: catching one when the
+    /// heap is full can't allocate its exception object (MicroPython keeps
+    /// an emergency one too).
+    memory_error: Value<'a>,
+    /// The source text the current `eval` runs (to tell it from modules').
+    main_source: &'a str,
+    /// `.py` modules read from the file system: (name, source), for tracebacks.
+    file_modules: [(&'a str, &'a str); MAX_FILE_MODULES],
+    file_module_count: usize,
     /// REPL mode: top-level expression statements print their value.
     interactive: bool,
     out: &'a mut O,
@@ -299,6 +331,10 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
             nesting: 0,
             funcs: [None; MAX_FUNCS],
             error_line: None,
+            memory_error: Value::None,
+            main_source: "",
+            file_modules: [("", ""); MAX_FILE_MODULES],
+            file_module_count: 0,
             step_limit: None,
             steps: 0,
             abort: None,
@@ -338,6 +374,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
     /// caller's stack frame; the `set_` methods change it in place.)
     pub fn set_heap(&mut self, memory: &'a mut [u8]) {
         self.heap = Heap::new(memory);
+        self.memory_error = Value::None;
     }
 
     /// Gives scripts a file system: `open()` and the `os` module. The
@@ -540,21 +577,60 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
     }
 
     /// 1-based line where the error returned by the last `eval` call happened,
-    /// or `None` if it succeeded.
+    /// or `None` if it succeeded. In a module (see `error_file`), the line in
+    /// that module's file.
     pub const fn error_line(&self) -> Option<u32> {
-        self.error_line
+        match self.error_line {
+            Some(at) => Some(at.line),
+            None => None,
+        }
+    }
+
+    /// The file of `error_line`: `Some("machine.py")`-style module name (a
+    /// frozen module or a `.py` file, without the `.py`) when the error
+    /// happened in an imported module's code, `None` in the script `eval` ran.
+    pub fn error_file(&self) -> Option<&'a str> {
+        let at = self.error_line?;
+        let inside = |text: &str| {
+            let start = text.as_ptr() as usize;
+            let p = at.source.as_ptr() as usize;
+            p >= start && p + at.source.len() <= start + text.len() && !text.is_empty()
+        };
+        if inside(self.main_source) {
+            return None;
+        }
+        self.frozen
+            .iter()
+            .chain(self.file_modules[..self.file_module_count].iter())
+            .find(|(_, text)| inside(text))
+            .map(|&(name, _)| name)
+    }
+
+    /// When the error is in a module (`error_file`), the line of the main
+    /// script's statement that led there (the import or call), if known.
+    pub const fn error_caller_line(&self) -> Option<u32> {
+        match self.error_line {
+            Some(at) => at.caller_line,
+            None => None,
+        }
     }
 
     /// Runs a script. Variables and functions stay defined for later calls.
     pub fn eval(&mut self, source: &'a str) -> Result<(), Error> {
         self.error_line = None;
+        self.main_source = source;
         self.steps = 0;
         self.sp = 0;
         self.handling = Value::None;
+        if self.memory_error == Value::None && self.heap.capacity() > 0 {
+            self.memory_error = self
+                .exception_object(Error::OutOfMemory)
+                .unwrap_or(Value::None);
+        }
         let result = self.run(source);
         match result {
             Ok(()) => self.error_line = None,
-            Err(_) => self.note_error(1), // only if no line was recorded
+            Err(_) => self.note_error(1, source), // only if no line was recorded
         }
         // Calls and blocks always unwind their own state, even on errors
         debug_assert!(self.call_depth == 0 && self.nesting == 0);
@@ -568,11 +644,27 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
             .map(|_| ())
     }
 
-    /// Records the line of an error. The innermost (first) record wins, so
-    /// an error inside a block or function points at the failing statement.
-    fn note_error(&mut self, line: u32) {
-        if self.error_line.is_none() {
-            self.error_line = Some(line);
+    /// Records the line of an error in `source`. The innermost (first) record
+    /// wins, so an error inside a block or function points at the failing
+    /// statement; when that is in other source text (a module), the first
+    /// line recorded in the main script is kept too, as the caller's.
+    fn note_error(&mut self, line: u32, source: &'a str) {
+        match &mut self.error_line {
+            None => {
+                self.error_line = Some(ErrorAt {
+                    line,
+                    source,
+                    caller_line: None,
+                })
+            }
+            Some(at) => {
+                if at.caller_line.is_none()
+                    && core::ptr::eq(source, self.main_source)
+                    && !core::ptr::eq(at.source, self.main_source)
+                {
+                    at.caller_line = Some(line);
+                }
+            }
         }
     }
 
@@ -603,8 +695,11 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
         code: &mut Code<'a>,
     ) -> Result<Option<Stmt<'a>>, Error> {
         let result = parser.parse_next_stmt(code);
-        if result.is_err() {
-            self.note_error(parser.line());
+        match result {
+            // A whole statement is too big: point at its start
+            Err(Error::TooComplex) => self.note_error(parser.stmt_line(), parser.source()),
+            Err(_) => self.note_error(parser.line(), parser.source()),
+            Ok(_) => {}
         }
         result
     }
@@ -613,7 +708,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
     fn next_indent(&mut self, parser: &mut Parser<'a>) -> Result<Option<u32>, Error> {
         let result = parser.next_indent();
         if result.is_err() {
-            self.note_error(parser.line());
+            self.note_error(parser.line(), parser.source());
         }
         result
     }
@@ -635,7 +730,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
                 None => return Ok(flow),
                 Some(i) if i < indent => return Ok(flow),
                 Some(i) if i > indent => {
-                    self.note_error(parser.line());
+                    self.note_error(parser.line(), parser.source());
                     return Err(Error::IndentationError);
                 }
                 Some(_) => {}
@@ -663,11 +758,11 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
     ) -> Result<Flow<'a>, Error> {
         if self.nesting >= MAX_NESTING {
             // Too deep (through calls, e.g. recursion): like Python, a RecursionError
-            self.note_error(parser.line());
+            self.note_error(parser.line(), parser.source());
             return Err(Error::RecursionLimit);
         }
         if let Err(err) = self.check_stack() {
-            self.note_error(parser.line());
+            self.note_error(parser.line(), parser.source());
             return Err(err);
         }
         self.nesting += 1;
@@ -677,7 +772,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
                 Ok(Some(i)) if i > header_indent => self.exec_block(parser, i, run, ctx, code),
                 Ok(_) => {
                     // `expected an indented block`
-                    self.note_error(parser.line());
+                    self.note_error(parser.line(), parser.source());
                     Err(Error::IndentationError)
                 }
                 Err(e) => Err(e),
@@ -740,7 +835,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
             self.exec_parsed(stmt, start, parser, indent, false, ctx, code)
         };
         if result.is_err() {
-            self.note_error(line);
+            self.note_error(line, parser.source());
         }
         result
     }
@@ -1220,7 +1315,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
                 let this = run && !taken && {
                     let val = self.eval_expr(code, cond);
                     if val.is_err() {
-                        self.note_error(line);
+                        self.note_error(line, parser.source());
                     }
                     let val = val?;
                     self.truthy(val)
@@ -1343,7 +1438,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
         run: bool,
         ctx: Ctx,
         code: &mut Code<'a>,
-    ) -> Result<(Result<Flow<'a>, Error>, Option<u32>), Error> {
+    ) -> Result<(Result<Flow<'a>, Error>, Option<ErrorAt<'a>>), Error> {
         let mut outcome = self.run_clause(parser, indent, run, ctx, code)?;
         let mut line = self.error_line.take();
         let body_ok = outcome.is_ok();
@@ -1371,13 +1466,13 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
                                     Ok(m) => m,
                                     Err(e) => {
                                         outcome = Err(e);
-                                        line = Some(header_line);
+                                        line = Some(ErrorAt::at(header_line, parser));
                                         false
                                     }
                                 },
                                 Err(e) => {
                                     outcome = Err(e);
-                                    line = Some(header_line);
+                                    line = Some(ErrorAt::at(header_line, parser));
                                     false
                                 }
                             },
@@ -1443,7 +1538,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
         }
         if clauses == 0 {
             // `try:` needs at least one `except` or `finally`
-            self.note_error(parser.line());
+            self.note_error(parser.line(), parser.source());
             return Err(Error::InvalidSyntax);
         }
         Ok((outcome, line))
@@ -4185,6 +4280,91 @@ print(fact(6), fib(6))
         let _ = (vm, vm2);
         assert_eq!(out.as_str(), "8 10 <module 'blinker'>\nfrozen\n");
         assert_eq!(out2.as_str(), "file 2\n");
+    }
+
+    /// The traceback of `script` (which must fail), as the REPL prints it.
+    #[cfg(all(feature = "modules", feature = "files"))]
+    fn traceback_of(script: &'static str) -> std::string::String {
+        static FROZEN: &[(&str, &str)] = &[(
+            "sensors",
+            "VALUE = 5\n\ndef read(x):\n    y = x + 1\n    return y // 0\n",
+        )];
+        let mut flash = std::vec![0u8; 4 * crate::flatfs::SLOT_SIZE as usize];
+        let files = RefCell::new(
+            crate::flatfs::FlatFs::mount(crate::flatfs::RamFlash::new(&mut flash)).unwrap(),
+        );
+        crate::FileSystem::create(&mut *files.borrow_mut(), "broken.py", false).unwrap();
+        crate::FileSystem::write_file(&mut *files.borrow_mut(), 1, b"A = 1\n\nB = missing\n")
+            .unwrap();
+        crate::FileSystem::close_file(&mut *files.borrow_mut(), 1).unwrap();
+        let mut out = MockOut::new();
+        let mut heap = [0u8; 4096];
+        let mut memory = [0u8; 256];
+        let mut vm = Interpreter::new(&mut out)
+            .with_heap(&mut heap)
+            .with_files(&files)
+            .with_module_memory(&mut memory)
+            .with_frozen_modules(FROZEN);
+        let err = vm.eval(script).unwrap_err();
+        let mut text = MockOut::new();
+        vm.write_traceback(err, "<stdin>", &mut text);
+        std::string::String::from(text.as_str())
+    }
+
+    #[test]
+    #[cfg(all(feature = "modules", feature = "files"))]
+    fn test_tracebacks_name_modules() {
+        // In a frozen module's function, called from the script
+        assert_eq!(
+            traceback_of("import sensors\nx = 2\nsensors.read(x)\n"),
+            "Traceback (most recent call last):\n  File \"<stdin>\", line 3, in <module>\n  \
+             File \"sensors.py\", line 5, in <module>\nZeroDivisionError: division by zero"
+        );
+        // At the top level of a .py file, while importing it
+        assert_eq!(
+            traceback_of("y = 1\nimport broken\n"),
+            "Traceback (most recent call last):\n  File \"<stdin>\", line 2, in <module>\n  \
+             File \"broken.py\", line 3, in <module>\nNameError: name is not defined"
+        );
+        // A caught error in a module leaves nothing behind
+        assert_eq!(
+            traceback_of(
+                "import sensors\ntry:\n    sensors.read(1)\nexcept ZeroDivisionError:\n    pass\nz = 1 // 0\n"
+            ),
+            "Traceback (most recent call last):\n  File \"<stdin>\", line 6, in <module>\n\
+             ZeroDivisionError: division by zero"
+        );
+        // Through a function of the script: the script's own outermost line
+        assert_eq!(
+            traceback_of("import sensors\ndef f():\n    return sensors.read(2)\n\nf()\n"),
+            "Traceback (most recent call last):\n  File \"<stdin>\", line 3, in <module>\n  \
+             File \"sensors.py\", line 5, in <module>\nZeroDivisionError: division by zero"
+        );
+    }
+
+    #[test]
+    fn test_too_complex_and_full_heap_errors() {
+        // A statement too big for the parser: a SyntaxError at its first line
+        let long = "x = 1\ny = [\n    1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1,\n    \
+                    1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1,\n]\n";
+        let (err, line) = run_err(long);
+        assert_eq!((err, line), (Error::TooComplex, Some(2)));
+        // MemoryError can be caught when the heap is full (no room for the
+        // exception object): an emergency one is kept
+        let mut out = MockOut::new();
+        let mut heap = [0u8; 2048];
+        let mut vm = Interpreter::new(&mut out).with_heap(&mut heap);
+        vm.eval(
+            "keep = []\nwhile True:\n    try:\n        keep.append([1])\n    except MemoryError as e:\n        \
+             print('full', e)\n        break\nkeep = None\ntry:\n    s = 'ab' * 100000\nexcept MemoryError:\n    \
+             print('caught again')\n",
+        )
+        .unwrap();
+        let _ = vm;
+        assert_eq!(
+            out.as_str(),
+            "full memory allocation failed\ncaught again\n"
+        );
     }
 
     #[test]

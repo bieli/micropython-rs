@@ -228,7 +228,7 @@ impl<'a> Code<'a> {
     /// always before `at` (they belong to enclosing expressions).
     fn insert(&mut self, at: usize, item: Item<'a>) -> Result<(), Error> {
         if self.len >= MAX_EXPR_ITEMS {
-            return Err(Error::OutOfMemory);
+            return Err(Error::TooComplex);
         }
         self.items.copy_within(at..self.len, at + 1);
         self.items[at] = item;
@@ -246,7 +246,7 @@ impl<'a> Code<'a> {
 
     fn push(&mut self, item: Item<'a>) -> Result<(), Error> {
         if self.len >= MAX_EXPR_ITEMS {
-            return Err(Error::OutOfMemory);
+            return Err(Error::TooComplex);
         }
         self.items[self.len] = item;
         self.len += 1;
@@ -507,6 +507,11 @@ impl<'a> Parser<'a> {
     /// or lexer error, this is the line where the problem was found.
     pub const fn line(&self) -> u32 {
         self.current_line
+    }
+
+    /// The source text this parser reads (a module's, the main script's).
+    pub const fn source(&self) -> &'a str {
+        self.lexer.source()
     }
 
     /// Line (1-based) where the most recently parsed statement starts.
@@ -1322,7 +1327,7 @@ impl<'a> Parser<'a> {
             match self.take_cmp_op()? {
                 Some(next) => {
                     if links >= MAX_CHAIN {
-                        return Err(Error::OutOfMemory);
+                        return Err(Error::TooComplex);
                     }
                     chain_jumps[links] = code.push_jump(Item::CmpChain { op, skip: 0 })? as u8;
                     links += 1;
@@ -1858,7 +1863,7 @@ impl<'a> Parser<'a> {
     #[cfg_attr(feature = "iram", link_section = ".rwtext")]
     fn nested(&mut self, f: impl FnOnce(&mut Self) -> Result<(), Error>) -> Result<(), Error> {
         if self.depth >= MAX_EXPR_DEPTH {
-            return Err(Error::OutOfMemory);
+            return Err(Error::TooComplex);
         }
         self.depth += 1;
         let result = f(self);
@@ -2410,12 +2415,12 @@ mod tests {
 
         // Too deeply nested parentheses
         let mut parser = Parser::new("x = ((((((((((((((((((1))))))))))))))))))").unwrap();
-        assert_eq!(parser.parse_next_stmt(&mut code), Err(Error::OutOfMemory));
+        assert_eq!(parser.parse_next_stmt(&mut code), Err(Error::TooComplex));
 
         // Too many RPN items in one statement (33 operands + 32 operators)
         let long = "x = 1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1";
         let mut parser = Parser::new(long).unwrap();
-        assert_eq!(parser.parse_next_stmt(&mut code), Err(Error::OutOfMemory));
+        assert_eq!(parser.parse_next_stmt(&mut code), Err(Error::TooComplex));
 
         // The buffer is reused per statement, so many statements are fine
         let mut parser =

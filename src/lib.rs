@@ -47,6 +47,10 @@ pub enum Error {
     InvalidSyntax,
     UnknownIdentifier,
     OutOfMemory,
+    /// One statement's expression is too big or too deeply nested for the
+    /// parser's fixed buffers (`ast_parser::MAX_EXPR_ITEMS`, `MAX_EXPR_DEPTH`):
+    /// a `SyntaxError`, fixed by splitting it into smaller statements.
+    TooComplex,
     TooManyArguments,
     /// Operator applied to unsupported operand types (e.g. `'a' + 1`).
     TypeError,
@@ -98,6 +102,7 @@ impl Error {
             Error::UnterminatedString => "unterminated string",
             Error::UnknownIdentifier => "name is not defined",
             Error::OutOfMemory => "memory allocation failed",
+            Error::TooComplex => "expression too complex: split it into smaller statements",
             Error::TooManyArguments => "too many arguments or names",
             Error::TypeError => "unsupported operand or argument type",
             Error::ZeroDivision => "division by zero",

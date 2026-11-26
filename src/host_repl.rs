@@ -92,12 +92,7 @@ fn run(vm: &mut Vm, source: &'static str, interactive: bool) -> Result<(), Error
 /// A Python traceback, like the firmware prints it.
 fn report(vm: &mut Vm, result: Result<(), Error>) {
     if let Err(err) = result {
-        write("Traceback (most recent call last):\n");
-        match vm.error_line() {
-            Some(line) => write(&format!("  File \"<stdin>\", line {}, in <module>\n", line)),
-            None => write("  File \"<stdin>\", in <module>\n"),
-        }
-        vm.print_exception(err);
+        vm.print_traceback(err, "<stdin>");
         write("\n");
     }
 }

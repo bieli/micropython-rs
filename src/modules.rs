@@ -46,6 +46,14 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
         }
         // `name.py` from the file system, else a frozen module of that name
         let source = match self.load_source(name) {
+            Ok(source) => {
+                // Remembered for tracebacks (the first few files)
+                if self.file_module_count < self.file_modules.len() {
+                    self.file_modules[self.file_module_count] = (name, source);
+                    self.file_module_count += 1;
+                }
+                source
+            }
             Err(Error::ImportError) => self
                 .frozen
                 .iter()
