@@ -174,6 +174,7 @@ Open after Phase 6 (the `machine` module is done in 7.1): `bytearray`
 | 7.6 | **Wi-Fi: `network.WLAN`** (station mode) like MicroPython's ESP32 port: `active`, `scan`, `connect`, `isconnected`, `status`, `ifconfig`, `config`, `disconnect` (`FEATURES=wifi`) | Connected boards; the base for sockets and HTTP | ✅ on a TTGO with a WPA2 network |
 | 7.7 | **`Pin.irq()` and `machine.Timer`**: soft interrupts like MicroPython's (callbacks between statements, during sleeps and at the prompt) | Buttons, periodic tasks, event-driven code from MicroPython tutorials | ✅ on a TTGO (edges on a looped-back pin, timers) |
 | 7.8 | **Wi-Fi access point**: `network.WLAN(network.AP_IF)` with `config(ssid=, key=, authmode=, channel=, hidden=, max_clients=)`, `ifconfig()`, `status('stations')`, alone or with the station; a DHCP server in the firmware | The board's own network for setup pages and phones | ✅ on a TTGO, joined from a Linux laptop |
+| 7.9 | **The clock**: `time.time()`, `gmtime()`, `localtime()`, `mktime()`, `time_ns()`, `ticks_add()` (MicroPython's ESP32 epoch, 2000), `machine.RTC`, `ntptime` over Wi-Fi (DNS and SNTP in the firmware), `gc`, `display.backlight()`; the yard lights app (`scripts/yard_lights.py`) | Schedules by the time of day: lights, irrigation, logging with timestamps | ✅ on a TTGO with NTP over Wi-Fi |
 | 7.3 | **Feature levels** (`minimal`, `medium`, `full`; `full` by default) for the core library and the firmware (`make flash LEVEL=...`) | Smaller builds and less RAM for small chips | ✅ (README, "Feature levels") |
 
 Done for 7.1:
@@ -248,6 +249,22 @@ Done for 7.8:
 * Tested from a Linux laptop: WPA2 and open networks found, address 192.168.4.2 by DHCP, 50/50 pings (2.8-27 ms),
   1400-byte pings, both interfaces answering at once; the laptop's wired default route untouched.
 
+Done for 7.9:
+
+* Firmware: a wall clock (an offset to the boot timer, set by `rtc_set`), the native `utime` with `time()`,
+  `time_ns()` and `ticks_add()`, and a frozen `time.py` with `gmtime`/`localtime`/`mktime` in Python (checked against
+  CPython on 30 000 dates); `machine.RTC`. A smoltcp DNS socket and an SNTP request (`wifi_ntp`) behind a frozen
+  `ntptime`; `display.backlight()`, on again after a script.
+* Core: a `gc` module (`collect`, `mem_free`, `mem_alloc`, `objects_free`). The heap's object table is 512 entries at
+  the `full` level (256 before): `machine`, `network` and `ntptime` alone kept 240 objects alive, so a script
+  importing them ran out with 23 KB of the heap still free. +3 KB of interpreter RAM (31.4 KB REPL frame).
+* Found on the board: a failed DNS lookup freed its query slot, and cancelling it again panicked (the board hung).
+* `scripts/yard_lights.py`: sunrise/sunset from NOAA's equations (within 24 s of astral), EU summer time (matched
+  `Europe/Warsaw` hourly over 3 years), NTP every 6 hours with retries, a watchdog, a status screen with buttons.
+  Tested on the TTGO by setting the clock around sunset, sunrise and a night break; the watchdog restarted
+  `main.py` 62 s after Ctrl-C.
+* Next: a battery-backed clock (DS3231 over I²C) as a fallback; time zones as a module (`TZ` strings).
+
 Done for 7.7:
 
 * Core: `HardwareBridge::poll_event` (events by number), `set_events`, `resume_sleep` and `soft_reset`, and
@@ -264,8 +281,8 @@ Done for 7.7:
 * Measured on the TTGO: a 50 ms timer fires 20 times in `sleep_ms(1000)`, a 100 Hz one 50 times in a 500 ms busy
   loop, both-edge interrupts give 10 callbacks for 5 pulses (values right), timers keep going at the prompt and stop
   on a soft reset, also with Wi-Fi connected; 6 % slower with a timer set, unchanged otherwise.
-* Not done: level triggers, hard interrupts (Python in the interrupt itself), `RTC`, `Signal`,
-  `micropython.schedule()`.
+* Not done: level triggers, hard interrupts (Python in the interrupt itself), `Signal`,
+  `micropython.schedule()`. (`RTC`: done in 7.9.)
 
 ## Recommended order
 

@@ -303,7 +303,9 @@ impl HardwareBridge for TtgoHardware<'_, '_> {
     }
 
     fn soft_reset(&mut self) {
-        self.board.soft_reset()
+        self.board.soft_reset();
+        // A script may have switched it off (display.backlight(0))
+        self.console.borrow_mut().set_backlight(true);
     }
 
     fn idle(&mut self) {

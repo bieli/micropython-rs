@@ -1,5 +1,5 @@
 # machine: MicroPython's hardware classes (Pin, ADC, PWM, I2C, SoftI2C, UART,
-# SPI, SoftSPI, WDT), written in Python on top of the firmware's functions
+# SPI, SoftSPI, Timer, WDT, RTC), written in Python on top of the firmware's functions
 # (pin_write, adc_read, pwm_u16, i2c_write, uart_read, spi_read, ...), so
 # code from MicroPython tutorials runs unchanged. Built into the firmware
 # (a frozen module); a machine.py on the board's file system comes first.
@@ -12,8 +12,9 @@
 # Pin.irq() and Timer callbacks are soft interrupts (MicroPython's default,
 # hard=False): they run between statements, while the script sleeps, and at
 # the >>> prompt. hard=True is accepted and works the same way. Edge
-# triggers only (no IRQ_LOW_LEVEL / IRQ_HIGH_LEVEL). No RTC or *_into
-# methods (they need bytearray) yet.
+# triggers only (no IRQ_LOW_LEVEL / IRQ_HIGH_LEVEL). RTC keeps the time while
+# the board runs; it starts at 2000-01-01 after a reset or power-up (no
+# battery-backed time). No *_into methods (they need bytearray) yet.
 # Floats work where MicroPython takes them: time.sleep(0.5), machine values
 # from int arithmetic (duty_ns, read_uv) stay ints, as on MicroPython.
 
@@ -341,6 +342,28 @@ class Timer:
     def deinit(self):
         timer_deinit(self._id)
         _callbacks.pop(self._event, None)
+
+
+class RTC:
+    # datetime() is (year, month, day, weekday, hours, minutes, seconds,
+    # subseconds in microseconds), as on MicroPython's ESP32 port; weekday 0
+    # is Monday (it is ignored when setting)
+    def __init__(self, id=0, datetime=None):
+        if datetime is not None:
+            self.datetime(datetime)
+
+    def init(self, datetime):
+        self.datetime(datetime)
+
+    def datetime(self, datetimetuple=None):
+        import time
+        if datetimetuple is None:
+            us = time.time_ns() // 1000
+            t = time.gmtime(us // 1000000)
+            return (t[0], t[1], t[2], t[6], t[3], t[4], t[5], us % 1000000)
+        d = datetimetuple
+        secs = time.mktime((d[0], d[1], d[2], d[4], d[5], d[6], 0, 0))
+        rtc_set(secs, d[7] if len(d) > 7 else 0)
 
 
 class WDT:

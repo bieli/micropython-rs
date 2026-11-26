@@ -156,8 +156,13 @@ pub fn run<O: Output, H: HardwareBridge>(
 static FROZEN_MODULES: &[(&str, &str)] = &[
     #[cfg(feature = "machine")]
     ("machine", include_str!("../modules/machine.py")),
+    // On top of the native `utime` (board.rs), with the calendar functions
+    #[cfg(feature = "machine")]
+    ("time", include_str!("../modules/time.py")),
     #[cfg(feature = "wifi")]
     ("network", include_str!("../modules/network.py")),
+    #[cfg(all(feature = "wifi", feature = "machine"))]
+    ("ntptime", include_str!("../modules/ntptime.py")),
 ];
 
 /// A new interpreter for a session. Out of line: building it takes a

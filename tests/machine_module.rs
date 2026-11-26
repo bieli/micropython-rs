@@ -4,11 +4,32 @@
 //! frozen modules and classes, like the firmware's `machine` feature.)
 #![cfg(all(feature = "modules", feature = "classes", feature = "format"))]
 
-use micropython_rs::{Arg, Error, HardwareBridge, HwFn, Interpreter, Output};
+use micropython_rs::{Arg, Error, HardwareBridge, HwFn, Interpreter, Module, Output};
 use std::fmt::Write;
 
 const MACHINE: &str = include_str!("../micropython-esp32/modules/machine.py");
-const FROZEN: &[(&str, &str)] = &[("machine", MACHINE)];
+const FROZEN: &[(&str, &str)] = &[
+    ("machine", MACHINE),
+    ("time", include_str!("../micropython-esp32/modules/time.py")),
+];
+
+/// The firmware's native `utime`, for `machine.RTC` (through `time`).
+const UTIME: Module = Module {
+    name: "utime",
+    doc: "",
+    functions: &[
+        HwFn::new("sleep", "s", ""),
+        HwFn::new("sleep_ms", "ms", ""),
+        HwFn::new("sleep_us", "us", ""),
+        HwFn::new("ticks_ms", "", ""),
+        HwFn::new("ticks_us", "", ""),
+        HwFn::new("ticks_diff", "new, old", ""),
+        HwFn::new("ticks_add", "ticks, delta", ""),
+        HwFn::new("time", "", ""),
+        HwFn::new("time_ns", "", ""),
+    ],
+    constants: &[],
+};
 
 /// Names and argument counts as in the firmware's table (board.rs).
 const FUNCTIONS: &[HwFn] = &[
@@ -43,6 +64,7 @@ const FUNCTIONS: &[HwFn] = &[
     HwFn::new("timer_init", "id, period_us, periodic", ""),
     HwFn::new("timer_deinit", "id", ""),
     HwFn::new("fire", "event", ""),
+    HwFn::with_args("rtc_set", 1, 2, "seconds, [microseconds]", ""),
 ];
 
 const CONSTANTS: &[(&str, i64)] = &[
@@ -67,6 +89,8 @@ struct MockBoard {
     rx: Vec<u8>,
     /// Events for the interpreter (`fire(n)` queues one)
     events: Vec<i64>,
+    /// The clock: microseconds since 2000-01-01 (`rtc_set`, `utime.time_ns`)
+    clock_us: i64,
 }
 
 fn show(args: &[Arg<'_>]) -> String {
@@ -107,6 +131,10 @@ impl HardwareBridge for MockBoard {
                 Ok(None)
             }
             "reset_cause" => Ok(Some(1)),
+            "rtc_set" => {
+                self.clock_us = int(0)? * 1_000_000 + args.get(1).map_or(Ok(0), |a| a.int())?;
+                Ok(None)
+            }
             _ => Ok(None),
         }
     }
@@ -132,6 +160,23 @@ impl HardwareBridge for MockBoard {
 
     fn functions(&self) -> &[HwFn] {
         FUNCTIONS
+    }
+
+    fn modules(&self) -> &[Module] {
+        &[UTIME]
+    }
+
+    fn call_module(
+        &mut self,
+        _module: &str,
+        name: &str,
+        _args: &[Arg<'_>],
+    ) -> Result<Option<i64>, Error> {
+        match name {
+            "time" => Ok(Some(self.clock_us.div_euclid(1_000_000))),
+            "time_ns" => Ok(Some(self.clock_us * 1000)),
+            _ => Ok(Some(0)),
+        }
     }
 
     fn poll_event(&mut self) -> Option<i64> {
@@ -315,4 +360,31 @@ fn pin_irq_and_timer_callbacks() {
     assert!(log.contains("timer_init(-1,100000,0)\n"), "{}", log);
     // The default trigger: both edges
     assert!(log.contains("pin_irq(25,3)\n"), "{}", log);
+}
+
+#[test]
+fn rtc_datetime() {
+    // (year, month, day, weekday, hours, minutes, seconds, subseconds in us),
+    // as on MicroPython's ESP32 port; the weekday is ignored when setting
+    let (out, log) = run(
+        "import machine, time\n\
+         rtc = machine.RTC()\n\
+         print(rtc.datetime())\n\
+         rtc.datetime((2026, 11, 26, 0, 7, 32, 15, 250000))\n\
+         print(rtc.datetime(), time.gmtime())\n\
+         machine.RTC().init((2027, 3, 28, 6, 1, 0, 0))\n\
+         print(time.localtime()[:7])\n",
+        b"",
+    );
+    assert_eq!(
+        out,
+        "(2000, 1, 1, 5, 0, 0, 0, 0)\n\
+         (2026, 11, 26, 3, 7, 32, 15, 250000) (2026, 11, 26, 7, 32, 15, 3, 330)\n\
+         (2027, 3, 28, 1, 0, 0, 6)\n"
+    );
+    assert!(
+        log.ends_with("rtc_set(848993535,250000)\nrtc_set(859510800,0)\n"),
+        "{}",
+        log
+    );
 }

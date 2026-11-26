@@ -27,6 +27,11 @@ pub const DISPLAY_MODULE: Module = Module {
             "color",
             "Fill the screen (also clears the console text)",
         ),
+        HwFn::new(
+            "backlight",
+            "on",
+            "Backlight on (1) or off (0): the screen keeps its picture; on again after a script",
+        ),
         HwFn::with_args("pixel", 2, 3, "x, y, [color]", "Set one pixel"),
         HwFn::with_args(
             "line",
@@ -154,6 +159,7 @@ pub fn call(
 
     match name {
         "fill" => console.fill_screen(color(0)?),
+        "backlight" => console.set_backlight(args[0].int()? != 0),
         "pixel" => console.draw_pixel(coord(0)?, coord(1)?, color(2)?),
         "line" => console.draw_line(point(0)?, point(2)?, color(4)?),
         "hline" => {

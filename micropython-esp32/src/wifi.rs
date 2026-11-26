@@ -30,8 +30,11 @@ use esp_radio::wifi::{
 };
 use micropython_rs::Error;
 use smoltcp::iface::{Config as IfaceConfig, Interface, SocketHandle, SocketSet, SocketStorage};
-use smoltcp::socket::{dhcpv4, udp};
-use smoltcp::wire::{EthernetAddress, HardwareAddress, IpCidr, IpEndpoint, Ipv4Address, Ipv4Cidr};
+use smoltcp::socket::{dhcpv4, dns, udp};
+use smoltcp::wire::{
+    DnsQueryType, EthernetAddress, HardwareAddress, IpAddress, IpCidr, IpEndpoint, Ipv4Address,
+    Ipv4Cidr,
+};
 
 /// MicroPython's `network.STAT_*` values (its ESP32 port: the reasons of a
 /// failed connection are the driver's disconnect reasons).
@@ -99,6 +102,9 @@ pub struct Wifi {
     controller: WifiController<'static>,
     sta: Net,
     dhcp: SocketHandle,
+    /// The station's DNS resolver and NTP socket
+    dns: SocketHandle,
+    ntp: SocketHandle,
     ap: Net,
     dhcp_server: DhcpServer,
     sta_active: bool,
@@ -172,6 +178,11 @@ impl Wifi {
 
         let mut sta = Net::new(interfaces.sta);
         let dhcp = sta.sockets.add(dhcpv4::Socket::new());
+        let queries: &'static mut [Option<dns::DnsQuery>; 1] = Box::leak(Box::new([None]));
+        let dns = sta
+            .sockets
+            .add(dns::Socket::new(&[FALLBACK_DNS.into()], &mut queries[..]));
+        let ntp = sta.sockets.add(udp_socket(1, 128));
         let mut ap = Net::new(interfaces.ap);
         ap.iface.update_ip_addrs(|addrs| {
             let _ = addrs.push(IpCidr::new(AP_IP.into(), AP_PREFIX));
@@ -185,6 +196,8 @@ impl Wifi {
             controller,
             sta,
             dhcp,
+            dns,
+            ntp,
             ap,
             dhcp_server,
             sta_active: false,
@@ -518,6 +531,134 @@ impl Wifi {
     pub fn rssi(&self) -> Result<i64, Error> {
         self.controller.rssi().map(|r| r as i64).map_err(io)
     }
+
+    /// Polls the station until `done` gives a result, `timeout_ms` passes
+    /// (`OSError`) or Ctrl-C.
+    fn wait_for<T>(
+        &mut self,
+        timeout_ms: u64,
+        mut done: impl FnMut(&mut Self) -> Option<Result<T, Error>>,
+    ) -> Result<T, Error> {
+        let start = esp_hal::time::Instant::now();
+        loop {
+            self.sta.poll();
+            if let Some(result) = done(self) {
+                return result;
+            }
+            if crate::ABORT.load(Ordering::Relaxed) {
+                return Err(Error::Interrupted);
+            }
+            if start.elapsed().as_millis() > timeout_ms {
+                return Err(Error::IoError); // timed out
+            }
+        }
+    }
+
+    /// The IPv4 address of `host`: a dotted address as it is, a name from
+    /// the DNS server DHCP gave (or 8.8.8.8).
+    pub fn resolve(&mut self, host: &str, timeout_ms: u64) -> Result<Ipv4Address, Error> {
+        if let Ok(address) = host.parse::<Ipv4Address>() {
+            return Ok(address);
+        }
+        if self.ip.is_none() {
+            return Err(Error::IoError); // not connected
+        }
+        let server = self.ip.and_then(|(_, _, dns)| dns).unwrap_or(FALLBACK_DNS);
+        let socket = self.sta.sockets.get_mut::<dns::Socket>(self.dns);
+        socket.update_servers(&[server.into()]);
+        let query = socket
+            .start_query(self.sta.iface.context(), host, DnsQueryType::A)
+            .map_err(|_| Error::ValueError)?;
+        let dns_handle = self.dns;
+        // A finished query (answered or failed) frees its slot by itself
+        let mut finished = false;
+        let result = self.wait_for(timeout_ms, |wifi| {
+            let socket = wifi.sta.sockets.get_mut::<dns::Socket>(dns_handle);
+            let result = socket.get_query_result(query);
+            finished = !matches!(result, Err(dns::GetQueryResultError::Pending));
+            match result {
+                Ok(addresses) => Some(
+                    addresses
+                        .iter()
+                        .map(|a| match a {
+                            IpAddress::Ipv4(v4) => *v4,
+                        })
+                        .next()
+                        .ok_or(Error::IoError),
+                ),
+                Err(dns::GetQueryResultError::Pending) => None,
+                Err(dns::GetQueryResultError::Failed) => Some(Err(Error::IoError)),
+            }
+        });
+        if !finished {
+            // Timed out or Ctrl-C: the query keeps its slot until cancelled
+            self.sta
+                .sockets
+                .get_mut::<dns::Socket>(self.dns)
+                .cancel_query(query);
+        }
+        result
+    }
+
+    /// The time from an NTP server (SNTP, RFC 4330): microseconds since
+    /// 2000-01-01 (UTC, MicroPython's ESP32 epoch), with half the round trip
+    /// added.
+    pub fn ntp(&mut self, host: &str, timeout_ms: u64) -> Result<i64, Error> {
+        let server = self.resolve(host, timeout_ms)?;
+        let socket = self.sta.sockets.get_mut::<udp::Socket>(self.ntp);
+        if !socket.is_open() {
+            socket.bind(NTP_LOCAL_PORT).map_err(io)?;
+        }
+        // Drop old answers
+        while socket.recv().is_ok() {}
+        let mut request = [0u8; 48];
+        request[0] = 0x23; // version 4, client
+        let sent_at = esp_hal::time::Instant::now();
+        socket
+            .send_slice(&request, IpEndpoint::new(server.into(), 123))
+            .map_err(io)?;
+        let ntp_handle = self.ntp;
+        let reply = self.wait_for(timeout_ms, |wifi| {
+            let socket = wifi.sta.sockets.get_mut::<udp::Socket>(ntp_handle);
+            let mut reply = [0u8; 48];
+            match socket.recv_slice(&mut reply) {
+                Ok((n, _)) if n >= 48 => Some(Ok(reply)),
+                _ => None,
+            }
+        })?;
+        let round_trip_us = sent_at.elapsed().as_micros() as i64;
+        // A server's answer (mode 4), synchronized (stratum 1-15)
+        if reply[0] & 7 != 4 || !(1..=15).contains(&reply[1]) {
+            return Err(Error::IoError);
+        }
+        let secs = u32::from_be_bytes([reply[40], reply[41], reply[42], reply[43]]) as i64;
+        let frac = u32::from_be_bytes([reply[44], reply[45], reply[46], reply[47]]) as i64;
+        // NTP counts from 1900; the era wraps in 2036 (then secs is small)
+        let secs = if secs >= NTP_TO_2000 {
+            secs
+        } else {
+            secs + (1 << 32)
+        };
+        Ok((secs - NTP_TO_2000) * 1_000_000 + (frac * 1_000_000 >> 32) + round_trip_us / 2)
+    }
+}
+
+/// Seconds from 1900 (NTP's epoch) to 2000-01-01.
+const NTP_TO_2000: i64 = 3_155_673_600;
+const NTP_LOCAL_PORT: u16 = 50123;
+/// The DNS server when DHCP didn't give one.
+const FALLBACK_DNS: Ipv4Address = Ipv4Address::new(8, 8, 8, 8);
+
+/// A UDP socket with room for `packets` of `bytes` each way.
+fn udp_socket(packets: usize, bytes: usize) -> udp::Socket<'static> {
+    let meta = || -> &'static mut [udp::PacketMetadata] {
+        alloc::vec![udp::PacketMetadata::EMPTY; packets].leak()
+    };
+    let data = || -> &'static mut [u8] { alloc::vec![0u8; packets * bytes].leak() };
+    udp::Socket::new(
+        udp::PacketBuffer::new(meta(), data()),
+        udp::PacketBuffer::new(meta(), data()),
+    )
 }
 
 fn write_addresses(out: &mut [u8], addresses: [Ipv4Address; 4]) -> usize {

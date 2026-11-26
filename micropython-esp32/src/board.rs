@@ -56,8 +56,14 @@ pub const SOFT_RESET: i64 = 5;
 
 /// `import time`: MicroPython's `time` module names for the time functions.
 pub const TIME_MODULE: Module = Module {
+    // With the `machine` feature, the frozen `time` module (modules/time.py)
+    // adds the calendar functions (gmtime, mktime) to this one, as MicroPython's
+    // `utime`; without it, this is `time`
+    #[cfg(feature = "machine")]
+    name: "utime",
+    #[cfg(not(feature = "machine"))]
     name: "time",
-    doc: "Delays and timestamps (MicroPython names)",
+    doc: "Delays, timestamps and the clock (MicroPython names)",
     functions: &[
         HwFn::new("sleep", "s", "Wait s seconds (a float: 0.5)"),
         HwFn::new("sleep_ms", "ms", "Wait ms milliseconds"),
@@ -65,9 +71,21 @@ pub const TIME_MODULE: Module = Module {
         HwFn::new("ticks_ms", "", "Milliseconds since boot"),
         HwFn::new("ticks_us", "", "Microseconds since boot"),
         HwFn::new("ticks_diff", "new, old", "new - old"),
+        HwFn::new("ticks_add", "ticks, delta", "ticks + delta"),
+        HwFn::new(
+            "time",
+            "",
+            "Seconds since 2000-01-01 (UTC, MicroPython's ESP32 epoch), from the clock",
+        ),
+        HwFn::new("time_ns", "", "Nanoseconds since 2000-01-01 (UTC)"),
     ],
     constants: &[],
 };
+
+/// The clock at boot: 2000-01-01 00:00:00 UTC, as MicroPython's RTC starts,
+/// until `rtc_set` (or `ntptime.settime()`). The clock counts microseconds
+/// since then: MicroPython's ESP32 epoch is 2000, not 1970.
+const CLOCK_AT_BOOT_US: i64 = 0;
 
 /// Pins wired to the ADC: the input-only GPIO34/36/39, so analog inputs
 /// never collide with digital outputs.
@@ -128,6 +146,7 @@ macro_rules! board_functions {
             micropython_rs::HwFn::new("stack_peak", "", "Most stack bytes used since the last call"),
             micropython_rs::HwFn::new("unique_id", "", "The chip's MAC address (6 bytes)").returning_bytes(),
             micropython_rs::HwFn::new("cpu_freq", "", "CPU clock in Hz"),
+            micropython_rs::HwFn::with_args("rtc_set", 1, 2, "seconds, [microseconds]", "Set the clock: seconds since 2000-01-01 (UTC)"),
             micropython_rs::HwFn::new("pin_irq", "pin, trigger", "Pin interrupt events: 1 rising, 2 falling, 3 both, 0 off (use Pin.irq)"),
             micropython_rs::HwFn::new("timer_init", "id, period_us, periodic", "Timer events (use machine.Timer)"),
             micropython_rs::HwFn::new("timer_deinit", "id", "Stop a timer"),
@@ -157,6 +176,8 @@ macro_rules! board_functions {
             micropython_rs::HwFn::new("wifi_ap_mac", "", "The access point's MAC address (6 bytes)").returning_bytes(),
             #[cfg(feature = "wifi")]
             micropython_rs::HwFn::new("wifi_rssi", "", "Signal strength of the connection, dBm"),
+            #[cfg(feature = "wifi")]
+            micropython_rs::HwFn::with_args("wifi_ntp", 1, 2, "host, [timeout_ms]", "Time from an NTP server: microseconds since 2000-01-01 (use ntptime)"),
             $($extra),*
         ]
     };
@@ -235,6 +256,8 @@ pub struct Board<'d> {
     rtc: Rtc<'d>,
     /// `Pin.irq()` and `machine.Timer` events
     events: crate::events::Events,
+    /// The clock: microseconds since 2000-01-01 (UTC) minus since boot
+    clock_offset_us: i64,
     _io: esp_hal::gpio::Io<'d>,
     wdt_enabled: bool,
 }
@@ -287,6 +310,7 @@ impl<'d> Board<'d> {
             station: None,
             rtc: Rtc::new(p.lpwr),
             events: crate::events::Events::new(),
+            clock_offset_us: CLOCK_AT_BOOT_US,
             _io: {
                 let mut io = esp_hal::gpio::Io::new(p.io_mux);
                 io.set_interrupt_handler(crate::events::gpio_interrupt);
@@ -350,6 +374,18 @@ impl<'d> Board<'d> {
                     .map(|()| None)
             }
             "cpu_freq" => Ok(Some(CPU_CLOCK as i64 * 1_000_000)),
+            "rtc_set" => {
+                let us = match args.get(1) {
+                    Some(us) => us.int()?,
+                    None => 0,
+                };
+                let wall_us = int(0)?
+                    .checked_mul(1_000_000)
+                    .and_then(|s| s.checked_add(us));
+                let wall_us = wall_us.ok_or(Error::ValueError)?;
+                self.clock_offset_us = wall_us - since_boot().as_micros() as i64;
+                Ok(None)
+            }
             "pin_irq" => {
                 let pin = pin_number(int(0)?)?;
                 let trigger = int(1)?;
@@ -428,6 +464,14 @@ impl<'d> Board<'d> {
             })),
             #[cfg(feature = "wifi")]
             "wifi_rssi" => self.wifi()?.rssi().map(Some),
+            #[cfg(feature = "wifi")]
+            "wifi_ntp" => {
+                let timeout = match args.get(1) {
+                    Some(t) => non_negative(t.int()?)? as u64,
+                    None => 1000,
+                };
+                self.wifi()?.ntp(args[0].str()?, timeout).map(Some)
+            }
             "pwm_stop" => self.pwm_stop(pin_number(int(0)?)?).map(|()| None),
             "i2c_probe" => Ok(Some(self.i2c_probe(i2c_addr(int(0)?)?) as i64)),
             "i2c_write" => {
@@ -753,7 +797,7 @@ impl<'d> Board<'d> {
         args: &[Arg<'_>],
     ) -> Result<Option<i64>, Error> {
         match (module, name) {
-            ("time", "sleep") => {
+            ("time" | "utime", "sleep") => {
                 // Seconds, an int or a float (`time.sleep(0.5)`), to the microsecond
                 let us = match args[0] {
                     Arg::Float(s) if s >= 0.0 && s < 1e12 => (s * 1e6) as i64,
@@ -765,10 +809,20 @@ impl<'d> Board<'d> {
                 };
                 self.sleep_for_us(us.max(0) as u64).map(|()| None)
             }
+            ("time" | "utime", "time") => Ok(Some(self.clock_us().div_euclid(1_000_000))),
+            ("time" | "utime", "time_ns") => Ok(Some(self.clock_us().saturating_mul(1000))),
+            ("time" | "utime", "ticks_add") => {
+                Ok(Some(args[0].int()?.wrapping_add(args[1].int()?)))
+            }
             // The other `time` functions are the flat ones with the same name
-            ("time", _) => self.call(name, args),
+            ("time" | "utime", _) => self.call(name, args),
             _ => Err(Error::UnknownIdentifier),
         }
+    }
+
+    /// The clock: microseconds since 2000-01-01 (UTC).
+    fn clock_us(&self) -> i64 {
+        since_boot().as_micros() as i64 + self.clock_offset_us
     }
 
     pub fn sleep_ms(&mut self, ms: i64) -> Result<(), Error> {

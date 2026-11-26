@@ -308,8 +308,8 @@ Limits (in `src/interpreter.rs`), for the `full` [feature level](#feature-levels
 | `MAX_NESTING` | 40 (24 / 40) | Nested blocks (`if`/`while`/function bodies) running at once | `RecursionLimit` |
 
 Native stack use grows with each nested call (an RPN buffer and parser state per call, about 7.8 KB on the ESP32,
-see [Stack budget](#stack-budget-measured-on-the-esp32)), which is why `MAX_CALL_DEPTH` is small. On a 64-bit host the `Interpreter` struct is about 22 KB (including the 128 variable
-slots, the 128-value stack, the 256-entry object table of the heap and the 96-slot function table); on the ESP32 it's about 27 KB.
+see [Stack budget](#stack-budget-measured-on-the-esp32)), which is why `MAX_CALL_DEPTH` is small. On a 64-bit host the `Interpreter` struct is about 45 KB (including the 128 variable
+slots, the 128-value stack, the 512-entry object table of the heap and the 96-slot function table); on the ESP32 it's about 30 KB.
 
 ### Strings
 
@@ -455,7 +455,9 @@ When it's full, a **mark-and-sweep garbage collector** keeps everything reachabl
 stack (the operands of every expression being evaluated, including those of calling functions, and the iterables of
 running `for` loops), and everything inside reachable lists and dicts. It frees the rest (cycles included) and moves
 the survivors together. Values refer to heap objects through handles, so moving them is safe. Limits: the buffer size
-and 256 live objects (`heap::MAX_OBJECTS`; every string inside a list counts); beyond that, `Error::OutOfMemory`.
+and 512 live objects at the `full` level, 256 at `minimal` and `medium` (`heap::MAX_OBJECTS`; every string inside a list
+counts, and the frozen modules keep about 250: `machine` 160, `network` 65); beyond that, `Error::OutOfMemory`.
+`gc.mem_free()` and `gc.objects_free()` show how much of each is left, `gc.collect()` frees garbage at once.
 Without a heap, creating strings or containers raises `Error::OutOfMemory`; everything else works.
 
 ```rust
@@ -539,24 +541,25 @@ include everything below the script: `main`, the REPL and `eval()`.
 
 | Code | Peak stack |
 |------|-----------:|
-| A statement at the top level (`x = 1`) | 48.5 KB |
-| Each further Python call (`def` function or method) | + 7.8 KB |
+| A statement at the top level (`x = 1`) | 51.5 KB |
+| Each further Python call (`def` function or method) | + 7.5 KB |
 | Each nested block (`if`, `for`, `while`, `try`, `with`) | + 1.6 KB |
-| Recursion until `RecursionError` (`MAX_CALL_DEPTH` = 8 calls) | 118 KB |
-| Methods with `with`, `try`, `*args`/`**kwargs`, f-strings, comprehensions, until `RecursionError` | 146 KB |
-| **Worst case found**: 4 nested blocks per call, until `RecursionError` (`MAX_NESTING` = 40) | **154 KB** |
+| Recursion until `RecursionError` (`MAX_CALL_DEPTH` = 8 calls) | 121.5 KB |
+| Methods with `with`, `try`, `*args`/`**kwargs`, f-strings, comprehensions, until `RecursionError` | 149 KB |
+| **Worst case found**: 4 nested blocks per call, until `RecursionError` (`MAX_NESTING` = 40) | **157 KB** |
 
 The main stack is 181 KB (what the 520 KB of RAM leaves after statics, the REPL's buffers in `dram2` and esp-hal), so
 the interpreter's limits stop scripts about 11 KB above the stack guard's floor (181 − 16 KB margin): the guard is the
-second line of defense (with Wi-Fi, 111 KB of stack, it's the one that stops deep recursion). Of the 48.5 KB at the
+second line of defense (with Wi-Fi, 102 KB of stack, it's the one that stops deep recursion: a top-level statement
+takes 53.5 KB there, which leaves room for about 5 nested Python calls). Of the 51.5 KB at the
 top level, `main` takes 12 KB (the board's drivers, a 4 KB SPI buffer and the flash driver's 4 KB buffer), the REPL
-29 KB (the 27 KB `Interpreter` struct, built out of line so that no temporary copy of it stays on the stack; 18 KB of
-it are the 96 function slots), and `eval()` with the call of `stack_peak()` itself the remaining 8 KB. `make report` lists the
+31.4 KB (the 30 KB `Interpreter` struct, built out of line so that no temporary copy of it stays on the stack; 18 KB of
+it are the 96 function slots, 6 KB the heap's object table), and `eval()` with the call of `stack_peak()` itself the remaining 8 KB. `make report` lists the
 biggest stack frames of a build.
 
-On another MCU, budget about 48 KB for `eval()` plus 8 KB per call level you allow, or use a smaller [feature
+On another MCU, budget about 52 KB for `eval()` plus 8 KB per call level you allow, or use a smaller [feature
 level](#feature-levels) or lower `MAX_CALL_DEPTH` and `MAX_NESTING` and set the stack floor. Keep the `Interpreter`
-(27 KB on 32-bit targets with the `full` level) in one place: build it
+(30 KB on 32-bit targets with the `full` level) in one place: build it
 with `new()`/`with_hardware()` and the `set_` methods rather than moving it through the `with_` builders.
 
 **No `unsafe` code.** The core library is `#![forbid(unsafe_code)]` (except the `link_section` attribute of the
@@ -617,7 +620,7 @@ one before:
 |-------|--------|---------------------------------------------|
 | `minimal` | ints, bools, `None`, strings, bytes, lists, tuples, dicts, comprehensions, `if`/`while`/`for`, `def` with defaults and keyword arguments, `lambda`, closures, decorators, exceptions, native modules and hardware functions, `builtins` | 16 / 48 / 6 |
 | `medium` | + floats and `math`, classes (`class`, `super()`, `@classmethod`, `__str__`, `__call__`, your own exceptions), string formatting (`%`, `str.format`, f-strings, `format()`, `hex()`/`bin()`/`oct()`) | 32 / 96 / 8 |
-| `full` | + files (`open()`, `os`), importing `.py` files and frozen modules, `sys`, `binascii`: everything Thonny and mpremote need | 96 / 128 / 8 |
+| `full` | + files (`open()`, `os`), importing `.py` files and frozen modules, `sys`, `binascii`, `gc`: everything Thonny and mpremote need | 96 / 128 / 8 |
 
 ```toml
 micropython-rs = { path = "...", default-features = false, features = ["medium"] }
@@ -636,7 +639,7 @@ The ESP32 firmware (`make flash LEVEL=minimal`), measured on the generic build a
 |---------|-----------------:|----------:|-------------------:|--------------------------------:|--------------------------------:|
 | `minimal` | 142.0 KB | 258 KB | 10.0 KB | 29 KB | 85 KB (6 calls) |
 | `medium` | 218.8 KB (floats: about 60 KB of it) | 356 KB | 15.5 KB | 35 KB | 108 KB (8 calls) |
-| `full` (default) | 231.2 KB + 9 KB `machine.py` | 380 KB | 29.1 KB (96 function slots) | 48.5 KB | 118 KB (8 calls) |
+| `full` (default) | 231.2 KB + 13 KB frozen `machine.py`, `time.py` | 380 KB | 31.4 KB (96 function slots, 512 objects) | 51.5 KB | 121.5 KB (8 calls) |
 
 "Interpreter in RAM" is the REPL's stack frame, which holds the `Interpreter` struct; its tables shrink with the
 level. Speed is the same at every level. Thonny, mpremote's file commands and the `machine` module need `full`.
@@ -1073,6 +1076,7 @@ terminal against it on a PC without a board.
 | [`scripts/button.py`](micropython-esp32/scripts/button.py) | Counting button presses with a pull-up and debouncing, timed with `ticks_ms` |
 | [`scripts/pwm_fade.py`](micropython-esp32/scripts/pwm_fade.py) | Fading an LED, and a 50 Hz servo pulse |
 | [`scripts/i2c_scan.py`](micropython-esp32/scripts/i2c_scan.py) | Scanning the I²C bus, and reading registers with `i2c_write_read` |
+| [`scripts/yard_lights.py`](micropython-esp32/scripts/yard_lights.py) | Yard lights: an LED strip on at sunset and off at sunrise, for months. Sunrise/sunset computed from the location, the clock from NTP, EU summer time, a watchdog, a status screen. See [Yard lights app](#yard-lights-app) (`FEATURES=tft,wifi`) |
 | [`scripts/wifi_scanner.py`](micropython-esp32/scripts/wifi_scanner.py) | A Wi-Fi scanner app in the calculator's style: networks strongest first with signal bars, dBm, channel and security; a details page with signal quality and BSSID; two-button navigation (`FEATURES=tft,wifi`) |
 | [`scripts/wifi_ap.py`](micropython-esp32/scripts/wifi_ap.py) | `network.WLAN(network.AP_IF)`: the board's own Wi-Fi network, showing devices as they join and leave (`FEATURES=wifi`) |
 | [`scripts/wifi_connect.py`](micropython-esp32/scripts/wifi_connect.py) | `network.WLAN`: scan, connect with error handling, `ifconfig()` (`FEATURES=wifi`) |
@@ -1170,6 +1174,60 @@ ADC2, so ADC1 readings (GPIO32–39) came out mirrored (`4095 - value`; an uncon
 | [`scripts/watchdog.py`](micropython-esp32/scripts/watchdog.py) | The watchdog resetting a hung script, and `reset_cause()` after the reboot |
 | [`scripts/errors.py`](micropython-esp32/scripts/errors.py) | A forbidden pin reported as `ValueError` with its line number |
 
+### Yard lights app
+
+[`scripts/yard_lights.py`](micropython-esp32/scripts/yard_lights.py) switches an LED strip on at sunset and off at
+sunrise, every day, unattended for months: the board computes sunrise and sunset for its location, gets the time from
+NTP over Wi-Fi and follows the EU summer time rules. It uses `machine.Pin`, `machine.WDT`, `network.WLAN`, `ntptime`,
+`time` and `math`, and, on the TTGO, `display` and `buttons` (without them it runs headless and reports to the serial
+port).
+
+```sh
+# edit the configuration at the top of the script (Wi-Fi, location, pin), then:
+make flash FEATURES=tft,wifi
+python3 tools/mpy.py save scripts/yard_lights.py     # runs at every power-up
+```
+
+| Setting | Default | Meaning |
+|---------|---------|---------|
+| `WIFI_SSID`, `WIFI_PASSWORD` | | The network (a 2.4 GHz IoT network is fine: it's only used for NTP) |
+| `LATITUDE`, `LONGITUDE` | 52.4064, 16.9252 (Poznań) | Degrees, north and east positive |
+| `UTC_OFFSET`, `EU_SUMMER_TIME` | 1, `True` | Poland: CET (UTC+1), CEST (UTC+2) from the last Sunday of March to the last Sunday of October, 01:00 UTC |
+| `LED_PIN`, `LED_ACTIVE_HIGH` | 26, `True` | The pin to the MOSFET or relay; `False` for relay modules that switch on with a low input |
+| `SUN_ANGLE` | -0.833 | The sun's height at the switch: -0.833 is sunrise/sunset, -6 civil dusk/dawn (about 35 min later/earlier) |
+| `ON_DELAY_MIN`, `OFF_ADVANCE_MIN` | 0, 0 | Minutes after sunset / before sunrise |
+| `NIGHT_BREAK` | `None` | `((0, 30), (5, 0))`: off from 00:30 to 05:00 local time, to save power |
+| `LIGHTS_WITHOUT_CLOCK` | `False` | The lights while the clock isn't set yet (no Wi-Fi after a power cut) |
+| `NTP_HOST`, `SYNC_HOURS` | `pl.pool.ntp.org`, 6 | Where and how often to set the clock |
+| `SCREEN_SECONDS`, `WATCHDOG_MS` | 60, 60000 | The screen goes dark after this long; the board resets if the script stops for this long |
+
+The screen shows the state (ON in orange, OFF), why (after sunset, daylight, night break, manual), the next switch,
+today's sunrise and sunset, the clock's state and the Wi-Fi signal. Buttons: LEFT wakes the screen, holding it
+switches the lights by hand until the next scheduled switch; RIGHT shows the details page (location, time zone, last
+sync, IP address, time running), holding it sets the clock from NTP now.
+
+**Wiring.** A 12 V LED strip needs a switch between the strip and its supply: a logic-level N-channel MOSFET (gate to
+GPIO26 through 100 Ω, 100 kΩ from gate to ground, drain to the strip's minus, source to ground), or a 3.3 V relay
+module. Connect the grounds of the supply and the board. Power the board from the strip's supply through a 5 V
+step-down converter. Don't drive the strip from the GPIO itself: a pin gives 20-40 mA.
+
+**Running for months.** The clock is set again every 6 hours (the ESP32's clock drifts a few seconds a day). When
+Wi-Fi or NTP fails, it retries after 1, 2, 4 ... up to 30 minutes, and Wi-Fi reconnects when the router comes back.
+The watchdog resets the board if the script hangs or stops on an error; after a reset the clock is gone until
+the first NTP answer (seconds when Wi-Fi works). Sunrise and sunset use NOAA's solar equations (Meeus): within 24 s of
+[astral](https://pypi.org/project/astral/) for Poznań over 2026-2028 (36 s for civil dusk), and the time zone matched
+CPython's `Europe/Warsaw` at every hour of those 3 years. Polar day and night are handled (off all day, on all day).
+
+Measured on the TTGO (`FEATURES=tft,wifi`, 80 MHz): the first sync with connecting to Wi-Fi 1.1-4.7 s; a schedule check
+(every second) 9 ms; a redraw 80-110 ms; sunrise/sunset for a day 80 ms, done twice a day. Stack at most 81 KB of the
+102 KB, heap 19 KB and 137 objects free. Switching checked by setting the clock to a minute before and after sunset,
+sunrise and the night break; after Ctrl-C at the `>>>` prompt, the watchdog reset the board after 62 s and `main.py`
+started again.
+
+Nice to have: a DS3231 RTC module on I²C (keeps the time without Wi-Fi after a power cut), a light sensor (an LDR on
+GPIO36) to switch on early on dark days, PWM dimming (`machine.PWM` on the MOSFET's gate, e.g. 30 % after midnight),
+and a motion sensor (PIR, `Pin.irq()`) for full brightness when someone walks by.
+
 ### Hardware API
 
 The names follow MicroPython's `time` and `machine` modules, as flat functions. The [`machine` module](#the-machine-module)
@@ -1185,7 +1243,8 @@ Pins are plain GPIO numbers.
 | I²C | `i2c_init(sda, scl, [freq])`, `i2c_scan()`, `i2c_write(addr, data)`, `i2c_read(addr, n)`, `i2c_write_read(addr, data, n)`, `i2c_probe(addr)`, `i2c_read_reg(addr, reg)`, `i2c_read_reg16(addr, reg)`, `i2c_write_reg(addr, reg, value)` | 100 kHz on SDA = GPIO21, SCL = GPIO22 at boot; `i2c_init` moves the bus to other allowed pins or changes the speed (1 kHz – 1 MHz). `i2c_scan()` returns the addresses as `bytes` (`for a in i2c_scan(): print(hex(a))`). `data` is `bytes` (or a `str`); reads return `bytes`, up to 512 at a time. `i2c_write_read` writes (e.g. a register number) and reads back without a stop in between. 16-bit reads are big-endian. A device that doesn't answer raises `OSError` |
 | UART | `uart_init(tx, rx, [baud])`, `uart_write(data)`, `uart_read([n], [timeout_ms])`, `uart_any()` | UART1 on any two allowed pins, default 115 200 baud (300 to 5 000 000). `uart_write` returns the bytes sent; `uart_read` waits until `n` bytes (default 512) or `timeout_ms` (default 100) and returns what came, possibly `b''`; `uart_any()` counts the bytes waiting. Ctrl-C stops a wait. `uart_init` again changes pins or speed |
 | SPI | `spi_init(sck, mosi, miso, [khz], [mode])`, `spi_write(data)`, `spi_transfer(data)`, `spi_read(n, [fill])` | SPI3 master, default 1000 kHz (10 to 40 000) and mode 0 (0–3). Chip select is yours: a GPIO with `pin_write`. `spi_transfer` returns the bytes read while sending; `spi_read` sends `fill` (default 0) |
-| Watchdog | `wdt_enable(timeout_ms)`, `wdt_feed()`, `wdt_disable()` | The RTC watchdog resets the whole board when it isn't fed in time. `sleep_ms` feeds it automatically every 100 ms |
+| Watchdog | `wdt_enable(timeout_ms)`, `wdt_feed()`, `wdt_disable()` | The RTC watchdog resets the whole board when it isn't fed in time. `sleep_ms` feeds it automatically every 100 ms; the `>>>` prompt doesn't, so after a script ends (an error, Ctrl-C) the board resets and runs `main.py` again |
+| Clock | `rtc_set(seconds, [microseconds])`, `wifi_ntp(host, [timeout_ms])` (`wifi` only) | The wall clock behind `time.time()`, in seconds since 2000-01-01 UTC (MicroPython's ESP32 epoch). It starts at 2000-01-01 after a reset (no battery) and survives soft resets. `wifi_ntp` asks an NTP server (a name, looked up with the router's DNS server, or an IP address) and returns microseconds since 2000; `OSError` when it doesn't answer. Use them through `ntptime` and `machine.RTC` |
 | System | `reset()`, `reset_cause()`, `stack_peak()`, `unique_id()`, `cpu_freq()` | `reset_cause()` returns `PWRON_RESET`, `HARD_RESET`, `WDT_RESET`, `DEEPSLEEP_RESET` or `SOFT_RESET` (MicroPython's values). The firmware also prints the reset reason at boot. `stack_peak()`: the most bytes of the main stack used since its previous call (or boot), see [Stack budget](#stack-budget-measured-on-the-esp32). `unique_id()`: the chip's MAC address (6 bytes). `cpu_freq()`: the CPU clock in Hz (`CPU_MHZ`, 80 MHz by default) |
 | Battery (`tft` only) | `battery_mv([samples])` | Battery voltage in mV: switches on the TTGO's divider (`ADC_EN`, GPIO14), reads GPIO34, doubles it, switches the divider off |
 | TFT (`tft` only) | `cls()`, `color(r, g, b)`, `text(x, y, s)`, `rect(x, y, w, h)`, `backlight(on)` | `color` sets the text and fill color (0–255 per channel). `text` and `rect` draw at pixel positions. `WIDTH` and `HEIGHT` are 240 and 135 |
@@ -1256,8 +1315,13 @@ script goes on; a soft reset (Ctrl-D) stops them all. Measured on the TTGO: a 50
 `sleep_ms(1000)`, a 100 Hz timer 50 times in a 500 ms busy loop, 5 pulses on a pin give 10 callbacks with both
 edges; with a timer set, scripts run about 6 % slower (an event check per statement), without one at the same speed.
 
-Not there yet: level triggers, `RTC`, `Signal`, and the `*_into` methods (`readinto`, `write_readinto`,
-`readfrom_mem_into`), which need `bytearray`. The module takes 48 of the 96 function slots (`MAX_FUNCS`), and each
+`machine.RTC()` keeps the time as on MicroPython's ESP32 port: `rtc.datetime()` is `(year, month, day, weekday,
+hours, minutes, seconds, microseconds)`, `rtc.datetime((2026, 11, 26, 0, 7, 32, 0, 0))` sets it (the weekday is
+ignored). The ESP32 has no battery for it: after a reset or power-up it starts at 2000-01-01 again, so set it from
+NTP (`ntptime.settime()`) or keep another clock (a DS3231 module on I²C). It drifts a few seconds a day.
+
+Not there yet: level triggers, `Signal`, and the `*_into` methods (`readinto`, `write_readinto`,
+`readfrom_mem_into`), which need `bytearray`. The module takes 51 of the 96 function slots (`MAX_FUNCS`), and each
 method call runs Python code: `led.value(1)` takes 1.2 ms
 on the ESP32 at 80 MHz (0.43 ms at 240 MHz), `pin_write(2, 1)` 0.27 ms (0.12 ms). Fine for blinking, sensors and
 buses, too slow for bit-banging.
@@ -1345,8 +1409,22 @@ What Wi-Fi costs (the reason it's a feature, not in every build):
 | Main stack | 181 KB | 102 KB (recursion ends with `RecursionError` at about 95 KB instead of 154 KB) |
 | Speed with Wi-Fi off / connected | | the same / 2 % slower (the scheduler's ticks) |
 
+The time over Wi-Fi, as on MicroPython:
+
+```python
+import ntptime, time
+ntptime.host = 'pl.pool.ntp.org'   # default: pool.ntp.org; ntptime.timeout = 1 (seconds)
+ntptime.settime()                  # sets the clock (UTC); OSError when no server answers
+print(time.localtime())            # (2026, 11, 25, 23, 30, 6, 2, 329): UTC, the board has no time zone
+```
+
+The firmware looks names up with smoltcp's DNS client (the DNS server DHCP gave, or 8.8.8.8), then sends one SNTP
+request. Measured on the TTGO: `settime()` takes 23-77 ms, an unknown name fails in 40 ms; about 1 query in 10 gets
+no answer (UDP), and NTP servers ignore a repeat within a few seconds, so retry after a pause.
+
 Not there yet: static addresses (`ifconfig((...))`), and sockets (`socket`, `urequests`), which are next. `network`
-takes 12 function slots, so a script using both `machine` and `network` has 36 of the 96 left.
+takes 12 function slots, `time` and `ntptime` 2 each, so a script using `machine`, `network` and `ntptime` has 29 of
+the 96 left.
 
 #### Modules
 
@@ -1354,7 +1432,9 @@ takes 12 function slots, so a script using both `machine` and `network` has 36 o
 |--------|--------|----------|
 | `machine` | both | MicroPython's hardware classes, see [The `machine` module](#the-machine-module) |
 | `network` | `wifi` | Wi-Fi: `network.WLAN`, see [The `network` module](#the-network-module-wi-fi) |
-| `time` | both | `sleep(s)` (also a float: `sleep(0.5)`), `sleep_ms(ms)`, `sleep_us(us)`, `ticks_ms()`, `ticks_us()`, `ticks_diff(new, old)`, with MicroPython's names, so `import time; time.sleep_ms(100)` works as on MicroPython |
+| `time` | both | `sleep(s)` (also a float: `sleep(0.5)`), `sleep_ms(ms)`, `sleep_us(us)`, `ticks_ms()`, `ticks_us()`, `ticks_diff(new, old)`, `ticks_add(t, delta)`, `time()`, `time_ns()`, with MicroPython's names, so `import time; time.sleep_ms(100)` works as on MicroPython. At the `full` level also `gmtime([secs])`, `localtime([secs])` (the same: no time zone) and `mktime(tuple)`, in Python (a frozen `time.py` on top of the native `utime`). `time()` counts seconds since 2000-01-01 UTC, MicroPython's ESP32 epoch |
+| `ntptime` | `wifi` | `settime()`, `time()`, `host`, `timeout`: the clock from an NTP server |
+| `gc` | both | `collect()`, `mem_free()`, `mem_alloc()`, `objects_free()` (free object-table entries, not in MicroPython), `enable()`/`disable()`/`isenabled()` (collection is always on) |
 | `display` | `tft` | Drawing on the 240 × 135 TFT. See below |
 | `buttons` | both | Debounced button events with short and long presses. TTGO: `LEFT` = GPIO0, `RIGHT` = GPIO35; generic build: `LEFT` = BOOT button (GPIO0) |
 
@@ -1373,6 +1453,7 @@ display.text(8, 120, 'hello', display.YELLOW, display.BLUE)  # text color, backg
 | `display` function | Draws |
 |--------------------|-------|
 | `fill(color)` | The whole screen. Also moves the console cursor to the top |
+| `backlight(on)` | Backlight off (0) or on (1); the picture stays. It's on again when a script ends |
 | `pixel(x, y, [color])` | One pixel |
 | `line(x0, y0, x1, y1, [color])`, `hline(x, y, w, [color])`, `vline(x, y, h, [color])` | Lines |
 | `rect(x, y, w, h, [color])`, `fill_rect(...)` | Rectangle outline / filled |
