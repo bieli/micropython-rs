@@ -852,6 +852,12 @@ the I2C bus, the ADC pins; Wi-Fi: a scan found 6 networks in 0.9 s, connected wi
 access point next to the station. Stack: a top-level statement takes 43.5 KB, recursion stops at `MAX_CALL_DEPTH` (8
 calls, 113 KB) before the stack guard, and the worst case found takes 130 KB of the 141 KB.
 
+Wi-Fi and the ADC: the radio's calibration uses the same SAR ADC as `adc_read`/`adc_mv`/`machine.ADC` and changes
+its settings (the controller, attenuations, and on the S3 the calibration code, which esp-hal only writes when it
+changes). So with Wi-Fi running, each ADC call sets ADC1 up again first, as ESP-IDF does before every one-shot reading:
+0.12 ms more per call on the S3 at 80 MHz (0.41 instead of 0.28 ms for one sample, 1.26 instead of 1.14 ms for 64).
+Builds without Wi-Fi are unchanged.
+
 The S3's USB-Serial/JTAG port ignores a flush while its previous packet is still going out, so a short write right
 after another one would wait for the next write (the raw REPL's closing `\x04>`, and `mpy.py` timed out). The
 firmware flushes once more while it waits for input ([`serial_input.rs`](micropython-esp32/src/serial_input.rs)).

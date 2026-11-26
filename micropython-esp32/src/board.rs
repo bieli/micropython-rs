@@ -230,6 +230,47 @@ pub struct BoardPeripherals<'d> {
     pub lpwr: LPWR<'d>,
 }
 
+/// ADC1 with its three pins (`ADC_PINS`), at 11 dB attenuation (0-3.1 V).
+struct Analog<'d> {
+    adc: Adc<'d, ADC1<'d>, Blocking>,
+    pin_a: AdcPin<chip::AdcA<'d>, ADC1<'d>, chip::AdcCal<'d>>,
+    pin_b: AdcPin<chip::AdcB<'d>, ADC1<'d>, chip::AdcCal<'d>>,
+    pin_c: AdcPin<chip::AdcC<'d>, ADC1<'d>, chip::AdcCal<'d>>,
+}
+
+impl<'d> Analog<'d> {
+    fn new(adc1: ADC1<'d>, a: chip::AdcA<'d>, b: chip::AdcB<'d>, c: chip::AdcC<'d>) -> Self {
+        let mut config = AdcConfig::new();
+        // ESP32-S3: calibrated with the chip's eFuse values (`chip::AdcCal`)
+        #[cfg(feature = "esp32s3")]
+        let (pin_a, pin_b, pin_c) = (
+            config.enable_pin_with_cal(a, Attenuation::_11dB),
+            config.enable_pin_with_cal(b, Attenuation::_11dB),
+            config.enable_pin_with_cal(c, Attenuation::_11dB),
+        );
+        #[cfg(feature = "esp32")]
+        let (pin_a, pin_b, pin_c) = (
+            config.enable_pin(a, Attenuation::_11dB),
+            config.enable_pin(b, Attenuation::_11dB),
+            config.enable_pin(c, Attenuation::_11dB),
+        );
+        let adc = Adc::new(adc1, config);
+        // esp-hal 1.0 bug workaround: on the ESP32, ADC1 results from the RTC
+        // controller come out inverted (4095 - value) unless SAR1_DATA_INV is
+        // set, like ESP-IDF does. `Adc::new` only sets the ADC2 bit.
+        #[cfg(feature = "esp32")]
+        esp_hal::peripherals::SENS::regs()
+            .sar_read_ctrl()
+            .modify(|_, w| w.sar1_data_inv().set_bit());
+        Self {
+            adc,
+            pin_a,
+            pin_b,
+            pin_c,
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq)]
 enum PinMode {
     Output,
@@ -241,10 +282,8 @@ pub struct Board<'d> {
     /// Pins scripts may use.
     allowed: &'static [u8],
     pins: [Option<(Flex<'d>, PinMode)>; chip::GPIO_COUNT],
-    adc: Adc<'d, ADC1<'d>, Blocking>,
-    adc_a: AdcPin<chip::AdcA<'d>, ADC1<'d>, chip::AdcCal<'d>>,
-    adc_b: AdcPin<chip::AdcB<'d>, ADC1<'d>, chip::AdcCal<'d>>,
-    adc_c: AdcPin<chip::AdcC<'d>, ADC1<'d>, chip::AdcCal<'d>>,
+    /// ADC1 and its three pins (`None` only while `refresh_adc` rebuilds it)
+    analog: Option<Analog<'d>>,
     ledc: Ledc<'d>,
     pwm_pins: [Option<u8>; PWM_SLOTS],
     /// The I2C bus (`None` only while `i2c_init` replaces it).
@@ -269,28 +308,7 @@ pub struct Board<'d> {
 impl<'d> Board<'d> {
     /// `allowed` lists the GPIO numbers scripts may use with `pin_*` and `pwm`.
     pub fn new(p: BoardPeripherals<'d>, allowed: &'static [u8]) -> Self {
-        let mut adc_config = AdcConfig::new();
-        // ESP32-S3: calibrated with the chip's eFuse values (`chip::AdcCal`)
-        #[cfg(feature = "esp32s3")]
-        let (adc_a, adc_b, adc_c) = (
-            adc_config.enable_pin_with_cal(p.adc_a, Attenuation::_11dB),
-            adc_config.enable_pin_with_cal(p.adc_b, Attenuation::_11dB),
-            adc_config.enable_pin_with_cal(p.adc_c, Attenuation::_11dB),
-        );
-        #[cfg(feature = "esp32")]
-        let (adc_a, adc_b, adc_c) = (
-            adc_config.enable_pin(p.adc_a, Attenuation::_11dB),
-            adc_config.enable_pin(p.adc_b, Attenuation::_11dB),
-            adc_config.enable_pin(p.adc_c, Attenuation::_11dB),
-        );
-        let adc = Adc::new(p.adc1, adc_config);
-        // esp-hal 1.0 bug workaround: on the ESP32, ADC1 results from the RTC
-        // controller come out inverted (4095 - value) unless SAR1_DATA_INV is
-        // set, like ESP-IDF does. `Adc::new` only sets the ADC2 bit.
-        #[cfg(feature = "esp32")]
-        esp_hal::peripherals::SENS::regs()
-            .sar_read_ctrl()
-            .modify(|_, w| w.sar1_data_inv().set_bit());
+        let analog = Analog::new(p.adc1, p.adc_a, p.adc_b, p.adc_c);
 
         let mut ledc = Ledc::new(p.ledc);
         ledc.set_global_slow_clock(LSGlobalClkSource::APBClk);
@@ -307,10 +325,7 @@ impl<'d> Board<'d> {
             delay: Delay::new(),
             allowed,
             pins: [const { None }; chip::GPIO_COUNT],
-            adc,
-            adc_a,
-            adc_b,
-            adc_c,
+            analog: Some(analog),
             ledc,
             pwm_pins: [None; PWM_SLOTS],
             i2c: Some(i2c),
@@ -1011,18 +1026,45 @@ impl<'d> Board<'d> {
     /// One reading as the ADC gives it: a raw 12-bit value on the ESP32,
     /// calibrated millivolts on the ESP32-S3 (`chip::ADC_READS_MV`).
     fn adc_sample(&mut self, pin: i64) -> Result<i64, Error> {
+        let a = self.analog.as_mut().ok_or(Error::IoError)?;
         let value = match pin {
-            p if p == ADC_PINS[0] as i64 => nb::block!(self.adc.read_oneshot(&mut self.adc_a)),
-            p if p == ADC_PINS[1] as i64 => nb::block!(self.adc.read_oneshot(&mut self.adc_b)),
-            p if p == ADC_PINS[2] as i64 => nb::block!(self.adc.read_oneshot(&mut self.adc_c)),
+            p if p == ADC_PINS[0] as i64 => nb::block!(a.adc.read_oneshot(&mut a.pin_a)),
+            p if p == ADC_PINS[1] as i64 => nb::block!(a.adc.read_oneshot(&mut a.pin_b)),
+            p if p == ADC_PINS[2] as i64 => nb::block!(a.adc.read_oneshot(&mut a.pin_c)),
             _ => return Err(Error::ValueError),
         };
         value.map(i64::from).map_err(|_| Error::IoError)
     }
 
+    /// With Wi-Fi running, sets ADC1 up again before a reading. The radio's
+    /// calibration (when it starts, and while it runs) uses the same SAR ADC
+    /// and changes its settings: the controller, attenuations and, on the
+    /// ESP32-S3, the calibration code, which esp-hal writes only when it
+    /// differs from the last one it wrote, so readings would stay off until
+    /// a reset. ESP-IDF sets the ADC up before every one-shot reading too.
+    /// Without Wi-Fi, nothing else touches the ADC.
+    fn refresh_adc(&mut self) {
+        #[cfg(feature = "wifi")]
+        if self.station.is_some() {
+            // The old driver goes first: the new one takes the same hardware
+            self.analog = None;
+            // SAFETY: the pins and ADC1 belonged to the driver just dropped,
+            // which the board owned alone
+            self.analog = Some(unsafe {
+                Analog::new(
+                    ADC1::steal(),
+                    chip::AdcA::steal(),
+                    chip::AdcB::steal(),
+                    chip::AdcC::steal(),
+                )
+            });
+        }
+    }
+
     /// A raw 12-bit reading (0-4095). On the ESP32-S3 it comes from the
     /// calibrated millivolts, scaled to the 11 dB range.
     fn adc_read(&mut self, pin: i64) -> Result<i64, Error> {
+        self.refresh_adc();
         let value = self.adc_sample(pin)?;
         if chip::ADC_READS_MV {
             return Ok((value * 4095 / chip::ADC_FULL_SCALE_MV).clamp(0, 4095));
@@ -1037,6 +1079,7 @@ impl<'d> Board<'d> {
         if !(1..=MAX_ADC_SAMPLES).contains(&samples) {
             return Err(Error::ValueError);
         }
+        self.refresh_adc();
         let mut total = 0;
         for _ in 0..samples {
             total += self.adc_sample(pin)?;
