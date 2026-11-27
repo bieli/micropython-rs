@@ -1108,11 +1108,19 @@ dependencies = [
  "esp-rtos",
  "esp-storage",
  "libm",
+ "micropython-port",
  "micropython-rs",
  "mipidsi",
  "nb 1.1.0",
  "portable-atomic",
  "smoltcp",
+]
+
+[[package]]
+name = "micropython-port"
+version = "0.1.0"
+dependencies = [
+ "micropython-rs",
 ]
 
 [[package]]

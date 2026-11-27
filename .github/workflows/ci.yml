@@ -42,6 +42,16 @@ jobs:
       - name: Feature levels minimal and medium (lints, tests, no_std build)
         run: make levels
 
+      # The board-independent REPL: its tests on a mock board, and a no_std
+      # build for a bare Arm core (no chip code may creep in)
+      - name: Shared firmware crate (micropython-port)
+        working-directory: micropython-port
+        run: |
+          cargo fmt -- --check
+          cargo clippy --all-targets -- -D warnings
+          cargo test
+          cargo build --target thumbv7em-none-eabihf
+
       # Real tools against `mpy-cli --repl` on a pseudo-terminal (same REPL
       # protocol as the ESP32 firmware)
       - name: End-to-end tests with Thonny 3.2.7 and 5.0's backends and mpremote

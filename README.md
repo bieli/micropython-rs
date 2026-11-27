@@ -955,6 +955,13 @@ The [`micropython-esp32/`](micropython-esp32) folder holds the firmware. It runs
 with a MicroPython-style hardware API: time, GPIO, ADC, PWM, I²C, a watchdog, and drawing on the TTGO's screen.
 You pick the board with a **Cargo feature** and the script with **`SCRIPT=`**.
 
+The REPL itself (the `>>>` prompt, MicroPython's raw REPL that `mpremote`, Thonny and `tools/mpy.py` use, and the
+`#@` file commands) is in [`micropython-port/`](micropython-port), a crate without any chip code. A board implements its
+`Port` trait (how bytes reach its console and leave it, the lowest stack address scripts may use, its name and
+build) and hands over the memory for the sessions, its frozen modules and a flash file system. The ESP32 firmware is
+one such board ([`src/repl.rs`](micropython-esp32/src/repl.rs)); `micropython-port/tests/repl.rs` drives the same REPL
+on a PC through a mock board.
+
 ### Supported boards (`FEATURES`)
 
 | Board | Cargo feature | Make command | Python `print()` goes to | Extra functions |

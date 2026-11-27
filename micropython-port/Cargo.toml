@@ -1,0 +1,14 @@
+[package]
+name = "micropython-port"
+version = "0.1.0"
+edition = "2021"
+authors = ["Marcin Bielak <marcin.bieli+github+micropython-rs@gmail.com>"]
+license = "Apache-2.0"
+description = "The board-independent part of micropython-rs firmware: the REPL, MicroPython's raw REPL and the #@ file commands of tools/mpy.py"
+
+[dependencies]
+# The firmware chooses the interpreter's features (its level, float32, ...)
+micropython-rs = { path = "..", default-features = false }
+
+[dev-dependencies]
+micropython-rs = { path = "..", features = ["full"] }

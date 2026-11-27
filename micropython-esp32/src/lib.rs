@@ -1,7 +1,5 @@
 #![no_std]
 
-use core::sync::atomic::AtomicBool;
-
 pub mod bench;
 pub mod board;
 pub mod buttons;
@@ -15,9 +13,9 @@ pub mod storage;
 #[cfg(feature = "wifi")]
 pub mod wifi;
 
-/// Set by Ctrl-C on the serial port; stops the running script
-/// (checked by the interpreter between statements and inside `sleep_ms`).
-pub static ABORT: AtomicBool = AtomicBool::new(false);
+/// Set by Ctrl-C on the serial port; stops the running script (the REPL's,
+/// in `micropython-port`).
+pub use micropython_port::ABORT;
 
 /// The firmware version and the git commit it's built from (`e3f938c`,
 /// `e3f938c-dirty`; `unknown` outside a checkout).
@@ -26,7 +24,7 @@ pub const COMMIT: &str = env!("MPY_GIT_COMMIT");
 
 /// How the firmware was built, as `make` options: `chip=esp32 level=full
 /// features=tft,wifi float=64 mhz=80` (`#@version`, `tools/mpy.py`).
-pub fn build_options(out: &mut impl core::fmt::Write) -> core::fmt::Result {
+pub fn build_options(out: &mut dyn core::fmt::Write) -> core::fmt::Result {
     let chip = if cfg!(feature = "esp32s3") {
         "esp32s3"
     } else if cfg!(feature = "esp32c3") {
