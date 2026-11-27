@@ -677,7 +677,13 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
             } else {
                 self.globals_len
             };
-            let funcs = self.funcs.iter().flatten().filter(|f| f.named()).count();
+            let funcs = self
+                .funcs
+                .slots()
+                .iter()
+                .flatten()
+                .filter(|f| f.named())
+                .count();
             return Some(n + funcs);
         }
         let Value::Obj(r) = v else {
@@ -1403,10 +1409,10 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
                 return;
             }
             Value::Func(i) => {
-                let bit = 1u128 << i;
-                if self.func_marks & bit == 0 {
-                    self.func_marks |= bit;
-                    if let Some(f) = self.funcs[i as usize] {
+                let (word, bit) = (i as usize / 128, 1u128 << (i % 128));
+                if self.func_marks[word] & bit == 0 {
+                    self.func_marks[word] |= bit;
+                    if let Some(f) = self.funcs.slots()[i as usize] {
                         self.mark_value(f.defaults, work, n);
                         self.mark_value(f.module, work, n);
                     }

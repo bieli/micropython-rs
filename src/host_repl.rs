@@ -76,7 +76,8 @@ fn new_vm(files: &'static RefCell<dyn FileSystem>) -> Vm {
         .with_heap(heap)
         .with_files(files)
         .with_module_memory(modules)
-        .with_stmt_cache(cache);
+        .with_stmt_cache(cache)
+        .with_func_slots(Box::leak(vec![None; 255].into_boxed_slice()));
     vm.set_abort_flag(&ABORT);
     vm
 }

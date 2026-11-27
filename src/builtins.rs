@@ -237,7 +237,8 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
                 Value::ExcClass(c) => Some(super::exceptions::class_name(c)),
                 Value::Module(m) => self.module(m).map(|m| m.name),
                 Value::Func(f) => {
-                    self.funcs[f as usize].map(|f| if f.lambda { "<lambda>" } else { f.name })
+                    self.funcs.slots()[f as usize]
+                        .map(|f| if f.lambda { "<lambda>" } else { f.name })
                 }
                 _ => None,
             };
@@ -551,8 +552,8 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
                 let (name, v) = self.vars[i];
                 self.dict_set(d, Value::Str(name), v)?;
             }
-            for i in 0..self.funcs.len() {
-                if let Some(f) = self.funcs[i] {
+            for i in 0..self.funcs.slots().len() {
+                if let Some(f) = self.funcs.slots()[i] {
                     if f.named() {
                         self.dict_set(d, Value::Str(f.name), Value::Func(i as u8))?;
                     }
@@ -579,7 +580,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
             if self.call_depth > 0 {
                 self.globals_len = 0;
             }
-            for f in self.funcs.iter_mut() {
+            for f in self.funcs.slots_mut().iter_mut() {
                 if f.is_some_and(|f| f.named()) {
                     *f = None;
                 }
@@ -604,6 +605,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
             return Ok(self.vars[i].1);
         }
         self.funcs
+            .slots()
             .iter()
             .position(|f| f.is_some_and(|f| f.named() && f.name == name))
             .map(|i| Value::Func(i as u8))
@@ -642,10 +644,11 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
         }
         let slot = self
             .funcs
+            .slots()
             .iter()
             .position(|f| f.is_some_and(|f| f.named() && f.name == name))
             .ok_or(Error::KeyError)?;
-        self.funcs[slot] = None;
+        self.funcs.slots_mut()[slot] = None;
         Ok(())
     }
 

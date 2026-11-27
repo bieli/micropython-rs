@@ -563,14 +563,18 @@ include everything below the script: `main`, the REPL and `eval()`.
 | Methods with `with`, `try`, `*args`/`**kwargs`, f-strings, comprehensions, until `RecursionError` | 149 KB |
 | **Worst case found**: 4 nested blocks per call, until `RecursionError` (`MAX_NESTING` = 40) | **157 KB** |
 
-The main stack is 181 KB (what the 520 KB of RAM leaves after statics, the REPL's buffers in `dram2` and esp-hal), so
-the interpreter's limits stop scripts about 11 KB above the stack guard's floor (181 − 16 KB margin): the guard is the
-second line of defense (with Wi-Fi, 102 KB of stack, it's the one that stops deep recursion: a top-level statement
-takes 53.5 KB there, which leaves room for about 5 nested Python calls). Of the 51.5 KB at the
-top level, `main` takes 12 KB (the board's drivers, a 4 KB SPI buffer and the flash driver's 4 KB buffer), the REPL
-31.4 KB (the 30 KB `Interpreter` struct, built out of line so that no temporary copy of it stays on the stack; 18 KB of
-it are the 96 function slots, 6 KB the heap's object table), and `eval()` with the call of `stack_peak()` itself the remaining 8 KB. `make report` lists the
-biggest stack frames of a build.
+The table above was measured before the function table moved out of the `Interpreter` struct (see below). The
+main stack is what the 520 KB of RAM leaves after statics, the REPL's buffers in `dram2` and esp-hal; the
+interpreter's limits stop scripts above the stack guard's floor (16 KB margin): the guard is the second line of
+defense (with Wi-Fi it's the one that stops deep recursion).
+
+The function table and the statement cache are statics of the firmware (`Interpreter::with_func_slots`,
+`with_stmt_cache`), not part of the `Interpreter` struct: the struct is 15 KB on the ESP32 instead of 30, and starting
+the REPL, which builds, moves and keeps it, needs about 40 KB of stack instead of 88 (`repl::run` 16 KB,
+`new_interpreter` 15 KB, `from_parts` 8.6 KB). Measured on the TTGO with Wi-Fi (`FEATURES=tft,wifi`): a top-level
+statement takes 37.8 KB of the 83.5 KB stack (before: 53.6 of 102 KB); 4 nested Python calls fit, about as many as
+before: next to the Wi-Fi driver there's no RAM to spare, only to move, and each call still takes about 7.5 KB.
+Without Wi-Fi the stack is 162 KB. `make report` lists the biggest stack frames of a build.
 
 #### Statement cache
 
@@ -679,7 +683,7 @@ The ESP32 firmware (`make flash LEVEL=minimal`), measured on the generic build a
 |---------|-----------------:|----------:|-------------------:|--------------------------------:|--------------------------------:|
 | `minimal` | 142.0 KB | 258 KB | 10.0 KB | 29 KB | 85 KB (6 calls) |
 | `medium` | 218.8 KB (floats: about 60 KB of it) | 356 KB | 15.5 KB | 35 KB | 108 KB (8 calls) |
-| `full` (default) | 231.2 KB + 13 KB frozen `machine.py`, `time.py` | 380 KB | 31.4 KB (96 function slots, 512 objects) | 51.5 KB | 121.5 KB (8 calls) |
+| `full` (default) | 231.2 KB + 13 KB frozen `machine.py`, `time.py` | 380 KB | 31.4 KB (96 function slots, 512 objects; before the function table moved out: 16 KB now) | 51.5 KB | 121.5 KB (8 calls) |
 
 "Interpreter in RAM" is the REPL's stack frame, which holds the `Interpreter` struct; its tables shrink with the
 level. Speed is the same at every level. Thonny, mpremote's file commands and the `machine` module need `full`.
@@ -1522,7 +1526,7 @@ What it shows:
   less than the interpreter. `CPU_MHZ=240` (160 on the C3) runs everything 2-3x faster.
 
 Not there yet: level triggers, `Signal`, and the `*_into` methods (`readinto`, `write_readinto`,
-`readfrom_mem_into`), which need `bytearray`. The module takes 53 of the 96 function slots (`MAX_FUNCS`), and each
+`readfrom_mem_into`), which need `bytearray`. The module takes 53 of the firmware's 96 function slots (128 on the S3), and each
 method call runs Python code: `led.value(1)` takes 1.2 ms
 on the ESP32 at 80 MHz (0.43 ms at 240 MHz), `pin_write(2, 1)` 0.27 ms (0.12 ms). Fine for blinking, sensors and
 buses, too slow for bit-banging.

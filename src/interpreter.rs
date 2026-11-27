@@ -150,6 +150,36 @@ struct Ctx {
     in_class: bool,
 }
 
+/// Function slots the interpreter has of its own (`with_func_slots` gives it more).
+pub const INLINE_FUNCS: usize = 16;
+
+/// The function table: the interpreter's own few slots, or the embedder's.
+/// (The inline variant is the bigger one on purpose: it's the fallback when
+/// the embedder gives none, and boxing isn't available without an allocator.)
+#[allow(clippy::large_enum_variant)]
+enum FuncTable<'a> {
+    Inline([Option<FuncDef<'a>>; INLINE_FUNCS]),
+    External(&'a mut [Option<FuncDef<'a>>]),
+}
+
+impl<'a> FuncTable<'a> {
+    #[cfg_attr(feature = "iram", link_section = ".rwtext")]
+    fn slots(&self) -> &[Option<FuncDef<'a>>] {
+        match self {
+            FuncTable::Inline(slots) => slots,
+            FuncTable::External(slots) => slots,
+        }
+    }
+
+    #[cfg_attr(feature = "iram", link_section = ".rwtext")]
+    fn slots_mut(&mut self) -> &mut [Option<FuncDef<'a>>] {
+        match self {
+            FuncTable::Inline(slots) => slots,
+            FuncTable::External(slots) => slots,
+        }
+    }
+}
+
 /// A `def` function: its signature and a parser positioned at its body.
 /// Where an error happened: a line of `source` (the main script, or an
 /// imported module's text), and for an error in a module, the main script's
@@ -175,7 +205,7 @@ impl<'a> ErrorAt<'a> {
 const MAX_FILE_MODULES: usize = 8;
 
 #[derive(Debug, Clone, Copy)]
-struct FuncDef<'a> {
+pub struct FuncDef<'a> {
     /// The name, or for a lambda its source text (which identifies it).
     name: &'a str,
     params: [&'a str; MAX_PARAMS],
@@ -262,7 +292,9 @@ pub struct Interpreter<'a, O: Output, H: HardwareBridge = NoHardware> {
     /// Names declared `global` by the active calls; the innermost call's
     /// declarations start at `frame_globals`.
     global_decls: [&'a str; MAX_GLOBAL_DECLS],
-    funcs: [Option<FuncDef<'a>>; MAX_FUNCS],
+    /// The function table: 16 slots of its own, or the embedder's
+    /// (`with_func_slots`)
+    funcs: FuncTable<'a>,
     /// Objects created at runtime (empty unless `with_heap` is used).
     heap: Heap<'a>,
     /// The exception object of the last `raise` (see `Error::Exception`).
@@ -279,7 +311,7 @@ pub struct Interpreter<'a, O: Output, H: HardwareBridge = NoHardware> {
     closure_env: Value<'a>,
     next_env: Value<'a>,
     /// Reachable function slots during a collection (bit per slot).
-    func_marks: u128,
+    func_marks: [u128; 2],
     /// Lowest native stack address scripts may reach (`set_stack_floor`).
     stack_floor: usize,
     /// Parsed statements kept for running again (`with_stmt_cache`).
@@ -331,7 +363,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
             globals_len: 0,
             call_depth: 0,
             nesting: 0,
-            funcs: [None; MAX_FUNCS],
+            funcs: FuncTable::Inline([None; INLINE_FUNCS]),
             error_line: None,
             memory_error: Value::None,
             main_source: "",
@@ -353,7 +385,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
             method_self: Value::None,
             closure_env: Value::None,
             next_env: Value::None,
-            func_marks: 0,
+            func_marks: [0; 2],
             stack_floor: 0,
             module_memory: None,
             stmt_cache: &mut [],
@@ -392,6 +424,28 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
     /// file system (`import sensors` reads `sensors.py`). Each module stays
     /// there until the interpreter is dropped; without it, only native
     /// modules can be imported.
+    /// The function table: a slot for each `def` function, lambda and method
+    /// alive at once (up to 255; `[None; N]`). Without it, the interpreter
+    /// has `INLINE_FUNCS` (16) of its own; `MAX_FUNCS` is the size the
+    /// feature level suggests. Kept outside the interpreter, the table can be
+    /// as large as the memory allows, and the `Interpreter` struct (often on
+    /// the stack) stays small: a slot is about 190 bytes on a 32-bit chip.
+    pub fn with_func_slots(mut self, slots: &'a mut [Option<FuncDef<'a>>]) -> Self {
+        self.set_func_slots(slots);
+        self
+    }
+
+    /// Like `with_func_slots`, on an interpreter that already exists (its
+    /// functions so far are moved over, as far as they fit).
+    pub fn set_func_slots(&mut self, slots: &'a mut [Option<FuncDef<'a>>]) {
+        let len = slots.len().min(255);
+        let slots = &mut slots[..len];
+        for (i, slot) in slots.iter_mut().enumerate() {
+            *slot = self.funcs.slots().get(i).copied().flatten();
+        }
+        self.funcs = FuncTable::External(slots);
+    }
+
     /// Memory for parsed statements: a loop's or a function's body is lexed
     /// and parsed once, not on every pass (about 2x faster loops). Each entry
     /// is about 0.5 KB on a 32-bit chip; 8-16 cover the statements of the
@@ -1774,10 +1828,11 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
             let at_top = self.call_depth == 0 || global;
             let slot = self
                 .funcs
+                .slots()
                 .iter()
                 .position(|f| at_top && f.is_some_and(|f| f.named() && f.name == name))
                 .ok_or(Error::UnknownIdentifier)?;
-            self.funcs[slot] = None;
+            self.funcs.slots_mut()[slot] = None;
             return Ok(());
         };
         self.vars.copy_within(i + 1..self.nvars, i);
@@ -1977,6 +2032,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
                     return Err(err);
                 }
                 self.funcs
+                    .slots()
                     .iter()
                     .position(|f| f.is_some_and(|f| f.named() && f.name == name))
                     .map(|i| Value::Func(i as u8))
@@ -2007,24 +2063,26 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
     fn define_func(&mut self, func: FuncDef<'a>) -> Result<(), Error> {
         let slot = match self
             .funcs
+            .slots()
             .iter()
             .position(|f| f.is_some_and(|f| f.named() && f.name == func.name))
         {
             Some(i) => i,
             None => self.free_func_slot()?,
         };
-        self.funcs[slot] = Some(func);
+        self.funcs.slots_mut()[slot] = Some(func);
         Ok(())
     }
 
     /// A free slot in the function table; unreachable lambdas and methods
     /// are collected first if needed.
     fn free_func_slot(&mut self) -> Result<usize, Error> {
-        if let Some(i) = self.funcs.iter().position(Option::is_none) {
+        if let Some(i) = self.funcs.slots().iter().position(Option::is_none) {
             return Ok(i);
         }
         self.collect();
         self.funcs
+            .slots()
             .iter()
             .position(Option::is_none)
             .ok_or(Error::OutOfMemory)
@@ -2034,11 +2092,16 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
     /// when its class statement runs again, gets the same slot back).
     fn method_slot(&mut self, func: FuncDef<'a>) -> Result<u8, Error> {
         let same = |f: &FuncDef<'a>| f.method && core::ptr::eq(f.name, func.name);
-        let slot = match self.funcs.iter().position(|f| f.as_ref().is_some_and(same)) {
+        let slot = match self
+            .funcs
+            .slots()
+            .iter()
+            .position(|f| f.as_ref().is_some_and(same))
+        {
             Some(i) => i,
             None => self.free_func_slot()?,
         };
-        self.funcs[slot] = Some(func);
+        self.funcs.slots_mut()[slot] = Some(func);
         Ok(slot as u8)
     }
 
@@ -2569,13 +2632,18 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
         let same = |f: &FuncDef<'a>| {
             f.lambda && f.name.as_ptr() == src.as_ptr() && f.name.len() == src.len()
         };
-        if let Some(i) = self.funcs.iter().position(|f| f.as_ref().is_some_and(same)) {
+        if let Some(i) = self
+            .funcs
+            .slots()
+            .iter()
+            .position(|f| f.as_ref().is_some_and(same))
+        {
             return Ok(Value::Func(i as u8));
         }
         let mut parser = Parser::new(src)?;
         let (params, count, star, _) = parser.parse_lambda_parts(&mut Code::new())?;
         let slot = self.free_func_slot()?;
-        self.funcs[slot] = Some(FuncDef {
+        self.funcs.slots_mut()[slot] = Some(FuncDef {
             name: src,
             params,
             count,
@@ -2601,7 +2669,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
     ) -> Result<Value<'a>, Error> {
         match f {
             Value::Func(slot) => {
-                let func = self.funcs[slot as usize].ok_or(Error::UnknownIdentifier)?;
+                let func = self.funcs.slots()[slot as usize].ok_or(Error::UnknownIdentifier)?;
                 self.call_user_func(func, args, kwargs)
             }
             Value::NativeFn { module, func } if kwargs.is_empty() => {
@@ -3159,11 +3227,11 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
             "Built-in:\n  print(...)\n  help()\n  abs(x), min(a, b, ...), max(a, b, ...)\n  len(s), str(x), repr(x), int(x, [base]), ord(c), chr(n), bytes(x), bool(x)\n  list(x), tuple(x), dict(x), range(...), sorted(x), reversed(x), sum(x),\n  any(x), all(x), enumerate(x), zip(a, b), format(x, spec)\n  isinstance(x, t), type(x), hasattr(x, name), getattr(x, name, [default]),\n  callable(x), id(x), dir([x]), globals(), help('modules')\n",
         );
 
-        let mut funcs = self.funcs.iter().flatten().peekable();
+        let mut funcs = self.funcs.slots().iter().flatten().peekable();
         if funcs.peek().is_some() {
             self.out.write_str("Script functions:\n");
         }
-        for func in self.funcs.iter().flatten() {
+        for func in self.funcs.slots().iter().flatten() {
             self.out.write_str("  ");
             self.out.write_str(func.name);
             self.out.write_str("(");
@@ -4959,11 +5027,13 @@ print(outer(), count)
         let mut mem = std::vec![0u8; heap_size];
         let mut module_memory = std::vec![0u8; 16 * 1024];
         let mut cache = [crate::ast_parser::StmtCache::EMPTY; 8];
+        let mut slots = [None; MAX_FUNCS];
         let mut vm = Interpreter::new(&mut out)
             .with_heap(&mut mem)
             .with_files(&files)
             .with_module_memory(&mut module_memory)
-            .with_stmt_cache(&mut cache);
+            .with_stmt_cache(&mut cache)
+            .with_func_slots(&mut slots);
         let result = vm.eval(src);
         (out.as_str().into(), result)
     }
@@ -5473,7 +5543,7 @@ print(outer(), count)
         }
         vm.eval("def make(n):\n    return lambda: n\nfs = []\nfor i in range(100):\n    f = make(i)\n    if i % 30 == 0:\n        fs.append(f)\nprint(p.get(), [f() for f in fs])")
             .unwrap();
-        assert!(vm.funcs.iter().flatten().count() < MAX_FUNCS);
+        assert!(vm.funcs.slots().iter().flatten().count() < MAX_FUNCS);
         let _ = vm;
         assert_eq!(out.as_str(), "7 [0, 30, 60, 90]\n");
     }

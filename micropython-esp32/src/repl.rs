@@ -20,6 +20,7 @@ use core::fmt::Write as _;
 use core::sync::atomic::Ordering;
 
 use esp_println::print;
+use micropython_rs::interpreter::FuncDef;
 use micropython_rs::{Error, HardwareBridge, Interpreter, Output, StmtCache};
 
 use micropython_rs::flatfs::{FsError, Writer};
@@ -102,6 +103,31 @@ unsafe fn take_stmt_cache<'a>() -> &'a mut [StmtCache<'a>] {
     unsafe { core::slice::from_raw_parts_mut(cache, STMT_CACHE_SLOTS) }
 }
 
+/// The function table (`Interpreter::with_func_slots`): a slot for each
+/// function, method and lambda alive at once, about 190 bytes each. Outside
+/// the `Interpreter` struct, it no longer comes out of the stack three times
+/// while the REPL starts (the struct is built, moved and kept). `machine`,
+/// `network`, `time` and `ntptime` take 69; the S3 has room for more.
+const FUNC_SLOTS: usize = if cfg!(feature = "esp32s3") { 128 } else { 96 };
+
+static mut FUNCS: core::mem::MaybeUninit<[Option<FuncDef<'static>>; FUNC_SLOTS]> =
+    core::mem::MaybeUninit::uninit();
+
+/// The function table for one session, every slot empty.
+///
+/// # Safety
+/// Only one session may hold it at a time (`run` makes a new one for each).
+unsafe fn take_func_slots<'a>() -> &'a mut [Option<FuncDef<'a>>] {
+    let slots = core::ptr::addr_of_mut!(FUNCS) as *mut Option<FuncDef<'a>>;
+    for i in 0..FUNC_SLOTS {
+        // SAFETY: inside the static; written whole before any use
+        unsafe { slots.add(i).write(None) };
+    }
+    // SAFETY: just initialised; the caller holds the only reference, and
+    // the functions only ever point into this session's source and heap
+    unsafe { core::slice::from_raw_parts_mut(slots, FUNC_SLOTS) }
+}
+
 const CTRL_A: u8 = 0x01;
 const CTRL_B: u8 = 0x02;
 const CTRL_C: u8 = 0x03;
@@ -159,8 +185,8 @@ pub fn run<O: Output, H: HardwareBridge>(
         hw.soft_reset();
         // SAFETY: the previous session's interpreter (the only other user)
         // is gone
-        let stmt_cache = unsafe { take_stmt_cache() };
-        let mut vm = new_interpreter(out, hw, heap, files, module_memory, stmt_cache);
+        let (stmt_cache, func_slots) = unsafe { (take_stmt_cache(), take_func_slots()) };
+        let mut vm = new_interpreter(out, hw, heap, files, module_memory, stmt_cache, func_slots);
         let mut repl = Repl {
             vm: &mut vm,
             arena: Arena::new(&mut memory[..]),
@@ -224,10 +250,12 @@ fn new_interpreter<'a, O: Output, H: HardwareBridge>(
     files: Option<&'a RefCell<Files>>,
     module_memory: &'a mut [u8],
     stmt_cache: &'a mut [StmtCache<'a>],
+    func_slots: &'a mut [Option<FuncDef<'a>>],
 ) -> Interpreter<'a, O, H> {
     let mut vm = Interpreter::with_hardware(out, hw);
     vm.set_heap(heap);
     vm.set_stmt_cache(stmt_cache);
+    vm.set_func_slots(func_slots);
     // Scripts get the flash files too: `open()` and the `os` module
     if let Some(files) = files {
         vm.set_files(files);

@@ -50,7 +50,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
     #[inline(never)]
     pub(super) fn collect(&mut self) {
         self.heap.begin_mark();
-        self.func_marks = 0;
+        self.func_marks = [0; 2];
         let mut work = [ObjRef::from_index(0); crate::heap::MAX_OBJECTS];
         let mut n = 0;
         for i in 0..self.nvars {
@@ -78,15 +78,15 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
         }
         // `def` functions are reachable by name (with their default values);
         // lambdas and methods only if something refers to them
-        for i in 0..self.funcs.len() {
-            if self.funcs[i].is_some_and(|f| f.named()) {
+        for i in 0..self.funcs.slots().len() {
+            if self.funcs.slots()[i].is_some_and(|f| f.named()) {
                 self.mark_value(Value::Func(i as u8), &mut work, &mut n);
                 self.trace(&mut work, &mut n);
             }
         }
         self.heap.sweep();
-        for (i, f) in self.funcs.iter_mut().enumerate() {
-            if self.func_marks & (1 << i) == 0 {
+        for (i, f) in self.funcs.slots_mut().iter_mut().enumerate() {
+            if self.func_marks[i / 128] & (1 << (i % 128)) == 0 {
                 *f = None;
             }
         }
@@ -436,7 +436,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
 
     /// `<function name>` (Python adds an address, which means nothing here).
     fn function_repr(&mut self, f: u8) -> Result<Value<'a>, Error> {
-        let name = match self.funcs[f as usize] {
+        let name = match self.funcs.slots()[f as usize] {
             Some(func) if !func.lambda => func.name,
             _ => "<lambda>",
         };
@@ -471,7 +471,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
             self.sp = base;
         }
         if let Value::Func(f) = v {
-            let name = match self.funcs[f as usize] {
+            let name = match self.funcs.slots()[f as usize] {
                 Some(func) if !func.lambda => func.name,
                 _ => "<lambda>",
             };

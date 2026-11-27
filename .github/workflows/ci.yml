@@ -83,12 +83,13 @@ jobs:
             id: generic-minimal
             features: ""
             level: minimal
-          # Wi-Fi: its heap and driver take 70 KB of the stack's RAM
+          # Wi-Fi: its heap and driver take 70 KB of the stack's RAM (the
+          # function table and statement cache are statics: 22 KB more)
           - board: TTGO T-Display + Wi-Fi
             id: ttgo-wifi
             features: tft,wifi
             level: full
-            min_stack: 96
+            min_stack: 80
           # ESP32-S3 (Seeed XIAO ESP32-S3): console on the chip's USB port
           - board: XIAO ESP32-S3
             id: s3-full
@@ -100,6 +101,7 @@ jobs:
             chip: esp32s3
             features: wifi
             level: full
+            min_stack: 100
           # ESP32-C3 (RISC-V; ESP32-C3 Super Mini): console on the chip's USB port
           - board: ESP32-C3 Super Mini
             id: c3-full
@@ -113,7 +115,7 @@ jobs:
             target: riscv32imc-unknown-none-elf
             features: wifi
             level: full
-            min_stack: 96
+            min_stack: 80
 
     steps:
       - name: Checkout repository

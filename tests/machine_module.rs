@@ -217,9 +217,12 @@ fn run(script: &str, rx: &[u8]) -> (String, String) {
         ..Default::default()
     };
     let mut heap = vec![0u8; 32 * 1024];
+    // The firmware's function table (machine.py alone has 53 functions)
+    let mut slots = [None; 96];
     let mut vm = Interpreter::with_hardware(&mut out, &mut board)
         .with_heap(&mut heap)
-        .with_frozen_modules(FROZEN);
+        .with_frozen_modules(FROZEN)
+        .with_func_slots(&mut slots);
     if let Err(err) = vm.eval(script) {
         let mut message = Text(String::new());
         vm.write_exception(err, &mut message);
