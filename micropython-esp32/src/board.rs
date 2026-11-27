@@ -1327,6 +1327,11 @@ fn cpu_info(out: &mut [u8]) -> usize {
         now_ms(),
         reset_cause(),
     );
+    let _ = write!(
+        c,
+        "psram={}\n",
+        crate::PSRAM_SIZE.load(core::sync::atomic::Ordering::Relaxed)
+    );
     #[cfg(feature = "wifi")]
     let _ = write!(
         c,

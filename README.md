@@ -455,8 +455,16 @@ When it's full, a **mark-and-sweep garbage collector** keeps everything reachabl
 stack (the operands of every expression being evaluated, including those of calling functions, and the iterables of
 running `for` loops), and everything inside reachable lists and dicts. It frees the rest (cycles included) and moves
 the survivors together. Values refer to heap objects through handles, so moving them is safe. Limits: the buffer size
-and 512 live objects at the `full` level, 256 at `minimal` and `medium` (`heap::MAX_OBJECTS`; every string inside a list
-counts, and the frozen modules keep about 250: `machine` 160, `network` 65); beyond that, `Error::OutOfMemory`.
+and the object table: the heap's own has 512 entries at the `full` level, 256 at `minimal` and `medium`
+(`heap::MAX_OBJECTS`; every string inside a list counts, and the frozen modules keep about 250: `machine` 160,
+`network` 65); `Interpreter::with_heap_table(&mut [HeapEntry::FREE; N])` gives it any size up to 65 535 (12 bytes an
+entry; one per 32-64 bytes of heap suits most scripts). Beyond either, `Error::OutOfMemory`.
+
+The collector is built for big heaps too: its work list is 64 entries on the stack (containers beyond that are marked
+"deferred" in the table and picked up afterwards), it looks only at the table entries below the highest one in use,
+and compaction orders the survivors by a radix sort of (offset, index) pairs in the heap's free memory (16 bytes a
+survivor; when that's not free, an in-place heapsort): no memory proportional to the table on the stack, and
+O(n log n) or better.
 `gc.mem_free()` and `gc.objects_free()` show how much of each is left, `gc.collect()` frees garbage at once.
 Without a heap, creating strings or containers raises `Error::OutOfMemory`; everything else works.
 
@@ -907,7 +915,16 @@ The S3's USB-Serial/JTAG port ignores a flush while its previous packet is still
 after another one would wait for the next write (the raw REPL's closing `\x04>`, and `mpy.py` timed out). The
 firmware flushes once more while it waits for input ([`serial_input.rs`](micropython-esp32/src/serial_input.rs)).
 
-Not there yet on the S3: the PSRAM (8 MB on the XIAO), its second core, and the TTGO's display build.
+**PSRAM** (`make flash CHIP=esp32s3 FEATURES=wifi,psram`): the interpreter's heap and its object table go into the
+external RAM (esp-hal maps it at boot; `PSRAM_MODE` is `octal` for the S3, as on the XIAO's 8 MB module, `quad`
+otherwise, e.g. an ESP32 WROVER with `FEATURES=psram`). Without PSRAM on the board, the internal 32 KB heap is used.
+`machine.lscpu()` shows the `PSRAM size`. On the XIAO ESP32-S3 (80 MHz): a **7.25 MB heap** with 65 535 object
+entries (instead of 32 KB and 512); 10 000 rows of `[i, 'row %d' % i, {'v': i * 2}]` (40 000 objects) in 2.1 s, a 1 MB
+string and a 2 MB `bytes` object; scripts run as fast as with the internal heap (string formatting twice as fast: the
+heap rarely fills). A collection costs about 17 µs per live object (PSRAM is slower than internal RAM): 6 ms with 500,
+81 ms with 5000, 0.34 s with 20 000, 1 s with 40 000 live objects; `CPU_MHZ=240` shortens it.
+
+Not there yet on the S3: its second core, and the TTGO's display build.
 
 > [!IMPORTANT]
 > On a TTGO T-Display, build with `FEATURES=tft`. The default build doesn't start the display or its backlight, so the screen stays dark.
@@ -1423,7 +1440,7 @@ ignored). The ESP32 has no battery for it: after a reset or power-up it starts a
 NTP (`ntptime.settime()`) or keep another clock (a DS3231 module on I²C). It drifts a few seconds a day.
 
 `machine.lscpu()` describes the board like Linux's `lscpu`: a dict with `Architecture`, `CPU(s)`, `Model name`,
-`Revision`, `CPU MHz`, `Flags`, `Flash size`, `Stack size`, the Python and Wi-Fi heaps, `MAC address`, `Board`, `Build`,
+`Revision`, `CPU MHz`, `Flags`, `Flash size`, `PSRAM size`, `Stack size`, the Python and Wi-Fi heaps, `MAC address`, `Board`, `Build`,
 `Reset cause` and more (sizes in bytes); `machine.lscpu(True)` prints it as a table instead (sizes in KiB/MiB). It's
 not in MicroPython. The firmware's `cpu_info()` gives the raw `key=value` lines. On the three boards it was tried on
 (each matched what `espflash board-info` reads from the chip):

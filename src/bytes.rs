@@ -234,7 +234,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
             }
             ("gc", "mem_alloc", _) => Ok(Value::Int(self.heap.used() as i64)),
             ("gc", "objects_free", _) => Ok(Value::Int(
-                (crate::heap::MAX_OBJECTS - self.heap.objects()) as i64,
+                (self.heap.table_len() - self.heap.objects()) as i64,
             )),
             ("gc", "isenabled", _) => Ok(Value::Bool(true)),
             ("gc", "enable" | "disable", _) => Ok(Value::None),

@@ -376,6 +376,7 @@ def lscpu(show=False):
     names = [('arch', 'Architecture'), ('', 'Byte Order'), ('cores', 'CPU(s)'), ('', 'Vendor ID')]
     names += [('model', 'Model name'), ('core', 'CPU core'), ('rev', 'Revision'), ('mhz', 'CPU MHz')]
     names += [('max_mhz', 'CPU max MHz'), ('flags', 'Flags'), ('flash', 'Flash size'), ('sram', 'SRAM size')]
+    names += [('psram', 'PSRAM size')]
     names += [('stack', 'Stack size'), ('', 'Python heap size'), ('', 'Python heap free')]
     names += [('wifi_heap', 'Wi-Fi heap size'), ('wifi_heap_free', 'Wi-Fi heap free'), ('mac', 'MAC address')]
     names += [('board', 'Board'), ('firmware', 'Firmware'), ('build', 'Build')]

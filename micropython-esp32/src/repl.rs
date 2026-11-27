@@ -174,11 +174,19 @@ pub struct BootScript {
 
 /// Runs the boot script, then the REPL, forever. A soft reset starts a new
 /// interpreter (all variables and functions are cleared).
+/// A heap in external RAM (PSRAM, the `psram` feature): megabytes for the
+/// interpreter instead of the internal 32 KB, with an object table to match.
+pub struct BigHeap {
+    pub heap: &'static mut [u8],
+    pub table: &'static mut [micropython_rs::heap::HeapEntry],
+}
+
 pub fn run<O: Output, H: HardwareBridge>(
     out: &mut O,
     hw: &mut H,
     boot: &BootScript,
     files: Option<&RefCell<Files>>,
+    mut big_heap: Option<BigHeap>,
 ) -> ! {
     let Buffers {
         arena: memory,
@@ -195,7 +203,14 @@ pub fn run<O: Output, H: HardwareBridge>(
         // SAFETY: the previous session's interpreter (the only other user)
         // is gone
         let (stmt_cache, func_slots) = unsafe { (take_stmt_cache(), take_func_slots()) };
+        let (heap, table) = match big_heap.as_mut() {
+            Some(big) => (&mut big.heap[..], Some(&mut big.table[..])),
+            None => (&mut heap[..], None),
+        };
         let mut vm = new_interpreter(out, hw, heap, files, module_memory, stmt_cache, func_slots);
+        if let Some(table) = table {
+            vm.set_heap_table(table);
+        }
         let mut repl = Repl {
             vm: &mut vm,
             arena: Arena::new(&mut memory[..]),

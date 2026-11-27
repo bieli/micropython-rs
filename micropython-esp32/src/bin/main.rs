@@ -231,6 +231,10 @@ fn main() -> ! {
     // Shared by the REPL's file commands and the scripts (`open()`, `os`)
     let files = storage::mount(peripherals.FLASH).map(core::cell::RefCell::new);
 
+    #[cfg(feature = "psram")]
+    let big_heap = psram_heap(&peripherals.PSRAM);
+    #[cfg(not(feature = "psram"))]
+    let big_heap = None;
     let mut board = Board::new(board_peripherals!(peripherals), GENERIC_PINS);
     // Most DevKits only have the BOOT button (GPIO0, GPIO9 on the C3) as a
     // user button: LEFT
@@ -240,7 +244,7 @@ fn main() -> ! {
 
     // From here on, `stack_peak()` can tell how deep the stack went
     micropython_esp32::stack::paint();
-    repl::run(&mut out, &mut hw, &BOOT_SCRIPT, files.as_ref())
+    repl::run(&mut out, &mut hw, &BOOT_SCRIPT, files.as_ref(), big_heap)
 }
 
 // ---------------------------------------------------------------------------
@@ -445,7 +449,7 @@ fn main() -> ! {
 
     // From here on, `stack_peak()` can tell how deep the stack went
     micropython_esp32::stack::paint();
-    repl::run(&mut out, &mut hw, &BOOT_SCRIPT, files.as_ref())
+    repl::run(&mut out, &mut hw, &BOOT_SCRIPT, files.as_ref(), None)
 }
 
 // ---------------------------------------------------------------------------
@@ -455,6 +459,34 @@ fn main() -> ! {
 /// Shows why the chip started (power on, watchdog, software reset, ...).
 fn print_reset_reason() {
     println!("Reset reason: {:?}", esp_hal::system::reset_reason());
+}
+
+/// The interpreter's heap in PSRAM (`psram` feature): all of it but the
+/// object table at its start (65 535 entries, the most an object handle
+/// addresses: 768 KB). `None` without PSRAM (the internal 32 KB heap then).
+#[cfg(feature = "psram")]
+fn psram_heap(psram: &esp_hal::peripherals::PSRAM<'_>) -> Option<repl::BigHeap> {
+    use micropython_rs::heap::HeapEntry;
+    let (start, size) = esp_hal::psram::psram_raw_parts(psram);
+    micropython_esp32::PSRAM_SIZE.store(size as u32, core::sync::atomic::Ordering::Relaxed);
+    let entries = u16::MAX as usize;
+    let table_bytes = entries * core::mem::size_of::<HeapEntry>();
+    if size < table_bytes + 64 * 1024 {
+        return None;
+    }
+    let table = start as *mut HeapEntry;
+    for i in 0..entries {
+        // SAFETY: inside the PSRAM range esp-hal mapped; written before use
+        unsafe { table.add(i).write(HeapEntry::FREE) };
+    }
+    // SAFETY: the PSRAM is ours alone (nothing else allocates from it); the
+    // table and the heap don't overlap and live as long as the firmware
+    unsafe {
+        Some(repl::BigHeap {
+            table: core::slice::from_raw_parts_mut(table, entries),
+            heap: core::slice::from_raw_parts_mut(start.add(table_bytes), size - table_bytes),
+        })
+    }
 }
 
 /// The embedded boot script, used when no `main.py` is saved in flash.

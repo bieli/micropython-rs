@@ -69,11 +69,14 @@ type Vm = Interpreter<'static, Stdout>;
 
 fn new_vm(files: &'static RefCell<dyn FileSystem>) -> Vm {
     let out: &'static mut Stdout = Box::leak(Box::new(Stdout));
-    let heap: &'static mut [u8] = Box::leak(vec![0u8; 256 * 1024].into_boxed_slice());
+    let heap: &'static mut [u8] = Box::leak(vec![0u8; 1024 * 1024].into_boxed_slice());
+    let heap_table =
+        Box::leak(vec![micropython_rs::heap::HeapEntry::FREE; 32 * 1024].into_boxed_slice());
     let modules: &'static mut [u8] = Box::leak(vec![0u8; 256 * 1024].into_boxed_slice());
     let cache = Box::leak(vec![micropython_rs::StmtCache::EMPTY; 64].into_boxed_slice());
     let mut vm = Interpreter::new(out)
         .with_heap(heap)
+        .with_heap_table(heap_table)
         .with_files(files)
         .with_module_memory(modules)
         .with_stmt_cache(cache)

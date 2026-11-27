@@ -19,7 +19,7 @@ use core::cmp::Ordering as CmpOrdering;
 
 use super::{Interpreter, Value};
 use crate::ast_parser::{BinOp, CmpOp};
-use crate::heap::{HeapView, Kind, ObjRef, MAX_OBJECTS};
+use crate::heap::{HeapView, Kind, ObjRef, MARK_WORK};
 use crate::{Error, HardwareBridge, Output};
 
 /// Bytes before the first slot: the number of elements (or pairs).
@@ -1400,7 +1400,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
     pub(super) fn mark_value(
         &mut self,
         v: Value<'a>,
-        work: &mut [ObjRef; MAX_OBJECTS],
+        work: &mut [ObjRef; MARK_WORK],
         n: &mut usize,
     ) {
         let r = match v {
@@ -1423,13 +1423,18 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
             _ => return,
         };
         if self.heap.mark(r) && self.heap.kind(r).is_container() {
-            work[*n] = r;
-            *n += 1;
+            if *n < work.len() {
+                work[*n] = r;
+                *n += 1;
+            } else {
+                // The work list is full: `collect` picks it up later
+                self.heap.defer(r);
+            }
         }
     }
 
     /// Marks the contents of the containers in `work` (and theirs).
-    pub(super) fn trace(&mut self, work: &mut [ObjRef; MAX_OBJECTS], n: &mut usize) {
+    pub(super) fn trace(&mut self, work: &mut [ObjRef; MARK_WORK], n: &mut usize) {
         while *n > 0 {
             *n -= 1;
             let r = work[*n];

@@ -412,6 +412,22 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
         self.memory_error = Value::None;
     }
 
+    /// The heap's object table: one entry for each string, list, dict, ...
+    /// alive at once (12 bytes each; up to 65 535; `[HeapEntry::FREE; N]`).
+    /// Without it, the heap has `heap::MAX_OBJECTS` (512 at the full level)
+    /// of its own: enough for a 32 KB heap, not for a heap of megabytes
+    /// (one entry per 32-64 bytes of heap is a good size). Call it after
+    /// `with_heap`.
+    pub fn with_heap_table(mut self, table: &'a mut [crate::heap::HeapEntry]) -> Self {
+        self.set_heap_table(table);
+        self
+    }
+
+    /// Like `with_heap_table`, on an interpreter that already exists.
+    pub fn set_heap_table(&mut self, table: &'a mut [crate::heap::HeapEntry]) {
+        self.heap.set_table(table);
+    }
+
     /// Gives scripts a file system: `open()` and the `os` module. The
     /// application can use it too between `eval` calls (a `RefCell`, so it's
     /// borrowed only while the interpreter works with files).
@@ -4517,6 +4533,38 @@ print(fact(6), fib(6))
             out.as_str(),
             "full memory allocation failed\ncaught again\n"
         );
+    }
+
+    #[test]
+    #[cfg(feature = "stdlib")]
+    fn test_big_heap_table() {
+        // A 1 MB heap with a 30 000-entry object table: thousands of live
+        // containers (far more than the collector's work list holds: they're
+        // deferred), a deep chain, and collections that compact them all
+        let mut out = MockOut::new();
+        let mut mem = std::vec![0u8; 1024 * 1024];
+        let mut table = std::vec![crate::heap::HeapEntry::FREE; 30_000];
+        let mut vm = Interpreter::new(&mut out)
+            .with_heap(&mut mem)
+            .with_heap_table(&mut table);
+        vm.eval(
+            "import gc\n\
+             rows = []\n\
+             for i in range(3000):\n    rows.append([str(i), {'k': str(i * 2)}])\n\
+             chain = None\n\
+             for i in range(2000):\n    chain = [i, chain]\n\
+             for k in range(3):\n    junk = [str(j) + 'x' for j in range(4000)]\n    junk = None\n    gc.collect()\n\
+             total = 0\n\
+             for r in rows:\n    total += int(r[0]) + int(r[1]['k'])\n\
+             depth = 0\n\
+             c = chain\n\
+             while c is not None:\n    depth += 1\n    c = c[1]\n\
+             print(total, depth, gc.objects_free() > 12000, gc.mem_free() > 500000)\n",
+        )
+        .unwrap();
+        let collections = vm.heap_stats().3;
+        assert!(collections >= 3, "{}", collections);
+        assert_eq!(out.as_str(), "13495500 2000 True True\n");
     }
 
     #[test]

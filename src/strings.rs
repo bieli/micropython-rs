@@ -51,7 +51,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
     pub(super) fn collect(&mut self) {
         self.heap.begin_mark();
         self.func_marks = [0; 2];
-        let mut work = [ObjRef::from_index(0); crate::heap::MAX_OBJECTS];
+        let mut work = [ObjRef::from_index(0); crate::heap::MARK_WORK];
         let mut n = 0;
         for i in 0..self.nvars {
             self.mark_value(self.vars[i].1, &mut work, &mut n);
@@ -83,6 +83,12 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
                 self.mark_value(Value::Func(i as u8), &mut work, &mut n);
                 self.trace(&mut work, &mut n);
             }
+        }
+        // Containers that didn't fit the work list
+        while let Some(r) = self.heap.take_deferred() {
+            work[0] = r;
+            n = 1;
+            self.trace(&mut work, &mut n);
         }
         self.heap.sweep();
         for (i, f) in self.funcs.slots_mut().iter_mut().enumerate() {

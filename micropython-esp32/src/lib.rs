@@ -19,6 +19,9 @@ pub mod wifi;
 /// (checked by the interpreter between statements and inside `sleep_ms`).
 pub static ABORT: AtomicBool = AtomicBool::new(false);
 
+/// Bytes of external RAM (PSRAM) the firmware found (`psram` feature; 0 without).
+pub static PSRAM_SIZE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
 #[cfg(feature = "tft")]
 pub mod display_module;
 #[cfg(feature = "tft")]

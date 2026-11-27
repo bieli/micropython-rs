@@ -102,6 +102,13 @@ jobs:
             features: wifi
             level: full
             min_stack: 100
+          # The heap in PSRAM (the XIAO's 8 MB octal PSRAM)
+          - board: XIAO ESP32-S3 + Wi-Fi + PSRAM
+            id: s3-wifi-psram
+            chip: esp32s3
+            features: wifi,psram
+            level: full
+            min_stack: 100
           # ESP32-C3 (RISC-V; ESP32-C3 Super Mini): console on the chip's USB port
           - board: ESP32-C3 Super Mini
             id: c3-full

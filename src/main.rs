@@ -46,7 +46,9 @@ fn main() {
 
     let mut out = StdoutSink;
     // Objects created at runtime (strings, lists, ...) live here
-    let mut heap = vec![0u8; 256 * 1024];
+    let mut heap = vec![0u8; 1024 * 1024];
+    // One object table entry per 32 bytes of heap
+    let mut heap_table = vec![micropython_rs::heap::HeapEntry::FREE; 32 * 1024];
     // `open()` and `os` work on a file system in RAM (gone when the script ends),
     // with as many files as the ESP32's flash partition holds
     let mut flash = vec![0u8; 30 * SLOT_SIZE as usize];
@@ -59,6 +61,7 @@ fn main() {
     let mut func_slots = vec![None; 255];
     let mut vm = Interpreter::new(&mut out)
         .with_heap(&mut heap)
+        .with_heap_table(&mut heap_table)
         .with_files(&files)
         .with_module_memory(&mut module_memory)
         .with_stmt_cache(&mut stmt_cache)

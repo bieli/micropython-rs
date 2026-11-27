@@ -32,6 +32,10 @@ FEATURES_FLAG := --target $(TARGET) --no-default-features --features $(CHIP),$(L
 # directory; leave empty for the board's demo (scripts/demo.py or scripts/ttgo_demo.py)
 SCRIPT       ?=
 
+# PSRAM type for FEATURES=psram: octal on the S3 modules with 8 MB (the XIAO
+# ESP32-S3), quad otherwise (ESP32 WROVER, S3 modules with 2 MB)
+PSRAM_MODE   ?= $(if $(filter esp32s3,$(CHIP)),octal,quad)
+
 # CPU clock in MHz: 80 (default, least current), 160 or 240 (fastest)
 CPU_MHZ      ?=
 
@@ -72,6 +76,7 @@ build:
 		-v "$(CARGO_CACHE)":/home/esp/.cargo/registry \
 		-e MPY_SCRIPT="$(SCRIPT)" \
 		-e MPY_CPU_MHZ="$(CPU_MHZ)" \
+		$(if $(findstring psram,$(FEATURES)),-e ESP_HAL_CONFIG_PSRAM_MODE="$(PSRAM_MODE)") \
 		-w /workspace/$(BIN_NAME) \
 		$(DOCKER_IMAGE) \
 		bash -c "source /home/esp/export-esp.sh && cargo build --release $(FEATURES_FLAG)"
