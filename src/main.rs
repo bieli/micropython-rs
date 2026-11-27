@@ -53,10 +53,13 @@ fn main() {
     let files = RefCell::new(FlatFs::mount(RamFlash::new(&mut flash)).expect("RAM file system"));
     // The source of imported `.py` modules (from the RAM file system)
     let mut module_memory = vec![0u8; 256 * 1024];
+    // Parsed statements kept for loops and functions (see `with_stmt_cache`)
+    let mut stmt_cache = vec![micropython_rs::StmtCache::EMPTY; 64];
     let mut vm = Interpreter::new(&mut out)
         .with_heap(&mut heap)
         .with_files(&files)
-        .with_module_memory(&mut module_memory);
+        .with_module_memory(&mut module_memory)
+        .with_stmt_cache(&mut stmt_cache);
 
     if let Err(err) = vm.eval(&script) {
         // Like Python: the traceback goes to stderr

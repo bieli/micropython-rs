@@ -467,10 +467,14 @@ const BOOT_SCRIPT: BootScript = BootScript {
 /// second data RAM region (what the REPL's buffers leave of it) and 56 KB of
 /// the main data RAM, which the stack gives up. With the station and the
 /// access point busy, the driver used up to about 60 KB.
+///
+/// ESP32: 52 KB of main RAM (68 KB in all, the driver's most seen was 55 KB):
+/// the 4 KB less than before hold the REPL's statement cache, so the stack
+/// keeps the 102 KB that starting the REPL needs.
 #[cfg(all(feature = "wifi", feature = "esp32"))]
 fn wifi_heap() {
     esp_alloc::heap_allocator!(#[link_section = ".dram2_uninit"] size: 16 * 1024);
-    esp_alloc::heap_allocator!(size: 56 * 1024);
+    esp_alloc::heap_allocator!(size: 52 * 1024);
 }
 
 /// ESP32-C3: 64 KB in `dram2` (66 KB there) and 8 KB of the main data RAM.

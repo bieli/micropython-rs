@@ -20,7 +20,7 @@ use core::fmt::Write as _;
 use core::sync::atomic::Ordering;
 
 use esp_println::print;
-use micropython_rs::{Error, HardwareBridge, Interpreter, Output};
+use micropython_rs::{Error, HardwareBridge, Interpreter, Output, StmtCache};
 
 use micropython_rs::flatfs::{FsError, Writer};
 
@@ -67,6 +67,39 @@ fn take_buffers() -> &'static mut Buffers {
         core::ptr::write_bytes(buffers, 0, 1);
         (*buffers).assume_init_mut()
     }
+}
+
+/// Parsed statements kept for loops and functions (`Interpreter::with_stmt_cache`):
+/// about 0.5 KB each. The ESP32 with Wi-Fi has the least RAM to spare (its
+/// `dram2` holds the driver's heap): 8 there, 16 elsewhere.
+const STMT_CACHE_SLOTS: usize = if cfg!(all(feature = "esp32", feature = "wifi")) {
+    8
+} else {
+    16
+};
+
+/// The ESP32 without Wi-Fi keeps it in `dram2` (16 KB are left there).
+#[cfg_attr(
+    all(feature = "esp32", not(feature = "wifi")),
+    link_section = ".dram2_uninit"
+)]
+static mut STMT_CACHE: core::mem::MaybeUninit<[StmtCache<'static>; STMT_CACHE_SLOTS]> =
+    core::mem::MaybeUninit::uninit();
+
+/// The statement cache for one session, every entry empty.
+///
+/// # Safety
+/// Only one session may hold it at a time (`run` makes a new one for each).
+unsafe fn take_stmt_cache<'a>() -> &'a mut [StmtCache<'a>] {
+    let cache = core::ptr::addr_of_mut!(STMT_CACHE) as *mut StmtCache<'a>;
+    for i in 0..STMT_CACHE_SLOTS {
+        // SAFETY: inside the static; written whole before any use
+        unsafe { cache.add(i).write(StmtCache::EMPTY) };
+    }
+    // SAFETY: just initialised; the caller holds the only reference. The
+    // entries only ever point into this session's source text, and the
+    // interpreter clears them at every `eval`
+    unsafe { core::slice::from_raw_parts_mut(cache, STMT_CACHE_SLOTS) }
 }
 
 const CTRL_A: u8 = 0x01;
@@ -124,7 +157,10 @@ pub fn run<O: Output, H: HardwareBridge>(
         // Like MicroPython: a soft reset stops the last session's pin
         // interrupts and timers
         hw.soft_reset();
-        let mut vm = new_interpreter(out, hw, heap, files, module_memory);
+        // SAFETY: the previous session's interpreter (the only other user)
+        // is gone
+        let stmt_cache = unsafe { take_stmt_cache() };
+        let mut vm = new_interpreter(out, hw, heap, files, module_memory, stmt_cache);
         let mut repl = Repl {
             vm: &mut vm,
             arena: Arena::new(&mut memory[..]),
@@ -187,9 +223,11 @@ fn new_interpreter<'a, O: Output, H: HardwareBridge>(
     heap: &'a mut [u8],
     files: Option<&'a RefCell<Files>>,
     module_memory: &'a mut [u8],
+    stmt_cache: &'a mut [StmtCache<'a>],
 ) -> Interpreter<'a, O, H> {
     let mut vm = Interpreter::with_hardware(out, hw);
     vm.set_heap(heap);
+    vm.set_stmt_cache(stmt_cache);
     // Scripts get the flash files too: `open()` and the `os` module
     if let Some(files) = files {
         vm.set_files(files);

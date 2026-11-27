@@ -36,6 +36,7 @@ pub(crate) fn float_bits(f: Float) -> u64 {
 pub(crate) fn float_from_bits(bits: u64) -> Float {
     Float::from_bits(bits as _)
 }
+pub use ast_parser::StmtCache;
 pub use interpreter::Interpreter;
 pub use interpreter::Value;
 

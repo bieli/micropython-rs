@@ -282,6 +282,8 @@ pub struct Interpreter<'a, O: Output, H: HardwareBridge = NoHardware> {
     func_marks: u128,
     /// Lowest native stack address scripts may reach (`set_stack_floor`).
     stack_floor: usize,
+    /// Parsed statements kept for running again (`with_stmt_cache`).
+    stmt_cache: &'a mut [crate::ast_parser::StmtCache<'a>],
     /// Memory for the source of imported `.py` modules (`with_module_memory`).
     module_memory: Option<&'a mut [u8]>,
     /// `.py` modules built into the application (`with_frozen_modules`).
@@ -354,6 +356,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
             func_marks: 0,
             stack_floor: 0,
             module_memory: None,
+            stmt_cache: &mut [],
             frozen: &[],
             py_modules: Value::None,
             module_env: Value::None,
@@ -389,6 +392,23 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
     /// file system (`import sensors` reads `sensors.py`). Each module stays
     /// there until the interpreter is dropped; without it, only native
     /// modules can be imported.
+    /// Memory for parsed statements: a loop's or a function's body is lexed
+    /// and parsed once, not on every pass (about 2x faster loops). Each entry
+    /// is about 0.5 KB on a 32-bit chip; 8-16 cover the statements of the
+    /// loops that run at once. Without it, every statement is parsed each
+    /// time it runs. The cache is cleared by every `eval` (the source text
+    /// of an earlier call may be replaced).
+    pub fn with_stmt_cache(mut self, cache: &'a mut [crate::ast_parser::StmtCache<'a>]) -> Self {
+        self.set_stmt_cache(cache);
+        self
+    }
+
+    /// Like `with_stmt_cache`, on an interpreter that already exists.
+    pub fn set_stmt_cache(&mut self, cache: &'a mut [crate::ast_parser::StmtCache<'a>]) {
+        crate::ast_parser::clear_stmt_cache(cache);
+        self.stmt_cache = cache;
+    }
+
     pub fn with_module_memory(mut self, memory: &'a mut [u8]) -> Self {
         self.module_memory = Some(memory);
         self
@@ -619,6 +639,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
     pub fn eval(&mut self, source: &'a str) -> Result<(), Error> {
         self.error_line = None;
         self.main_source = source;
+        crate::ast_parser::clear_stmt_cache(self.stmt_cache);
         self.steps = 0;
         self.sp = 0;
         self.handling = Value::None;
@@ -694,7 +715,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
         parser: &mut Parser<'a>,
         code: &mut Code<'a>,
     ) -> Result<Option<Stmt<'a>>, Error> {
-        let result = parser.parse_next_stmt(code);
+        let result = crate::ast_parser::parse_cached(self.stmt_cache, parser, code);
         match result {
             // A whole statement is too big: point at its start
             Err(Error::TooComplex) => self.note_error(parser.stmt_line(), parser.source()),
@@ -3709,11 +3730,27 @@ print(nothing)
 
     /// Runs a script and returns its output, panicking on errors.
     fn run_ok<'b>(src: &str, out: &'b mut MockOut) -> &'b str {
+        // Also with a statement cache (3 entries: collisions and evictions
+        // too), which must change nothing
+        let mut cached_out = MockOut::new();
+        let mut heap = [0u8; 4096];
+        let mut cache = [crate::ast_parser::StmtCache::EMPTY; 3];
+        let mut vm = Interpreter::new(&mut cached_out)
+            .with_heap(&mut heap)
+            .with_stmt_cache(&mut cache);
+        let cached = vm.eval(src);
         let mut heap = [0u8; 4096];
         let mut vm = Interpreter::new(out).with_heap(&mut heap);
         if let Err(err) = vm.eval(src) {
             panic!("error {:?} at line {:?} in:\n{}", err, vm.error_line(), src);
         }
+        assert_eq!(cached, Ok(()), "with the statement cache:\n{}", src);
+        assert_eq!(
+            cached_out.as_str(),
+            out.as_str(),
+            "with the statement cache:\n{}",
+            src
+        );
         out.as_str()
     }
 
@@ -3728,7 +3765,22 @@ print(nothing)
         let mut heap = [0u8; 4096];
         let mut vm = Interpreter::new(&mut out).with_heap(&mut heap);
         let err = vm.eval(src).expect_err("script should fail");
-        (err, vm.error_line())
+        let line = vm.error_line();
+        // The same error at the same line with a statement cache
+        let mut out = MockOut::new();
+        let mut heap = [0u8; 4096];
+        let mut cache = [crate::ast_parser::StmtCache::EMPTY; 3];
+        let mut vm = Interpreter::new(&mut out)
+            .with_heap(&mut heap)
+            .with_stmt_cache(&mut cache);
+        let cached = vm.eval(src).expect_err("script should fail with the cache");
+        assert_eq!(
+            (cached, vm.error_line()),
+            (err, line),
+            "with the statement cache:\n{}",
+            src
+        );
+        (err, line)
     }
 
     // ---- 2.2 comparisons and booleans --------------------------------
@@ -4906,10 +4958,12 @@ print(outer(), count)
         let mut out = MockOut::new();
         let mut mem = std::vec![0u8; heap_size];
         let mut module_memory = std::vec![0u8; 16 * 1024];
+        let mut cache = [crate::ast_parser::StmtCache::EMPTY; 8];
         let mut vm = Interpreter::new(&mut out)
             .with_heap(&mut mem)
             .with_files(&files)
-            .with_module_memory(&mut module_memory);
+            .with_module_memory(&mut module_memory)
+            .with_stmt_cache(&mut cache);
         let result = vm.eval(src);
         (out.as_str().into(), result)
     }

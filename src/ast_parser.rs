@@ -468,6 +468,77 @@ impl Stmt<'_> {
 
 /// The parser is a small `Copy` value: the interpreter saves a copy to jump
 /// back to the start of a `while` loop or a function body.
+/// Statements with up to this many RPN items are cached (`StmtCache`).
+pub const CACHE_ITEMS: usize = 16;
+
+/// One parsed statement kept for running again: the parser state after it,
+/// the statement and its RPN items. A loop body or a function body is lexed
+/// and parsed once instead of on every pass (that was over half of the time
+/// a loop took). See `Interpreter::with_stmt_cache`.
+#[derive(Clone, Copy)]
+pub struct StmtCache<'a> {
+    /// Where the statement starts: the source text's address and length,
+    /// the byte offset of the parser's current token, and whether a `;`
+    /// came just before (see `Parser::cache_key`)
+    key: (usize, usize, usize, bool),
+    entry: Option<(Parser<'a>, Stmt<'a>)>,
+    len: u8,
+    items: [Item<'a>; CACHE_ITEMS],
+}
+
+impl<'a> StmtCache<'a> {
+    pub const EMPTY: Self = Self {
+        key: (0, 0, 0, false),
+        entry: None,
+        len: 0,
+        items: [Item::None; CACHE_ITEMS],
+    };
+}
+
+/// `parser.parse_next_stmt(code)`, through `cache` (direct-mapped by the
+/// statement's position): a statement parsed before at the same place of
+/// the same text is copied back instead of lexed and parsed again. The text
+/// must not change while entries for it are kept (`clear_stmt_cache`).
+#[cfg_attr(feature = "iram", link_section = ".rwtext")]
+pub fn parse_cached<'a>(
+    cache: &mut [StmtCache<'a>],
+    parser: &mut Parser<'a>,
+    code: &mut Code<'a>,
+) -> Result<Option<Stmt<'a>>, Error> {
+    if cache.is_empty() {
+        return parser.parse_next_stmt(code);
+    }
+    let key = parser.cache_key();
+    let hash = (key.0 ^ key.2.wrapping_mul(0x9e37_79b1)) >> 3;
+    let slot = &mut cache[hash % cache.len()];
+    if slot.key == key {
+        if let Some((after, stmt)) = slot.entry {
+            code.len = slot.len as usize;
+            code.items[..code.len].copy_from_slice(&slot.items[..code.len]);
+            *parser = after;
+            return Ok(Some(stmt));
+        }
+    }
+    let result = parser.parse_next_stmt(code);
+    if let Ok(Some(stmt)) = result {
+        if code.len <= CACHE_ITEMS {
+            slot.key = key;
+            slot.entry = Some((*parser, stmt));
+            slot.len = code.len as u8;
+            slot.items[..code.len].copy_from_slice(&code.items[..code.len]);
+        }
+    }
+    result
+}
+
+/// Forgets every cached statement (their source text may be replaced).
+pub fn clear_stmt_cache(cache: &mut [StmtCache<'_>]) {
+    for slot in cache {
+        slot.entry = None;
+        slot.key = (0, 0, 0, false);
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct Parser<'a> {
     lexer: Lexer<'a>,
@@ -539,6 +610,19 @@ impl<'a> Parser<'a> {
 
     /// True if the last statement ended with `;` (`a = 1; b = 2`), so the
     /// next statement, if any on this line, belongs to the same body.
+    /// What a statement parsed from here depends on: the text (address and
+    /// length), the position of the current token, and a `;` just before.
+    /// The lexer's other state (line, indentation) follows from these.
+    pub fn cache_key(&self) -> (usize, usize, usize, bool) {
+        let source = self.source();
+        (
+            source.as_ptr() as usize,
+            source.len(),
+            self.current_start,
+            self.after_semicolon,
+        )
+    }
+
     pub fn after_semicolon(&self) -> bool {
         self.after_semicolon
     }

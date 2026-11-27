@@ -572,6 +572,31 @@ top level, `main` takes 12 KB (the board's drivers, a 4 KB SPI buffer and the fl
 it are the 96 function slots, 6 KB the heap's object table), and `eval()` with the call of `stack_peak()` itself the remaining 8 KB. `make report` lists the
 biggest stack frames of a build.
 
+#### Statement cache
+
+The interpreter runs source text: without help, every pass of a loop lexes and parses each statement of its body
+again, which was over half of a loop's time (callgrind on the PC: the lexer and parser took 50-70 % of the
+instructions, the arithmetic under 2 %). `Interpreter::with_stmt_cache(&mut [StmtCache::EMPTY; N])` keeps up to `N`
+parsed statements (direct-mapped by their place in the source; statements of up to 16 RPN items), so a loop's or a
+function's body is parsed once. Each entry is about 0.5 KB on a 32-bit chip (1 KB on a 64-bit PC); the cache is
+cleared by every `eval` (the REPL reuses its source memory). The firmware gives it 16 entries (8 on the ESP32 with
+Wi-Fi: in main RAM, paid for by a 4 KB smaller Wi-Fi heap, 68 KB, of which the driver used at most 53 KB with the
+station, the access point, scans and NTP at once); `mpy-cli` and the host REPL 64. On the PC a 300 000-pass loop
+went from 0.31 to 0.11 s; on the ESP32 at 80 MHz (`machine.bench()`, thousands per second):
+
+| Python test | Without the cache | With it |
+|-------------|------------------:|--------:|
+| int math `(x*3+i)%k` | 3.9 | 8.1 |
+| float math `y*a+b` | 4.0 | 8.7 |
+| function call | 3.4 | 4.5 |
+| list append | 4.0 | 5.7 |
+| dict set | 2.7 | 3.5 |
+| `pin_write` | 1.9 | 2.5 |
+| empty `for` loop | 11.0 | 11.5 |
+
+The interpreter's tests run every script with and without a (3-entry) cache and compare the output, errors and
+error lines.
+
 On another MCU, budget about 52 KB for `eval()` plus 8 KB per call level you allow, or use a smaller [feature
 level](#feature-levels) or lower `MAX_CALL_DEPTH` and `MAX_NESTING` and set the stack floor. Keep the `Interpreter`
 (30 KB on 32-bit targets with the `full` level) in one place: build it
@@ -1468,7 +1493,7 @@ waits for each result. About 3 s per run. Measured at 80 MHz (`CPU_MHZ` default)
 | native GPIO toggle, esp-hal (M/s) | 3.62 | 3.18 | 5.38 |
 | native GPIO toggle, register (M/s) | 9.7 | 10.16 | 11.64 |
 | native GPIO read, register (M/s) | 7.44 | 5.12 | 12.31 |
-| Python for loop (k/s) | 11.0 | 12.7 | 12.4 |
+| Python for loop (k/s), before the [statement cache](#statement-cache) | 11.0 | 12.7 | 12.4 |
 | Python int math (x*3+i)%k (k/s) | 3.9 | 4.5 | 4.6 |
 | Python float math y*a+b (k/s) | 4.0 | 4.6 | 4.7 |
 | Python function call (k/s) | 3.4 | 3.8 | 3.9 |
