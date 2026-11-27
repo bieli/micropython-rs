@@ -79,11 +79,25 @@ def board_version(board):
     return dict(item.split("=", 1) for item in text.split() if "=" in item)
 
 
+def firmware_dir(info):
+    """The folder whose Makefile builds the board's firmware."""
+    return "micropython-mg24" if info and info.get("chip") == "mg24" else "micropython-esp32"
+
+
 def flash_command(info):
     """The `make flash` that builds firmware like the board's (from
-    micropython-esp32/)."""
+    `firmware_dir`)."""
     if info is None:
-        return "make flash [CHIP=esp32s3|esp32c3] [FEATURES=tft,wifi]  (the options it was built with)"
+        return ("make flash [CHIP=esp32s3|esp32c3] [FEATURES=tft,wifi]  (the options it was built with;\n"
+                "    a XIAO MG24: make flash, from micropython-mg24/)")
+    if info.get("chip") == "mg24":
+        # Its Makefile: 32-bit floats by default (the FPU is single precision)
+        parts = ["make flash"]
+        if info.get("level", "full") != "full":
+            parts.append("LEVEL=" + info["level"])
+        if info.get("float") == "64":
+            parts.append("FLOAT=64")
+        return " ".join(parts)
     parts = ["make flash"]
     if info.get("chip", "esp32") != "esp32":
         parts.append("CHIP=" + info["chip"])
@@ -131,7 +145,7 @@ def check_firmware(board):
         return
     if warning:
         sys.stderr.write(f"mpy.py: warning: {warning}.\n"
-                         f"  Flash the current firmware, from micropython-esp32/:\n"
+                         f"  Flash the current firmware, from {firmware_dir(info)}/:\n"
                          f"    {flash_command(info)}\n"
                          f"  (--no-check hides this)\n")
         sys.stderr.flush()

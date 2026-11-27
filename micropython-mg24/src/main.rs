@@ -1,0 +1,189 @@
+//! micropython-rs on the Seeed XIAO MG24 (Silicon Labs EFR32MG24B220F1536IM48:
+//! Arm Cortex-M33, 1536 KB flash, 256 KB RAM). The REPL is `micropython-port`'s;
+//! this file gives it the console (`console`), the stack and the memory.
+//!
+//! Build and flash: `make flash` (probe-rs, through the board's CMSIS-DAP).
+#![no_std]
+#![no_main]
+
+mod console;
+
+use core::mem::MaybeUninit;
+
+use mg24_hal::gpio::{Input, InputConfig, Level, Output as Pin, OutputConfig};
+use mg24_hal::CpuConfig;
+use micropython_port::{BootScript, Memory, Port};
+use micropython_rs::flatfs::RamFlash;
+use micropython_rs::interpreter::FuncDef;
+use micropython_rs::{NoHardware, Output, StmtCache};
+
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+pub const COMMIT: &str = env!("MPY_GIT_COMMIT");
+
+// ---- the REPL's memory -----------------------------------------------------
+//
+// 256 KB of RAM: these statics take 136 KB, the stack (above them, up to the
+// top of RAM) the rest. The linker script fails the build if they don't fit.
+
+const ARENA_SIZE: usize = 32 * 1024;
+const HEAP_SIZE: usize = 64 * 1024;
+const MODULE_MEMORY_SIZE: usize = 16 * 1024;
+const STMT_CACHE_SLOTS: usize = 16;
+const FUNC_SLOTS: usize = 96;
+
+static mut ARENA: [u8; ARENA_SIZE] = [0; ARENA_SIZE];
+static mut HEAP: [u8; HEAP_SIZE] = [0; HEAP_SIZE];
+static mut MODULES: [u8; MODULE_MEMORY_SIZE] = [0; MODULE_MEMORY_SIZE];
+static mut STMT_CACHE: [MaybeUninit<StmtCache<'static>>; STMT_CACHE_SLOTS] =
+    [const { MaybeUninit::uninit() }; STMT_CACHE_SLOTS];
+static mut FUNCS: [MaybeUninit<Option<FuncDef<'static>>>; FUNC_SLOTS] =
+    [const { MaybeUninit::uninit() }; FUNC_SLOTS];
+
+/// The memory for the REPL's sessions (called once, from `main`).
+fn take_memory() -> Memory {
+    // SAFETY: `main` calls this once, so these are the only references to
+    // the statics
+    unsafe {
+        Memory {
+            arena: &mut *core::ptr::addr_of_mut!(ARENA),
+            heap: &mut *core::ptr::addr_of_mut!(HEAP),
+            modules: &mut *core::ptr::addr_of_mut!(MODULES),
+            stmt_cache: &mut *core::ptr::addr_of_mut!(STMT_CACHE),
+            func_slots: &mut *core::ptr::addr_of_mut!(FUNCS),
+            frozen: &[],
+        }
+    }
+}
+
+// ---- the stack ---------------------------------------------------------------
+
+extern "C" {
+    // From mg24-hal's linker script: the statics end at `__euninit`, the
+    // stack grows down from `_stack_start` (the top of RAM) towards them
+    static __euninit: u8;
+    static _stack_start: u8;
+}
+
+/// The lowest stack address: the end of the statics.
+fn stack_bottom() -> usize {
+    // Only the symbol's address is taken (it's never read)
+    core::ptr::addr_of!(__euninit) as usize
+}
+
+/// The main stack's size in bytes (`lscpu`, with the `machine` module).
+#[allow(dead_code)]
+pub fn stack_size() -> usize {
+    // Only the symbols' addresses are taken
+    core::ptr::addr_of!(_stack_start) as usize - stack_bottom()
+}
+
+/// Stack kept free below the interpreter's lowest check, for the code it
+/// calls (formatting, flash writes) and for interrupts.
+const STACK_MARGIN: usize = 8 * 1024;
+
+// ---- the board's side of the REPL -------------------------------------------
+
+struct Mg24Port;
+
+impl Port for Mg24Port {
+    const NAME: &'static str = "EFR32MG24 (XIAO MG24)";
+    const VERSION: &'static str = VERSION;
+    const COMMIT: &'static str = COMMIT;
+
+    fn build_options(out: &mut dyn core::fmt::Write) -> core::fmt::Result {
+        let level = if cfg!(feature = "minimal") {
+            "minimal"
+        } else if cfg!(feature = "medium") {
+            "medium"
+        } else {
+            "full"
+        };
+        let float = if cfg!(feature = "float32") { 32 } else { 64 };
+        let mhz = mg24_hal::clock::sysclk_hz() / 1_000_000;
+        write!(
+            out,
+            "chip=mg24 level={} features= float={} mhz={}",
+            level, float, mhz
+        )
+    }
+
+    fn read_byte() -> Option<u8> {
+        console::read_byte()
+    }
+
+    fn discard_through(byte: u8) {
+        console::discard_through(byte)
+    }
+
+    fn console_write(s: &str) {
+        console::write_raw(s)
+    }
+
+    fn stack_floor() -> usize {
+        stack_bottom() + STACK_MARGIN
+    }
+}
+
+/// Script output and the REPL's prompts: on the console, with `\r\n`.
+struct Console;
+
+impl Output for Console {
+    fn write_str(&mut self, s: &str) {
+        console::write_crlf(s)
+    }
+}
+
+static BOOT_SCRIPT: BootScript = BootScript {
+    source: include_str!("../scripts/boot.py"),
+    name: "scripts/boot.py",
+};
+
+#[mg24_hal::main]
+fn main() -> ! {
+    // A stack overflow faults (MSPLIM, ARMv8-M) instead of overwriting the
+    // statics below the stack
+    // SAFETY: the limit is below every frame in use (the statics' end)
+    unsafe { core::arch::asm!("msr MSPLIM, {}", in(reg) stack_bottom()) };
+
+    let dp = mg24_hal::init(CpuConfig::default()).unwrap();
+    // The LED (PA7) off, the console's TX (PA8) idle high, RX (PA9) an
+    // input; they stay configured (`run` never returns)
+    let _led = Pin::new(dp.pins.pa7, Level::Low, OutputConfig::default());
+    let _tx = Pin::new(dp.pins.pa8, Level::High, OutputConfig::default());
+    let _rx = Input::new(dp.pins.pa9, InputConfig::new());
+    // PCLK is SYSCLK at reset (HFRCODPLL's 19 MHz band, no prescaler)
+    console::init(mg24_hal::clock::sysclk_hz());
+
+    let mut out = Console;
+    let mut hw = NoHardware;
+    micropython_port::run::<Mg24Port, _, _, RamFlash<'static>>(
+        &mut out,
+        &mut hw,
+        &BOOT_SCRIPT,
+        None,
+        take_memory(),
+        None,
+    )
+}
+
+/// A panic prints its message on the console, then resets the chip.
+#[panic_handler]
+fn panic(info: &core::panic::PanicInfo) -> ! {
+    use core::fmt::Write;
+    struct Raw;
+    impl core::fmt::Write for Raw {
+        fn write_str(&mut self, s: &str) -> core::fmt::Result {
+            console::write_crlf(s);
+            Ok(())
+        }
+    }
+    mg24_hal::interrupt::disable();
+    let _ = write!(Raw, "\n*** panic: {}\n*** resetting\n", info);
+    console::flush();
+    // SCB.AIRCR: VECTKEY and SYSRESETREQ
+    // SAFETY: a write to the System Control Block's reset register
+    unsafe { core::ptr::write_volatile(0xE000_ED0C as *mut u32, 0x05FA_0004) };
+    loop {
+        core::hint::spin_loop();
+    }
+}

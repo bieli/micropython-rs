@@ -1,0 +1,8 @@
+[build]
+# Cortex-M33 with its single-precision FPU
+target = "thumbv8m.main-none-eabihf"
+# mg24-hal's build script puts its linker script (link.x) on the search path
+rustflags = ["-C", "link-arg=-Tlink.x"]
+
+[target."thumbv8m.main-none-eabihf"]
+runner = "probe-rs run --chip EFR32MG24B220F1536IM48"

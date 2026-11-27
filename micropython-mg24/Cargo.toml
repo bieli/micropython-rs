@@ -1,0 +1,39 @@
+[package]
+name = "micropython-mg24"
+version = "0.1.0"
+edition = "2021"
+authors = ["Marcin Bielak <marcin.bieli+github+micropython-rs@gmail.com>"]
+license = "Apache-2.0"
+description = "micropython-rs firmware for the Seeed XIAO MG24 (Silicon Labs EFR32MG24, Arm Cortex-M33)"
+
+[dependencies]
+micropython-rs = { path = "..", default-features = false }
+# The board-independent REPL, raw REPL and #@ file commands
+micropython-port = { path = "../micropython-port" }
+# GPIO, clocks, delays and the startup code / linker script for the chip;
+# without its panic handler (ours prints the message on the console)
+mg24-hal = { version = "=2.0.0", default-features = false }
+# Registers for what mg24-hal doesn't cover (USART0, ...); its
+# critical-section feature off, as mg24-hal has it
+efr32mg24-pac = { version = "=0.1.0", default-features = false }
+
+[features]
+# The interpreter's level (as in micropython-esp32): full, medium or minimal.
+# float32: the Cortex-M33's FPU is single precision (64-bit floats would be
+# computed in software)
+default = ["full", "float32"]
+full = ["micropython-rs/full"]
+medium = ["micropython-rs/medium"]
+minimal = ["micropython-rs/minimal"]
+float32 = ["micropython-rs/float32"]
+
+[profile.release]
+debug = true
+opt-level = "s"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+
+[profile.dev]
+opt-level = "s"
+panic = "abort"

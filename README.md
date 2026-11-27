@@ -974,6 +974,27 @@ on a PC through a mock board.
 All builds share every function in [Hardware API](#hardware-api). Run `help()` from a script to list what your build has.
 `FEATURES=wifi` and `LEVEL=...` work on every board (`make flash CHIP=esp32s3 FEATURES=wifi`).
 
+#### Seeed XIAO MG24 (Silicon Labs EFR32MG24, Arm Cortex-M33): in progress
+
+The first board outside the ESP32 family, in [`micropython-mg24/`](micropython-mg24): its own firmware on
+`micropython-port`, built with stable Rust (no Docker) and flashed with [probe-rs](https://probe.rs) through the
+board's own CMSIS-DAP debugger on its USB-C port (no BOOT button):
+
+```bash
+rustup target add thumbv8m.main-none-eabihf
+cargo install probe-rs-tools --locked
+cd micropython-mg24
+make flash                     # build, flash, reset (LEVEL=..., FLOAT=64 as for the ESP32 boards)
+make size                      # flash and RAM use
+../micropython-esp32/tools/mpy.py run myscript.py   # the same tools as the ESP32 boards (mpy.py, mpremote)
+```
+
+What works now: the REPL and raw REPL on the USB serial port (USART0 at 115200, bytes received by interrupt,
+Ctrl-C stops a script), 32-bit floats (the FPU's precision; `FLOAT=64` computes in software), a 64 KB heap and
+about 115 KB of stack (a stack overflow faults, MSPLIM, instead of overwriting memory). The chip runs at its reset
+clock, 19 MHz. Next: `machine` and `time` (pins, the LED on PA7, I²C, clock speed), files in flash, ADC/PWM/SPI,
+and the Sense's motion sensor. Not planned: Bluetooth, Thread and Zigbee (they need Silicon Labs' closed C stacks).
+
 #### ESP32-S3 and ESP32-C3 (`CHIP=esp32s3`, `CHIP=esp32c3`)
 
 The chip is a Cargo feature (`esp32`, the default, `esp32s3` or `esp32c3`) and a build target

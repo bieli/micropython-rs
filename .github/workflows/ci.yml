@@ -21,7 +21,7 @@ jobs:
       - name: Install Rust toolchain, LLVM tools, and embedded targets (ARM + RISC-V)
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: thumbv7em-none-eabihf, riscv32imc-unknown-none-elf
+          targets: thumbv7em-none-eabihf, thumbv8m.main-none-eabihf, riscv32imc-unknown-none-elf
           components: rustfmt, clippy, llvm-tools-preview
 
       - name: Install cargo-llvm-cov
@@ -51,6 +51,15 @@ jobs:
           cargo clippy --all-targets -- -D warnings
           cargo test
           cargo build --target thumbv7em-none-eabihf
+
+      # The XIAO MG24 firmware (EFR32MG24, Cortex-M33): formatting, lints,
+      # the release build and its flash/RAM use
+      - name: XIAO MG24 firmware (micropython-mg24)
+        working-directory: micropython-mg24
+        run: |
+          cargo fmt -- --check
+          make clippy
+          make size
 
       # Real tools against `mpy-cli --repl` on a pseudo-terminal (same REPL
       # protocol as the ESP32 firmware)
