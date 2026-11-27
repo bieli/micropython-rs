@@ -1316,7 +1316,7 @@ Pins are plain GPIO numbers.
 | SPI | `spi_init(sck, mosi, miso, [khz], [mode])`, `spi_write(data)`, `spi_transfer(data)`, `spi_read(n, [fill])` | SPI3 master, default 1000 kHz (10 to 40 000) and mode 0 (0–3). Chip select is yours: a GPIO with `pin_write`. `spi_transfer` returns the bytes read while sending; `spi_read` sends `fill` (default 0) |
 | Watchdog | `wdt_enable(timeout_ms)`, `wdt_feed()`, `wdt_disable()` | The RTC watchdog resets the whole board when it isn't fed in time. `sleep_ms` feeds it automatically every 100 ms; the `>>>` prompt doesn't, so after a script ends (an error, Ctrl-C) the board resets and runs `main.py` again |
 | Clock | `rtc_set(seconds, [microseconds])`, `wifi_ntp(host, [timeout_ms])` (`wifi` only) | The wall clock behind `time.time()`, in seconds since 2000-01-01 UTC (MicroPython's ESP32 epoch). It starts at 2000-01-01 after a reset (no battery) and survives soft resets. `wifi_ntp` asks an NTP server (a name, looked up with the router's DNS server, or an IP address) and returns microseconds since 2000; `OSError` when it doesn't answer. Use them through `ntptime` and `machine.RTC` |
-| System | `reset()`, `reset_cause()`, `stack_peak()`, `unique_id()`, `cpu_freq()`, `cpu_info()` | `reset_cause()` returns `PWRON_RESET`, `HARD_RESET`, `WDT_RESET`, `DEEPSLEEP_RESET` or `SOFT_RESET` (MicroPython's values). The firmware also prints the reset reason at boot. `stack_peak()`: the most bytes of the main stack used since its previous call (or boot), see [Stack budget](#stack-budget-measured-on-the-esp32). `unique_id()`: the chip's MAC address (6 bytes). `cpu_freq()`: the CPU clock in Hz (`CPU_MHZ`, 80 MHz by default) |
+| System | `reset()`, `reset_cause()`, `stack_peak()`, `unique_id()`, `cpu_freq()`, `cpu_info()`, `cpu_bench(name, [pin])` | `reset_cause()` returns `PWRON_RESET`, `HARD_RESET`, `WDT_RESET`, `DEEPSLEEP_RESET` or `SOFT_RESET` (MicroPython's values). The firmware also prints the reset reason at boot. `stack_peak()`: the most bytes of the main stack used since its previous call (or boot), see [Stack budget](#stack-budget-measured-on-the-esp32). `unique_id()`: the chip's MAC address (6 bytes). `cpu_freq()`: the CPU clock in Hz (`CPU_MHZ`, 80 MHz by default) |
 | Battery (`tft` only) | `battery_mv([samples])` | Battery voltage in mV: switches on the TTGO's divider (`ADC_EN`, GPIO14), reads GPIO34, doubles it, switches the divider off |
 | TFT (`tft` only) | `cls()`, `color(r, g, b)`, `text(x, y, s)`, `rect(x, y, w, h)`, `backlight(on)` | `color` sets the text and fill color (0–255 per channel). `text` and `rect` draw at pixel positions. `WIDTH` and `HEIGHT` are 240 and 135 |
 
@@ -1434,8 +1434,70 @@ Uptime (ms):       4709
 Reset cause:       soft reset
 ```
 
+`machine.bench()` measures the board: a dict `{name with unit: value}`; `machine.bench(True)` prints it as a table.
+Native tests (the firmware's `cpu_bench(name, [pin])`, in [`src/bench.rs`](micropython-esp32/src/bench.rs)) run
+without the interpreter: integer and float arithmetic (f32 and f64 both, whatever the build's float), RAM and flash,
+and pin toggles through esp-hal and straight through the GPIO registers. Python tests show what a script gets. The
+GPIO tests use the board's LED pin, or `bench(gpio=2)`; `gpio=None` skips them. Each native test is a chain of
+dependent operations (the compiler can't fold it) repeated until it runs 20 ms: it measures latency, the time code
+waits for each result. About 3 s per run. Measured at 80 MHz (`CPU_MHZ` default) with the Wi-Fi builds:
+
+| Test (80 MHz) | ESP32 (TTGO) | ESP32-S3 (XIAO) | ESP32-C3 (Super Mini) |
+|---|---:|---:|---:|
+| native i32 add (Mop/s) | 49.22 | 53.33 | 53.33 |
+| native i32 mul (Mop/s) | 19.39 | 21.33 | 30.48 |
+| native i32 div (Mop/s) | 8.09 | 8.19 | 3.88 |
+| native i64 add (Mop/s) | 10.32 | 10.49 | 17.78 |
+| native i64 mul (Mop/s) | 8.89 | 9.14 | 6.81 |
+| native i64 div (Mop/s) | 0.6 | 0.61 | 0.37 |
+| native count leading zeros (Mop/s) | 21.33 | 22.86 | 2.79 |
+| native f32 add (Mop/s) | 18.28 | 19.39 | 0.85 |
+| native f32 mul (Mop/s) | 18.28 | 19.39 | 0.62 |
+| native f32 div (Mop/s) | 0.46 | 1.55 | 0.41 |
+| native f32 sqrt (Mop/s) | 0.53 | 0.59 | 0.26 |
+| native f32 sin (Mop/s) | 0.07 | 0.07 | 0.03 |
+| native f64 add (Mop/s) | 1.62 | 1.57 | 0.66 |
+| native f64 mul (Mop/s) | 0.81 | 0.83 | 0.35 |
+| native f64 div (Mop/s) | 0.16 | 0.18 | 0.21 |
+| native f64 sqrt (Mop/s) | 0.16 | 0.16 | 0.13 |
+| native f64 sin (Mop/s) | 0.03 | 0.03 | 0.02 |
+| native RAM write (MiB/s) | 235.3 | 234.8 | 149.9 |
+| native RAM read (MiB/s) | 63.9 | 83.6 | 121.1 |
+| native RAM copy (MiB/s) | 118.7 | 118.4 | 108.4 |
+| native flash read, cached (MiB/s) | 51.9 | 83.6 | 7.6 |
+| native GPIO toggle, esp-hal (M/s) | 3.62 | 3.18 | 5.38 |
+| native GPIO toggle, register (M/s) | 9.7 | 10.16 | 11.64 |
+| native GPIO read, register (M/s) | 7.44 | 5.12 | 12.31 |
+| Python for loop (k/s) | 11.0 | 12.7 | 12.4 |
+| Python int math (x*3+i)%k (k/s) | 3.9 | 4.5 | 4.6 |
+| Python float math y*a+b (k/s) | 4.0 | 4.6 | 4.7 |
+| Python function call (k/s) | 3.4 | 3.8 | 3.9 |
+| Python list append (k/s) | 4.0 | 4.5 | 4.5 |
+| Python dict set (k/s) | 2.7 | 3.3 | 3.1 |
+| Python str format (k/s) | 1.1 | 2.0 | 1.5 |
+| Python pin_write (k/s) | 1.9 | 2.5 | 2.4 |
+| Python Pin.value (k/s) | 0.7 | 0.9 | 0.9 |
+
+What it shows:
+* **Single precision FPU** (ESP32, S3): f32 add and mul are 20-30x faster than on the C3, which has no FPU (and
+  doubles run in software everywhere: 10-20x slower than f32 on the Xtensa chips). `make flash FLOAT=32` gives
+  scripts these f32 speeds (see [Single precision](#single-precision-float32)). Division: the S3's FPU has division
+  steps the ESP32's lacks (3.4x faster). `sin` goes through libm, which reduces `sinf`'s argument in double precision.
+* **Bit counting**: Xtensa has `NSAU` (count leading zeros in one instruction); RV32IMC has no bit-manipulation
+  extension, so the C3 does it in software (8x slower).
+* **Integers**: the C3's multiplier is faster (RISC-V M extension), its divider slower; 64-bit division is a
+  software routine on all three (40-50x slower than 64-bit add).
+* **Memory**: internal RAM moves 100-235 MiB/s at 80 MHz. Flash goes through a cache (32 KB or more on the ESP32 and
+  S3, 16 KB for code and data together on the C3): the 16 KB that's read stays in the Xtensa chips' caches, not in
+  the C3's, which then reads the flash itself (7.6 MiB/s).
+* **GPIO**: a register write toggles a pin at about 10 MHz (5 MHz square wave), esp-hal's `Flex` at 3-5 MHz, a
+  script's `pin_write` at 2.5 kHz and `Pin.value()` at about 1 kHz: for anything faster than a few kHz, use PWM or a
+  bus (SPI, UART, I2C).
+* **The interpreter**: 11-13 thousand empty loop passes a second, about 1000x below native code; the chip matters
+  less than the interpreter. `CPU_MHZ=240` (160 on the C3) runs everything 2-3x faster.
+
 Not there yet: level triggers, `Signal`, and the `*_into` methods (`readinto`, `write_readinto`,
-`readfrom_mem_into`), which need `bytearray`. The module takes 52 of the 96 function slots (`MAX_FUNCS`), and each
+`readfrom_mem_into`), which need `bytearray`. The module takes 53 of the 96 function slots (`MAX_FUNCS`), and each
 method call runs Python code: `led.value(1)` takes 1.2 ms
 on the ESP32 at 80 MHz (0.43 ms at 240 MHz), `pin_write(2, 1)` 0.27 ms (0.12 ms). Fine for blinking, sensors and
 buses, too slow for bit-banging.
@@ -1537,7 +1599,7 @@ request. Measured on the TTGO: `settime()` takes 23-77 ms, an unknown name fails
 no answer (UDP), and NTP servers ignore a repeat within a few seconds, so retry after a pause.
 
 Not there yet: static addresses (`ifconfig((...))`), and sockets (`socket`, `urequests`), which are next. `network`
-takes 12 function slots, `time` and `ntptime` 2 each, so a script using `machine`, `network` and `ntptime` has 28 of
+takes 12 function slots, `time` and `ntptime` 2 each, so a script using `machine`, `network` and `ntptime` has 27 of
 the 96 left.
 
 #### Modules

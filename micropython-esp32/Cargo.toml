@@ -21,6 +21,9 @@ esp-backtrace = { version = "=0.18.1", features = [
 esp-println = { version = "=0.16.1" }
 # `nb::block!` for the blocking ADC read
 nb = "1.1"
+# sqrt and sin for the native float tests of machine.bench() (the interpreter's
+# floats use it too)
+libm = "0.2"
 # Atomic read-modify-write (fetch_or, swap) also on the ESP32-C3, whose RISC-V
 # core has no atomic instructions (esp-hal sets portable-atomic up for it)
 portable-atomic = { version = "1.11", default-features = false }

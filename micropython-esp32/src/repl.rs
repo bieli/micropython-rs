@@ -152,6 +152,16 @@ pub fn run<O: Output, H: HardwareBridge>(
     }
 }
 
+/// The largest frozen module's source (in flash): what `machine.bench()`'s
+/// flash read test reads.
+pub fn frozen_text() -> &'static str {
+    FROZEN_MODULES
+        .iter()
+        .map(|&(_, text)| text)
+        .max_by_key(|text| text.len())
+        .unwrap_or("")
+}
+
 /// Python modules built into the firmware (frozen): imported like files,
 /// without using the module memory. A file of the same name comes first.
 static FROZEN_MODULES: &[(&str, &str)] = &[

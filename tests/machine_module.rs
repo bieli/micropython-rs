@@ -66,6 +66,7 @@ const FUNCTIONS: &[HwFn] = &[
     HwFn::new("fire", "event", ""),
     HwFn::with_args("rtc_set", 1, 2, "seconds, [microseconds]", ""),
     HwFn::new("cpu_info", "", "").returning_bytes(),
+    HwFn::with_args("cpu_bench", 1, 2, "name, [pin]", ""),
 ];
 
 const CONSTANTS: &[(&str, i64)] = &[
@@ -134,6 +135,9 @@ impl HardwareBridge for MockBoard {
                 Ok(None)
             }
             "reset_cause" => Ok(Some(1)),
+            // Native rates: 40 M/s for everything, but no flash text (ValueError)
+            "cpu_bench" if args[0].str()? == "flash_read" => Err(Error::ValueError),
+            "cpu_bench" => Ok(Some(40_000_000)),
             "rtc_set" => {
                 self.clock_us = int(0)? * 1_000_000 + args.get(1).map_or(Ok(0), |a| a.int())?;
                 Ok(None)
@@ -419,4 +423,33 @@ fn lscpu_like_linux() {
     assert!(out.contains("Flash size:        8 MiB\n"), "{}", out);
     assert!(out.contains("Stack size:        140 KiB\n"), "{}", out);
     assert!(out.contains("Reset cause:       soft reset\n"), "{}", out);
+}
+
+#[test]
+fn bench_suite() {
+    let (out, log) = run(
+        "import machine, gc\n\
+         r = machine.bench(gpio=None)\n\
+         print(r['native i32 add (Mop/s)'], r['native f64 sin (Mop/s)'], r['native RAM copy (MiB/s)'])\n\
+         print('native flash read, cached (MiB/s)' in r, 'native GPIO toggle, esp-hal (M/s)' in r, len(r))\n\
+         r = machine.bench(gpio=4)\n\
+         print(r['native GPIO toggle, register (M/s)'], 'Python pin_write (k/s)' in r, len(r))\n\
+         machine.bench(True, gpio=None)\n\
+         r = None\ngc.collect()\nbefore = gc.objects_free()\nr = machine.bench(gpio=4)\nr = None\ngc.collect()\n\
+         print('objects left behind', before - gc.objects_free())\n",
+        b"",
+    );
+    let mut lines = out.lines();
+    assert_eq!(lines.next(), Some("40.0 40.0 38.1"));
+    assert_eq!(lines.next(), Some("False False 27"));
+    assert_eq!(lines.next(), Some("40.0 True 32"));
+    assert!(
+        out.contains("native i32 add (Mop/s)                       40.0\n"),
+        "{}",
+        out
+    );
+    assert!(out.contains("Python dict set (k/s)"), "{}", out);
+    assert!(out.ends_with("objects left behind 0\n"), "{}", out);
+    // GPIO tests left the pin low
+    assert!(log.ends_with("pin_write(4,0)\n"), "{}", log);
 }

@@ -2,6 +2,7 @@
 
 use core::sync::atomic::AtomicBool;
 
+pub mod bench;
 pub mod board;
 pub mod buttons;
 pub mod chip;

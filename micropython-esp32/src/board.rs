@@ -125,6 +125,7 @@ macro_rules! board_functions {
             micropython_rs::HwFn::new("i2c_probe", "addr", "True if a device answers at addr"),
             micropython_rs::HwFn::new("i2c_scan", "", "Addresses of the devices on the bus (bytes)").returning_bytes(),
             micropython_rs::HwFn::new("cpu_info", "", "Chip, CPU, memory and build details as key=value lines (use machine.lscpu())").returning_bytes(),
+            micropython_rs::HwFn::with_args("cpu_bench", 1, 2, "name, [pin]", "A native speed test: operations, bytes or toggles per second (use machine.bench())"),
             micropython_rs::HwFn::new("i2c_write", "addr, data", "Send bytes; returns how many"),
             micropython_rs::HwFn::new("i2c_read", "addr, n", "Receive n bytes").returning_bytes(),
             micropython_rs::HwFn::new("i2c_write_read", "addr, data, n", "Send, then receive n bytes (e.g. a register)").returning_bytes(),
@@ -409,6 +410,21 @@ impl<'d> Board<'d> {
                     .map(|()| None)
             }
             "cpu_freq" => Ok(Some(CPU_CLOCK as i64 * 1_000_000)),
+            "cpu_bench" => {
+                let name = args[0].str()?;
+                let rate = match args.get(1) {
+                    Some(pin) => {
+                        let pin = pin_number(pin.int()?)?;
+                        self.pin_mode(pin, OUT)?;
+                        let flex = self.output(pin)?;
+                        let rate = crate::bench::gpio(flex, pin, name);
+                        flex.set_low();
+                        rate
+                    }
+                    None => crate::bench::run(name),
+                };
+                rate.map(Some).ok_or(Error::ValueError)
+            }
             "rtc_set" => {
                 let us = match args.get(1) {
                     Some(us) => us.int()?,

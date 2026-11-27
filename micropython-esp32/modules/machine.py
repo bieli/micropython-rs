@@ -1,5 +1,5 @@
 # machine: MicroPython's hardware classes (Pin, ADC, PWM, I2C, SoftI2C, UART,
-# SPI, SoftSPI, Timer, WDT, RTC; and lscpu()), written in Python on top of the firmware's functions
+# SPI, SoftSPI, Timer, WDT, RTC; and lscpu(), bench()), written in Python on top of the firmware's functions
 # (pin_write, adc_read, pwm_u16, i2c_write, uart_read, spi_read, ...), so
 # code from MicroPython tutorials runs unchanged. Built into the firmware
 # (a frozen module); a machine.py on the board's file system comes first.
@@ -370,19 +370,16 @@ class RTC:
 # lscpu(): the chip, CPU, memory and build as a dict, with the names Linux's
 # lscpu uses where they fit; lscpu(True) prints them as a table instead.
 # Not in MicroPython (its closest are os.uname() and machine.freq()).
-# (firmware key, name; '' for a value made here), in a few statements: one
-# expression of all of them is too big for the parser
-_LSCPU = [('arch', 'Architecture'), ('', 'Byte Order'), ('cores', 'CPU(s)'), ('', 'Vendor ID')]
-_LSCPU += [('model', 'Model name'), ('core', 'CPU core'), ('rev', 'Revision'), ('mhz', 'CPU MHz')]
-_LSCPU += [('max_mhz', 'CPU max MHz'), ('flags', 'Flags'), ('flash', 'Flash size'), ('sram', 'SRAM size')]
-_LSCPU += [('stack', 'Stack size'), ('', 'Python heap size'), ('', 'Python heap free')]
-_LSCPU += [('wifi_heap', 'Wi-Fi heap size'), ('wifi_heap_free', 'Wi-Fi heap free'), ('mac', 'MAC address')]
-_LSCPU += [('board', 'Board'), ('firmware', 'Firmware'), ('build', 'Build')]
-_LSCPU += [('uptime_ms', 'Uptime (ms)'), ('reset', 'Reset cause')]
-_RESETS = {1: 'power on', 2: 'hard reset', 3: 'watchdog', 4: 'deep sleep', 5: 'soft reset'}
-
-
 def lscpu(show=False):
+    # (firmware key, name; '' for a value made here), built here (not kept by
+    # the module) and in a few statements: one expression is too big to parse
+    names = [('arch', 'Architecture'), ('', 'Byte Order'), ('cores', 'CPU(s)'), ('', 'Vendor ID')]
+    names += [('model', 'Model name'), ('core', 'CPU core'), ('rev', 'Revision'), ('mhz', 'CPU MHz')]
+    names += [('max_mhz', 'CPU max MHz'), ('flags', 'Flags'), ('flash', 'Flash size'), ('sram', 'SRAM size')]
+    names += [('stack', 'Stack size'), ('', 'Python heap size'), ('', 'Python heap free')]
+    names += [('wifi_heap', 'Wi-Fi heap size'), ('wifi_heap_free', 'Wi-Fi heap free'), ('mac', 'MAC address')]
+    names += [('board', 'Board'), ('firmware', 'Firmware'), ('build', 'Build')]
+    names += [('uptime_ms', 'Uptime (ms)'), ('reset', 'Reset cause')]
     raw = {}
     for line in cpu_info().decode().split('\n'):
         kv = line.split('=', 1)
@@ -397,10 +394,10 @@ def lscpu(show=False):
     extra = {'Byte Order': 'Little Endian', 'Vendor ID': 'Espressif',
              'Python heap size': raw.get('_heap'), 'Python heap free': raw.get('_heap_free')}
     info = {}
-    for key, name in _LSCPU:
+    for key, name in names:
         value = raw.get(key) if key else extra.get(name)
         if name == 'Reset cause':
-            value = _RESETS.get(value, value)
+            value = {1: 'power on', 2: 'hard reset', 3: 'watchdog', 4: 'deep sleep', 5: 'soft reset'}.get(value, value)
         if value is not None:
             info[name] = value
     if not show:
@@ -413,6 +410,103 @@ def lscpu(show=False):
             else:
                 value = '%d KiB' % (value // 1024)
         print('%-18s %s' % (name + ':', value))
+
+
+# bench(): speed tests as a dict {name with unit: value}; bench(True) prints
+# a table. Native tests (cpu_bench in the firmware) show what the chip does
+# without the interpreter: integer and float arithmetic (f32 and f64 both,
+# whatever the build's float), memory and flash, and with a pin, GPIO.
+# Python tests show what a script gets. gpio: a free pin to toggle (default:
+# the board's LED, if it has one; None on the TTGO); it ends low. Names are
+# literals and values plain numbers: no heap objects per result.
+def bench(show=False, gpio=-1):
+    import time
+    tests = [('i32_add', 'native i32 add (Mop/s)'), ('i32_mul', 'native i32 mul (Mop/s)')]
+    tests += [('i32_div', 'native i32 div (Mop/s)'), ('i64_add', 'native i64 add (Mop/s)')]
+    tests += [('i64_mul', 'native i64 mul (Mop/s)'), ('i64_div', 'native i64 div (Mop/s)')]
+    tests += [('clz', 'native count leading zeros (Mop/s)'), ('f32_add', 'native f32 add (Mop/s)')]
+    tests += [('f32_mul', 'native f32 mul (Mop/s)'), ('f32_div', 'native f32 div (Mop/s)')]
+    tests += [('f32_sqrt', 'native f32 sqrt (Mop/s)'), ('f32_sin', 'native f32 sin (Mop/s)')]
+    tests += [('f64_add', 'native f64 add (Mop/s)'), ('f64_mul', 'native f64 mul (Mop/s)')]
+    tests += [('f64_div', 'native f64 div (Mop/s)'), ('f64_sqrt', 'native f64 sqrt (Mop/s)')]
+    tests += [('f64_sin', 'native f64 sin (Mop/s)')]
+    results = {}
+    for key, name in tests:
+        results[name] = round(cpu_bench(key) / 1e6, 2)
+    tests = [('ram_write', 'native RAM write (MiB/s)'), ('ram_read', 'native RAM read (MiB/s)')]
+    tests += [('ram_copy', 'native RAM copy (MiB/s)'), ('flash_read', 'native flash read, cached (MiB/s)')]
+    for key, name in tests:
+        try:
+            results[name] = round(cpu_bench(key) / 1048576, 1)
+        except ValueError:
+            pass                        # no frozen module text to read
+    tests = None
+    if gpio == -1:
+        try:
+            gpio = LED
+        except NameError:
+            gpio = None
+    if gpio is not None:
+        results['native GPIO toggle, esp-hal (M/s)'] = round(cpu_bench('gpio_hal', gpio) / 1e6, 2)
+        try:
+            results['native GPIO toggle, register (M/s)'] = round(cpu_bench('gpio_reg', gpio) / 1e6, 2)
+            results['native GPIO read, register (M/s)'] = round(cpu_bench('gpio_read', gpio) / 1e6, 2)
+        except ValueError:
+            pass                        # GPIO32 and up
+    # The interpreter: rates in thousands per second
+    n = 2000
+    t = time.ticks_us()
+    for i in range(n):
+        pass
+    results['Python for loop (k/s)'] = round(n * 1000 / max(1, time.ticks_diff(time.ticks_us(), t)), 1)
+    x = 0
+    t = time.ticks_us()
+    for i in range(n):
+        x = (x * 3 + i) % 1000
+    results['Python int math (x*3+i)%k (k/s)'] = round(n * 1000 / max(1, time.ticks_diff(time.ticks_us(), t)), 1)
+    y = 1.0
+    t = time.ticks_us()
+    for i in range(n):
+        y = y * 1.0001 + 0.5
+    results['Python float math y*a+b (k/s)'] = round(n * 1000 / max(1, time.ticks_diff(time.ticks_us(), t)), 1)
+    f = lambda a: a
+    t = time.ticks_us()
+    for i in range(n):
+        f(i)
+    results['Python function call (k/s)'] = round(n * 1000 / max(1, time.ticks_diff(time.ticks_us(), t)), 1)
+    f = None
+    items = []                          # 500: a long list would fill the 32 KB heap
+    t = time.ticks_us()
+    for i in range(500):
+        items.append(i)
+    results['Python list append (k/s)'] = round(500 * 1000 / max(1, time.ticks_diff(time.ticks_us(), t)), 1)
+    items = None
+    d = {}
+    t = time.ticks_us()
+    for i in range(n):
+        d[i & 63] = i
+    results['Python dict set (k/s)'] = round(n * 1000 / max(1, time.ticks_diff(time.ticks_us(), t)), 1)
+    d = None
+    t = time.ticks_us()
+    for i in range(500):
+        s = '%d:%d' % (i, i)
+    results['Python str format (k/s)'] = round(500 * 1000 / max(1, time.ticks_diff(time.ticks_us(), t)), 1)
+    if gpio is not None:
+        t = time.ticks_us()
+        for i in range(n):
+            pin_write(gpio, i & 1)
+        results['Python pin_write (k/s)'] = round(n * 1000 / max(1, time.ticks_diff(time.ticks_us(), t)), 1)
+        p = Pin(gpio, Pin.OUT)
+        t = time.ticks_us()
+        for i in range(500):
+            p.value(i & 1)
+        results['Python Pin.value (k/s)'] = round(500 * 1000 / max(1, time.ticks_diff(time.ticks_us(), t)), 1)
+        pin_write(gpio, 0)
+    if not show:
+        return results
+    print('%-38s %10s' % ('test at %d MHz' % (freq() // 1000000), 'speed'))
+    for name in results:
+        print('%-38s %10s' % (name, results[name]))
 
 
 class WDT:
