@@ -1614,7 +1614,7 @@ print(wlan.ifconfig())                   # ('192.168.0.111', '255.255.255.0', '1
 |------|------|
 | `network.WLAN(network.STA_IF)` | The station (client) interface; `network.WLAN(network.AP_IF)` is the access point (see below) |
 | `active([on])` | Starts or stops the radio; returns whether it's on. The first `active(True)` starts the Wi-Fi stack (93 ms) |
-| `scan()` | `(ssid, bssid, channel, RSSI, security, hidden)` tuples, `ssid` and `bssid` as bytes, `security` an `AUTH_*` value; up to 120 ms per channel like ESP-IDF (0.5-1 s) |
+| `scan()` | `(ssid, bssid, channel, RSSI, security, hidden)` tuples, `ssid` and `bssid` as bytes, `security` an `AUTH_*` value; up to 120 ms per channel like ESP-IDF (0.5-1 s). The radio doesn't scan while the station is connecting (after `connect()`, or after `WLAN(AP_IF).active(...)` restarts the radio and the station reconnects): `scan()` waits for that, up to 5 s, then raises `OSError` (a wrong password keeps the station trying) |
 | `connect(ssid, key)` | Starts connecting and returns, like MicroPython; DHCP follows. WPA2 or better (WPA3 too), or an open network with no key |
 | `isconnected()`, `status()` | `True` once there's an IP address; `STAT_IDLE`, `STAT_CONNECTING`, `STAT_GOT_IP`, `STAT_WRONG_PASSWORD`, `STAT_NO_AP_FOUND`, `STAT_BEACON_TIMEOUT`, `STAT_ASSOC_FAIL`, `STAT_HANDSHAKE_TIMEOUT` (MicroPython's ESP32 values) |
 | `status('rssi')` | Signal strength in dBm |

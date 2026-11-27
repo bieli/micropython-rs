@@ -25,8 +25,8 @@ use esp_hal::peripherals::{TIMG1, WIFI};
 use esp_hal::timer::timg::TimerGroup;
 use esp_radio::wifi::event::{self, EventExt};
 use esp_radio::wifi::{
-    AccessPointConfig, AuthMethod, ClientConfig, ModeConfig, ScanConfig, ScanTypeConfig,
-    WifiController, WifiDevice,
+    AccessPointConfig, AuthMethod, ClientConfig, InternalWifiError, ModeConfig, ScanConfig,
+    ScanTypeConfig, WifiController, WifiDevice, WifiError,
 };
 use micropython_rs::{Error, Returns};
 use smoltcp::iface::{Config as IfaceConfig, Interface, SocketHandle, SocketSet, SocketStorage};
@@ -127,6 +127,9 @@ fn now() -> smoltcp::time::Instant {
         .as_micros();
     smoltcp::time::Instant::from_micros(us as i64)
 }
+
+/// How long `scan()` waits for a connection in progress to finish.
+const SCAN_WAIT_MS: u64 = 5000;
 
 fn io<T>(_: T) -> Error {
     Error::IoError
@@ -512,10 +515,26 @@ impl Wifi {
             min: core::time::Duration::from_millis(10),
             max: core::time::Duration::from_millis(120),
         };
-        let found = self
-            .controller
-            .scan_with_config(ScanConfig::default().with_scan_type(scan_type))
-            .map_err(io)?;
+        let config = ScanConfig::default().with_scan_type(scan_type);
+        // The driver doesn't scan while the station is connecting
+        // (ESP_ERR_WIFI_STATE): after connect(), and after an access point
+        // change restarts the radio and the station reconnects. Wait for it
+        // (up to SCAN_WAIT_MS), keeping the network going, then scan.
+        let start = esp_hal::time::Instant::now();
+        let found = loop {
+            match self.controller.scan_with_config(config) {
+                Ok(found) => break found,
+                Err(WifiError::InternalError(InternalWifiError::State))
+                    if start.elapsed().as_millis() < SCAN_WAIT_MS =>
+                {
+                    let pause = esp_hal::time::Instant::now();
+                    while pause.elapsed().as_millis() < 50 {
+                        self.poll();
+                    }
+                }
+                Err(e) => return Err(io(e)),
+            }
+        };
         out.begin_list()?;
         for ap in &found {
             out.begin_tuple()?;
