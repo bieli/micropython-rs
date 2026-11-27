@@ -22,7 +22,7 @@ use micropython_esp32::buttons::{Buttons, BUTTONS_MODULE};
 use micropython_esp32::repl::{self, BootScript};
 use micropython_esp32::serial_input;
 use micropython_esp32::storage;
-use micropython_rs::{Arg, Error, HardwareBridge, HwFn, Module};
+use micropython_rs::{Arg, Error, HardwareBridge, HwFn, Module, Returns};
 
 esp_bootloader_esp_idf::esp_app_desc!();
 
@@ -168,6 +168,16 @@ impl HardwareBridge for GenericHardware<'_> {
 
     fn call_bytes(&mut self, name: &str, args: &[Arg<'_>], out: &mut [u8]) -> Result<usize, Error> {
         self.board.call_bytes(name, args, out)
+    }
+
+    fn call_values(
+        &mut self,
+        module: Option<&str>,
+        name: &str,
+        args: &[Arg<'_>],
+        out: &mut Returns<'_>,
+    ) -> Result<(), Error> {
+        self.board.call_values(module, name, args, out)
     }
 
     fn poll_event(&mut self) -> Option<i64> {
@@ -365,6 +375,16 @@ impl HardwareBridge for TtgoHardware<'_, '_> {
 
     fn call_bytes(&mut self, name: &str, args: &[Arg<'_>], out: &mut [u8]) -> Result<usize, Error> {
         self.board.call_bytes(name, args, out)
+    }
+
+    fn call_values(
+        &mut self,
+        module: Option<&str>,
+        name: &str,
+        args: &[Arg<'_>],
+        out: &mut Returns<'_>,
+    ) -> Result<(), Error> {
+        self.board.call_values(module, name, args, out)
     }
 
     fn poll_event(&mut self) -> Option<i64> {

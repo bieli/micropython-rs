@@ -1,10 +1,10 @@
-//! The firmware's frozen `time` module (micropython-esp32/modules/time.py, the
-//! calendar functions on top of the native `utime`) and `ntptime`
+//! The firmware's frozen `time` module (micropython-esp32/modules/time.py, on
+//! the native `utime`, whose calendar is micropython_rs::calendar) and `ntptime`
 //! (modules/ntptime.py), against a mock clock: MicroPython's ESP32 epoch
 //! (2000-01-01), time tuples as MicroPython gives them.
 #![cfg(all(feature = "modules", feature = "classes", feature = "format"))]
 
-use micropython_rs::{Arg, Error, HardwareBridge, HwFn, Interpreter, Module, Output};
+use micropython_rs::{Arg, Error, HardwareBridge, HwFn, Interpreter, Module, Output, Returns};
 use std::fmt::Write;
 
 const FROZEN: &[(&str, &str)] = &[
@@ -29,6 +29,9 @@ const UTIME: Module = Module {
         HwFn::new("ticks_add", "ticks, delta", ""),
         HwFn::new("time", "", ""),
         HwFn::new("time_ns", "", ""),
+        HwFn::with_args("gmtime", 0, 1, "[secs]", "").returning_values(),
+        HwFn::with_args("localtime", 0, 1, "[secs]", "").returning_values(),
+        HwFn::new("_mktime", "year, month, mday, hour, minute, second", ""),
     ],
     constants: &[],
 };
@@ -81,8 +84,41 @@ impl HardwareBridge for MockClock {
                 Ok(None)
             }
             "ticks_add" => Ok(Some(args[0].int()? + args[1].int()?)),
+            "_mktime" => {
+                let v = |i: usize| args[i].int();
+                Ok(Some(micropython_rs::calendar::mktime(
+                    v(0)?,
+                    v(1)?,
+                    v(2)?,
+                    v(3)?,
+                    v(4)?,
+                    v(5)?,
+                )))
+            }
             _ => Ok(Some(0)),
         }
+    }
+
+    fn call_values(
+        &mut self,
+        _module: Option<&str>,
+        _name: &str,
+        args: &[Arg<'_>],
+        out: &mut Returns<'_>,
+    ) -> Result<(), Error> {
+        // utime.gmtime / localtime, as in the firmware (board.rs)
+        let secs = match args.first() {
+            Some(arg) => arg.int()?,
+            None => self.clock_us.div_euclid(1_000_000),
+        };
+        let t = micropython_rs::calendar::gmtime(secs);
+        out.begin_tuple()?;
+        for v in [
+            t.year, t.month, t.mday, t.hour, t.minute, t.second, t.weekday, t.yearday,
+        ] {
+            out.int(v)?;
+        }
+        out.end()
     }
 
     fn functions(&self) -> &[HwFn] {

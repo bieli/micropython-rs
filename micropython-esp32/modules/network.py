@@ -55,10 +55,6 @@ def hostname(name=None):
     _hostname = name
 
 
-def _ip(b, at):
-    return '%d.%d.%d.%d' % (b[at], b[at + 1], b[at + 2], b[at + 3])
-
-
 class WLAN:
     IF_STA = 0
     IF_AP = 1
@@ -127,24 +123,13 @@ class WLAN:
         raise ValueError('unknown status param')
 
     def scan(self):
-        # (ssid, bssid, channel, RSSI, security, hidden), as on MicroPython
-        raw = wifi_scan()
-        found = []
-        i = 0
-        while i < len(raw):
-            n = raw[i]
-            at = i + 1 + n
-            rssi = raw[at + 7]
-            found.append((raw[i + 1:at], raw[at:at + 6], raw[at + 6],
-                          rssi - 256 if rssi > 127 else rssi, raw[at + 8], False))
-            i = at + 9
-        return found
+        # [(ssid, bssid, channel, RSSI, security, hidden)], as on MicroPython
+        return wifi_scan()
 
     def ifconfig(self, config=None):
         if config is not None:
             raise ValueError('no static addresses yet')
-        b = wifi_ap_ifconfig() if self._if == AP_IF else wifi_ifconfig()
-        return (_ip(b, 0), _ip(b, 4), _ip(b, 8), _ip(b, 12))
+        return wifi_ap_ifconfig() if self._if == AP_IF else wifi_ifconfig()
 
     def config(self, *args, **kwargs):
         # Station: config('mac'), config('ssid'), config('hostname'); setting

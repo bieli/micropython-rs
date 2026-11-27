@@ -4,7 +4,7 @@
 //! frozen modules and classes, like the firmware's `machine` feature.)
 #![cfg(all(feature = "modules", feature = "classes", feature = "format"))]
 
-use micropython_rs::{Arg, Error, HardwareBridge, HwFn, Interpreter, Module, Output};
+use micropython_rs::{Arg, Error, HardwareBridge, HwFn, Interpreter, Module, Output, Returns};
 use std::fmt::Write;
 
 const MACHINE: &str = include_str!("../micropython-esp32/modules/machine.py");
@@ -27,6 +27,9 @@ const UTIME: Module = Module {
         HwFn::new("ticks_add", "ticks, delta", ""),
         HwFn::new("time", "", ""),
         HwFn::new("time_ns", "", ""),
+        HwFn::with_args("gmtime", 0, 1, "[secs]", "").returning_values(),
+        HwFn::with_args("localtime", 0, 1, "[secs]", "").returning_values(),
+        HwFn::new("_mktime", "year, month, mday, hour, minute, second", ""),
     ],
     constants: &[],
 };
@@ -65,7 +68,7 @@ const FUNCTIONS: &[HwFn] = &[
     HwFn::new("timer_deinit", "id", ""),
     HwFn::new("fire", "event", ""),
     HwFn::with_args("rtc_set", 1, 2, "seconds, [microseconds]", ""),
-    HwFn::new("cpu_info", "", "").returning_bytes(),
+    HwFn::new("cpu_info", "", "").returning_values(),
     HwFn::with_args("cpu_bench", 1, 2, "name, [pin]", ""),
 ];
 
@@ -159,11 +162,6 @@ impl HardwareBridge for MockBoard {
                 self.rx.drain(..n.min(5)).collect() // arrives 5 bytes at a time
             }
             "unique_id" => vec![0x24, 0x0a, 0xc4, 1, 2, 3],
-            "cpu_info" => b"arch=xtensa\nmodel=ESP32-S3\ncore=Xtensa LX7\nrev=v0.2\ncores=2\nmhz=80\n\
-                max_mhz=240\nflags=fpu wifi ble usb-jtag\nflash=8388608\nsram=524288\nstack=144308\n\
-                mac=d8:3b:da:75:f0:a4\nboard=XIAO\nfirmware=0.1.0\nbuild=full wifi\nuptime_ms=1234\n\
-                reset=5\nwifi_heap=73728\nwifi_heap_free=40000\n"
-                .to_vec(),
             _ => return Err(Error::UnknownIdentifier),
         };
         out[..data.len()].copy_from_slice(&data);
@@ -182,13 +180,102 @@ impl HardwareBridge for MockBoard {
         &mut self,
         _module: &str,
         name: &str,
-        _args: &[Arg<'_>],
+        args: &[Arg<'_>],
     ) -> Result<Option<i64>, Error> {
         match name {
             "time" => Ok(Some(self.clock_us.div_euclid(1_000_000))),
             "time_ns" => Ok(Some(self.clock_us * 1000)),
+            "_mktime" => {
+                let v = |i: usize| args[i].int();
+                Ok(Some(micropython_rs::calendar::mktime(
+                    v(0)?,
+                    v(1)?,
+                    v(2)?,
+                    v(3)?,
+                    v(4)?,
+                    v(5)?,
+                )))
+            }
             _ => Ok(Some(0)),
         }
+    }
+
+    fn call_values(
+        &mut self,
+        module: Option<&str>,
+        name: &str,
+        args: &[Arg<'_>],
+        out: &mut Returns<'_>,
+    ) -> Result<(), Error> {
+        if module.is_none() && name == "cpu_info" {
+            // As the firmware's (board.rs), for an ESP32-S3 with Wi-Fi
+            out.begin_dict()?;
+            for (key, value) in [("Architecture", "xtensa"), ("Byte Order", "Little Endian")] {
+                out.str(key)?;
+                out.str(value)?;
+            }
+            out.str("CPU(s)")?;
+            out.int(2)?;
+            for (key, value) in [
+                ("Vendor ID", "Espressif"),
+                ("Model name", "ESP32-S3"),
+                ("CPU core", "Xtensa LX7"),
+                ("Revision", "v0.2"),
+            ] {
+                out.str(key)?;
+                out.str(value)?;
+            }
+            for (key, value) in [("CPU MHz", 80), ("CPU max MHz", 240)] {
+                out.str(key)?;
+                out.int(value)?;
+            }
+            out.str("Flags")?;
+            out.str("fpu wifi ble usb-jtag")?;
+            for (key, value) in [
+                ("Flash size", 8_388_608),
+                ("SRAM size", 524_288),
+                ("PSRAM size", 0),
+                ("Stack size", 144_308),
+            ] {
+                out.str(key)?;
+                out.int(value)?;
+            }
+            for key in ["Python heap size", "Python heap free"] {
+                out.str(key)?;
+                out.none()?;
+            }
+            for (key, value) in [("Wi-Fi heap size", 73_728), ("Wi-Fi heap free", 40_000)] {
+                out.str(key)?;
+                out.int(value)?;
+            }
+            for (key, value) in [
+                ("MAC address", "d8:3b:da:75:f0:a4"),
+                ("Board", "XIAO"),
+                ("Firmware", "0.1.0"),
+                ("Build", "full wifi"),
+            ] {
+                out.str(key)?;
+                out.str(value)?;
+            }
+            out.str("Uptime (ms)")?;
+            out.int(1234)?;
+            out.str("Reset cause")?;
+            out.str("soft reset")?;
+            return out.end();
+        }
+        // utime.gmtime / localtime, as in the firmware
+        let secs = match args.first() {
+            Some(arg) => arg.int()?,
+            None => self.clock_us.div_euclid(1_000_000),
+        };
+        let t = micropython_rs::calendar::gmtime(secs);
+        out.begin_tuple()?;
+        for v in [
+            t.year, t.month, t.mday, t.hour, t.minute, t.second, t.weekday, t.yearday,
+        ] {
+            out.int(v)?;
+        }
+        out.end()
     }
 
     fn poll_event(&mut self) -> Option<i64> {

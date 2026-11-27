@@ -371,36 +371,16 @@ class RTC:
 # lscpu uses where they fit; lscpu(True) prints them as a table instead.
 # Not in MicroPython (its closest are os.uname() and machine.freq()).
 def lscpu(show=False):
-    # (firmware key, name; '' for a value made here), built here (not kept by
-    # the module) and in a few statements: one expression is too big to parse
-    names = [('arch', 'Architecture'), ('', 'Byte Order'), ('cores', 'CPU(s)'), ('', 'Vendor ID')]
-    names += [('model', 'Model name'), ('core', 'CPU core'), ('rev', 'Revision'), ('mhz', 'CPU MHz')]
-    names += [('max_mhz', 'CPU max MHz'), ('flags', 'Flags'), ('flash', 'Flash size'), ('sram', 'SRAM size')]
-    names += [('psram', 'PSRAM size')]
-    names += [('stack', 'Stack size'), ('', 'Python heap size'), ('', 'Python heap free')]
-    names += [('wifi_heap', 'Wi-Fi heap size'), ('wifi_heap_free', 'Wi-Fi heap free'), ('mac', 'MAC address')]
-    names += [('board', 'Board'), ('firmware', 'Firmware'), ('build', 'Build')]
-    names += [('uptime_ms', 'Uptime (ms)'), ('reset', 'Reset cause')]
-    raw = {}
-    for line in cpu_info().decode().split('\n'):
-        kv = line.split('=', 1)
-        if len(kv) == 2:
-            raw[kv[0]] = int(kv[1]) if kv[1].isdigit() else kv[1]
+    # The firmware gives the dict (cpu_info); the Python heap's entries are
+    # filled in here
+    info = cpu_info()
     try:
         import gc
-        raw['_heap'] = gc.mem_free() + gc.mem_alloc()
-        raw['_heap_free'] = gc.mem_free()
+        info['Python heap size'] = gc.mem_free() + gc.mem_alloc()
+        info['Python heap free'] = gc.mem_free()
     except ImportError:
-        pass
-    extra = {'Byte Order': 'Little Endian', 'Vendor ID': 'Espressif',
-             'Python heap size': raw.get('_heap'), 'Python heap free': raw.get('_heap_free')}
-    info = {}
-    for key, name in names:
-        value = raw.get(key) if key else extra.get(name)
-        if name == 'Reset cause':
-            value = {1: 'power on', 2: 'hard reset', 3: 'watchdog', 4: 'deep sleep', 5: 'soft reset'}.get(value, value)
-        if value is not None:
-            info[name] = value
+        del info['Python heap size']
+        del info['Python heap free']
     if not show:
         return info
     for name in info:

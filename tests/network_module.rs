@@ -3,7 +3,7 @@
 //! the right `wifi_*` calls and decode their results like MicroPython shows them.
 #![cfg(all(feature = "modules", feature = "classes", feature = "format"))]
 
-use micropython_rs::{Arg, Error, HardwareBridge, HwFn, Interpreter, Output};
+use micropython_rs::{Arg, Error, HardwareBridge, HwFn, Interpreter, Output, Returns};
 use std::fmt::Write;
 
 const NETWORK: &str = include_str!("../micropython-esp32/modules/network.py");
@@ -11,11 +11,11 @@ const FROZEN: &[(&str, &str)] = &[("network", NETWORK)];
 
 const FUNCTIONS: &[HwFn] = &[
     HwFn::with_args("wifi_active", 0, 1, "[on]", ""),
-    HwFn::new("wifi_scan", "", "").returning_bytes(),
+    HwFn::new("wifi_scan", "", "").returning_values(),
     HwFn::with_args("wifi_connect", 1, 2, "ssid, [key]", ""),
     HwFn::new("wifi_disconnect", "", ""),
     HwFn::new("wifi_status", "", ""),
-    HwFn::new("wifi_ifconfig", "", "").returning_bytes(),
+    HwFn::new("wifi_ifconfig", "", "").returning_values(),
     HwFn::new("wifi_mac", "", "").returning_bytes(),
     HwFn::new("wifi_rssi", "", ""),
     HwFn::new("sleep_ms", "ms", ""),
@@ -27,7 +27,7 @@ const FUNCTIONS: &[HwFn] = &[
         "ssid, key, authmode, channel, hidden, max_clients",
         "",
     ),
-    HwFn::new("wifi_ap_ifconfig", "", "").returning_bytes(),
+    HwFn::new("wifi_ap_ifconfig", "", "").returning_values(),
     HwFn::new("wifi_ap_stations", "", "").returning_bytes(),
     HwFn::new("wifi_ap_mac", "", "").returning_bytes(),
 ];
@@ -102,27 +102,8 @@ impl HardwareBridge for MockRadio {
         out: &mut [u8],
     ) -> Result<usize, Error> {
         let data: Vec<u8> = match name {
-            // Two access points: "my-network" (channel 5, -75 dBm, WPA2) and "open" (channel 11, -88, open)
-            "wifi_scan" => {
-                let mut d = vec![10];
-                d.extend_from_slice(b"my-network");
-                d.extend_from_slice(&[1, 2, 3, 4, 5, 6, 5, (-75i8) as u8, 3]);
-                d.push(4);
-                d.extend_from_slice(b"open");
-                d.extend_from_slice(&[9, 9, 9, 9, 9, 9, 11, (-88i8) as u8, 0]);
-                d
-            }
-            "wifi_ifconfig" if self.connecting && self.key_ok => {
-                vec![
-                    192, 168, 0, 111, 255, 255, 255, 0, 192, 168, 0, 1, 8, 8, 8, 8,
-                ]
-            }
-            "wifi_ifconfig" => vec![0; 16],
             "wifi_mac" => vec![0x88, 0x13, 0xbf, 0x97, 0xb9, 0xd0],
             "wifi_ap_mac" => vec![0x8a, 0x13, 0xbf, 0x97, 0xb9, 0xd0],
-            "wifi_ap_ifconfig" => {
-                vec![192, 168, 4, 1, 255, 255, 255, 0, 192, 168, 4, 1, 0, 0, 0, 0]
-            }
             // One device joined while the access point is on
             "wifi_ap_stations" if self.ap_active => vec![2, 0, 0, 0, 0, 1],
             "wifi_ap_stations" => vec![],
@@ -130,6 +111,52 @@ impl HardwareBridge for MockRadio {
         };
         out[..data.len()].copy_from_slice(&data);
         Ok(data.len())
+    }
+
+    fn call_values(
+        &mut self,
+        _module: Option<&str>,
+        name: &str,
+        _args: &[Arg<'_>],
+        out: &mut Returns<'_>,
+    ) -> Result<(), Error> {
+        let addresses = |out: &mut Returns<'_>, a: [&str; 4]| -> Result<(), Error> {
+            out.begin_tuple()?;
+            for s in a {
+                out.str(s)?;
+            }
+            out.end()
+        };
+        match name {
+            // Two access points: "my-network" (channel 5, -75 dBm, WPA2) and "open" (channel 11, -88, open)
+            "wifi_scan" => {
+                out.begin_list()?;
+                for (ssid, bssid, channel, rssi, security) in [
+                    (&b"my-network"[..], [1, 2, 3, 4, 5, 6], 5, -75, 3),
+                    (&b"open"[..], [9; 6], 11, -88, 0),
+                ] {
+                    out.begin_tuple()?;
+                    out.bytes(ssid)?;
+                    out.bytes(&bssid)?;
+                    out.int(channel)?;
+                    out.int(rssi)?;
+                    out.int(security)?;
+                    out.bool(false)?;
+                    out.end()?;
+                }
+                out.end()
+            }
+            "wifi_ifconfig" if self.connecting && self.key_ok => addresses(
+                out,
+                ["192.168.0.111", "255.255.255.0", "192.168.0.1", "8.8.8.8"],
+            ),
+            "wifi_ifconfig" => addresses(out, ["0.0.0.0"; 4]),
+            "wifi_ap_ifconfig" => addresses(
+                out,
+                ["192.168.4.1", "255.255.255.0", "192.168.4.1", "0.0.0.0"],
+            ),
+            _ => Err(Error::UnknownIdentifier),
+        }
     }
 
     fn functions(&self) -> &[HwFn] {

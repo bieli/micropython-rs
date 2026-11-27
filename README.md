@@ -1483,7 +1483,7 @@ NTP (`ntptime.settime()`) or keep another clock (a DS3231 module on I²C). It dr
 `machine.lscpu()` describes the board like Linux's `lscpu`: a dict with `Architecture`, `CPU(s)`, `Model name`,
 `Revision`, `CPU MHz`, `Flags`, `Flash size`, `PSRAM size`, `Stack size`, the Python and Wi-Fi heaps, `MAC address`, `Board`, `Build`,
 `Reset cause` and more (sizes in bytes); `machine.lscpu(True)` prints it as a table instead (sizes in KiB/MiB). It's
-not in MicroPython. The firmware's `cpu_info()` gives the raw `key=value` lines. On the three boards it was tried on
+not in MicroPython. The firmware's `cpu_info()` gives the dict itself (built in Rust; `lscpu` adds the Python heap). On the three boards it was tried on
 (each matched what `espflash board-info` reads from the chip):
 
 | | TTGO T-Display | Seeed XIAO ESP32-S3 | ESP32-C3 Super Mini |
@@ -1697,7 +1697,7 @@ the 96 left.
 |--------|--------|----------|
 | `machine` | both | MicroPython's hardware classes, see [The `machine` module](#the-machine-module) |
 | `network` | `wifi` | Wi-Fi: `network.WLAN`, see [The `network` module](#the-network-module-wi-fi) |
-| `time` | both | `sleep(s)` (also a float: `sleep(0.5)`), `sleep_ms(ms)`, `sleep_us(us)`, `ticks_ms()`, `ticks_us()`, `ticks_diff(new, old)`, `ticks_add(t, delta)`, `time()`, `time_ns()`, with MicroPython's names, so `import time; time.sleep_ms(100)` works as on MicroPython. At the `full` level also `gmtime([secs])`, `localtime([secs])` (the same: no time zone) and `mktime(tuple)`, in Python (a frozen `time.py` on top of the native `utime`). `time()` counts seconds since 2000-01-01 UTC, MicroPython's ESP32 epoch |
+| `time` | both | `sleep(s)` (also a float: `sleep(0.5)`), `sleep_ms(ms)`, `sleep_us(us)`, `ticks_ms()`, `ticks_us()`, `ticks_diff(new, old)`, `ticks_add(t, delta)`, `time()`, `time_ns()`, with MicroPython's names, so `import time; time.sleep_ms(100)` works as on MicroPython. At the `full` level also `gmtime([secs])`, `localtime([secs])` (the same: no time zone) and `mktime(tuple)`, native (`micropython_rs::calendar`, about 0.3 ms a call on an ESP32-S3 at 80 MHz instead of 29 ms in Python). `time()` counts seconds since 2000-01-01 UTC, MicroPython's ESP32 epoch |
 | `ntptime` | `wifi` | `settime()`, `time()`, `host`, `timeout`: the clock from an NTP server |
 | `gc` | both | `collect()`, `mem_free()`, `mem_alloc()`, `objects_free()` (free object-table entries, not in MicroPython), `enable()`/`disable()`/`isenabled()` (collection is always on) |
 | `display` | `tft` | Drawing on the 240 × 135 TFT. See below |

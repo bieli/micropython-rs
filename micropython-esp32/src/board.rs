@@ -27,7 +27,7 @@ use esp_hal::{
     uart::{Config as UartConfig, Uart},
     Blocking,
 };
-use micropython_rs::{Arg, Error, HwFn, Module};
+use micropython_rs::{Arg, Error, HwFn, Module, Returns};
 
 use crate::chip;
 
@@ -80,6 +80,27 @@ pub const TIME_MODULE: Module = Module {
             "Seconds since 2000-01-01 (UTC, MicroPython's ESP32 epoch), from the clock",
         ),
         HwFn::new("time_ns", "", "Nanoseconds since 2000-01-01 (UTC)"),
+        HwFn::with_args(
+            "gmtime",
+            0,
+            1,
+            "[secs]",
+            "(year, month, mday, hour, minute, second, weekday, yearday)",
+        )
+        .returning_values(),
+        HwFn::with_args(
+            "localtime",
+            0,
+            1,
+            "[secs]",
+            "The same as gmtime: the board has no time zone",
+        )
+        .returning_values(),
+        HwFn::new(
+            "_mktime",
+            "year, month, mday, hour, minute, second",
+            "Seconds since 2000 (time.mktime takes the tuple)",
+        ),
     ],
     constants: &[],
 };
@@ -124,7 +145,7 @@ macro_rules! board_functions {
             micropython_rs::HwFn::with_args("i2c_init", 2, 3, "sda, scl, [freq]", "Move the I2C bus (default 21, 22 at 100 kHz)"),
             micropython_rs::HwFn::new("i2c_probe", "addr", "True if a device answers at addr"),
             micropython_rs::HwFn::new("i2c_scan", "", "Addresses of the devices on the bus (bytes)").returning_bytes(),
-            micropython_rs::HwFn::new("cpu_info", "", "Chip, CPU, memory and build details as key=value lines (use machine.lscpu())").returning_bytes(),
+            micropython_rs::HwFn::new("cpu_info", "", "Chip, CPU, memory and build details as a dict (machine.lscpu())").returning_values(),
             micropython_rs::HwFn::with_args("cpu_bench", 1, 2, "name, [pin]", "A native speed test: operations, bytes or toggles per second (use machine.bench())"),
             micropython_rs::HwFn::new("i2c_write", "addr, data", "Send bytes; returns how many"),
             micropython_rs::HwFn::new("i2c_read", "addr, n", "Receive n bytes").returning_bytes(),
@@ -155,7 +176,7 @@ macro_rules! board_functions {
             #[cfg(feature = "wifi")]
             micropython_rs::HwFn::with_args("wifi_active", 0, 1, "[on]", "Wi-Fi station on/off; returns whether it's on"),
             #[cfg(feature = "wifi")]
-            micropython_rs::HwFn::new("wifi_scan", "", "Access points (encoded; use network.WLAN.scan)").returning_bytes(),
+            micropython_rs::HwFn::new("wifi_scan", "", "Access points: [(ssid, bssid, channel, RSSI, security, hidden)]").returning_values(),
             #[cfg(feature = "wifi")]
             micropython_rs::HwFn::with_args("wifi_connect", 1, 2, "ssid, [key]", "Start connecting to a network"),
             #[cfg(feature = "wifi")]
@@ -163,7 +184,7 @@ macro_rules! board_functions {
             #[cfg(feature = "wifi")]
             micropython_rs::HwFn::new("wifi_status", "", "network.STAT_IDLE / CONNECTING / GOT_IP / ..."),
             #[cfg(feature = "wifi")]
-            micropython_rs::HwFn::new("wifi_ifconfig", "", "IP, netmask, gateway, DNS (16 bytes)").returning_bytes(),
+            micropython_rs::HwFn::new("wifi_ifconfig", "", "(IP, netmask, gateway, DNS)").returning_values(),
             #[cfg(feature = "wifi")]
             micropython_rs::HwFn::new("wifi_mac", "", "The station's MAC address (6 bytes)").returning_bytes(),
             #[cfg(feature = "wifi")]
@@ -171,7 +192,7 @@ macro_rules! board_functions {
             #[cfg(feature = "wifi")]
             micropython_rs::HwFn::with_args("wifi_ap_config", 6, 6, "ssid, key, authmode, channel, hidden, max_clients", "Configure the access point"),
             #[cfg(feature = "wifi")]
-            micropython_rs::HwFn::new("wifi_ap_ifconfig", "", "The access point's IP, netmask, gateway, DNS (16 bytes)").returning_bytes(),
+            micropython_rs::HwFn::new("wifi_ap_ifconfig", "", "The access point's (IP, netmask, gateway, DNS)").returning_values(),
             #[cfg(feature = "wifi")]
             micropython_rs::HwFn::new("wifi_ap_stations", "", "MAC addresses of the devices joined (6 bytes each)").returning_bytes(),
             #[cfg(feature = "wifi")]
@@ -623,6 +644,50 @@ impl<'d> Board<'d> {
         }
     }
 
+    /// The functions that return Python values (`HwFn::returning_values`):
+    /// the Wi-Fi scan and addresses, the calendar, `cpu_info`.
+    pub fn call_values(
+        &mut self,
+        module: Option<&str>,
+        name: &str,
+        args: &[Arg<'_>],
+        out: &mut Returns<'_>,
+    ) -> Result<(), Error> {
+        match (module, name) {
+            #[cfg(feature = "wifi")]
+            (None, "wifi_scan") => self.wifi()?.scan(out),
+            #[cfg(feature = "wifi")]
+            (None, "wifi_ifconfig") => {
+                let zero = smoltcp::wire::Ipv4Address::new(0, 0, 0, 0);
+                let addresses = match self.station.as_mut() {
+                    Some(station) => station.ifconfig(),
+                    None => [zero; 4],
+                };
+                crate::wifi::write_addresses(out, addresses)
+            }
+            #[cfg(feature = "wifi")]
+            (None, "wifi_ap_ifconfig") => {
+                crate::wifi::write_addresses(out, self.wifi_started()?.ap_ifconfig())
+            }
+            (None, "cpu_info") => cpu_info(out),
+            (Some("time" | "utime"), "gmtime" | "localtime") => {
+                let secs = match args.first() {
+                    Some(arg) => arg.int()?,
+                    None => self.clock_us().div_euclid(1_000_000),
+                };
+                let t = micropython_rs::calendar::gmtime(secs);
+                out.begin_tuple()?;
+                for v in [
+                    t.year, t.month, t.mday, t.hour, t.minute, t.second, t.weekday, t.yearday,
+                ] {
+                    out.int(v)?;
+                }
+                out.end()
+            }
+            _ => Err(Error::UnknownIdentifier),
+        }
+    }
+
     /// Board functions that return bytes (`i2c_read`, `uart_read`, ...):
     /// they fill `out` and return how many bytes they have.
     pub fn call_bytes(
@@ -639,18 +704,6 @@ impl<'d> Board<'d> {
                 .ok_or(Error::ValueError)
         };
         match name {
-            #[cfg(feature = "wifi")]
-            "wifi_scan" => self.wifi()?.scan(out),
-            #[cfg(feature = "wifi")]
-            "wifi_ifconfig" => match self.station.as_mut() {
-                Some(station) => Ok(station.ifconfig(out)),
-                None => {
-                    out[..16].fill(0);
-                    Ok(16)
-                }
-            },
-            #[cfg(feature = "wifi")]
-            "wifi_ap_ifconfig" => Ok(self.wifi_started()?.ap_ifconfig(out)),
             #[cfg(feature = "wifi")]
             "wifi_ap_stations" => match self.station.as_mut() {
                 Some(wifi) => Ok(wifi.ap_stations(out)),
@@ -671,7 +724,6 @@ impl<'d> Board<'d> {
                 out[..mac.len()].copy_from_slice(&mac);
                 Ok(mac.len())
             }
-            "cpu_info" => Ok(cpu_info(out)),
             "i2c_scan" => {
                 let mut n = 0;
                 for addr in 0x08..0x78 {
@@ -867,6 +919,17 @@ impl<'d> Board<'d> {
             }
             ("time" | "utime", "time") => Ok(Some(self.clock_us().div_euclid(1_000_000))),
             ("time" | "utime", "time_ns") => Ok(Some(self.clock_us().saturating_mul(1000))),
+            ("time" | "utime", "_mktime") => {
+                let v = |i: usize| args[i].int();
+                Ok(Some(micropython_rs::calendar::mktime(
+                    v(0)?,
+                    v(1)?,
+                    v(2)?,
+                    v(3)?,
+                    v(4)?,
+                    v(5)?,
+                )))
+            }
             ("time" | "utime", "ticks_add") => {
                 Ok(Some(args[0].int()?.wrapping_add(args[1].int()?)))
             }
@@ -1265,22 +1328,12 @@ pub fn raw_to_mv(raw: u32, vref_mv: u32) -> u32 {
     ((coeff_a * raw as u64 + 32_768) / 65_536 + OFFSET_11DB) as u32
 }
 
-/// `cpu_info()`: what `machine.lscpu()` shows, as `key=value` lines (the
-/// bridge passes bytes, not dicts; machine.py turns them into a dict).
-fn cpu_info(out: &mut [u8]) -> usize {
+/// `cpu_info()`: what `machine.lscpu()` shows, a dict with the names Linux's
+/// lscpu uses where they fit (sizes in bytes). The Python heap's entries are
+/// `None` here: machine.py fills them in (`gc`).
+fn cpu_info(out: &mut Returns<'_>) -> Result<(), Error> {
     use chip::about;
     use core::fmt::Write;
-
-    struct Cursor<'b>(&'b mut [u8], usize);
-    impl Write for Cursor<'_> {
-        fn write_str(&mut self, s: &str) -> core::fmt::Result {
-            let end = (self.1 + s.len()).min(self.0.len());
-            self.0[self.1..end].copy_from_slice(&s.as_bytes()[..end - self.1]);
-            self.1 = end;
-            Ok(())
-        }
-    }
-    let mut c = Cursor(out, 0);
     let rev = esp_hal::efuse::Efuse::chip_revision();
     let mac = esp_hal::efuse::Efuse::mac_address();
     let level = if cfg!(feature = "minimal") {
@@ -1290,56 +1343,93 @@ fn cpu_info(out: &mut [u8]) -> usize {
     } else {
         "full"
     };
+    let mut revision = crate::stack_text::<8>();
+    let _ = write!(revision, "v{}.{}", rev / 100, rev % 100);
+    let mut mac_text = crate::stack_text::<17>();
     let _ = write!(
-        c,
-        "arch={}\nmodel={}\ncore={}\nrev=v{}.{}\ncores={}\nmhz={}\nmax_mhz={}\nflags={}\n\
-         flash={}\nsram={}\nstack={}\n",
-        about::ARCH,
-        chip::NAME,
-        about::CORE,
-        rev / 100,
-        rev % 100,
-        about::CORES,
-        CPU_CLOCK as u32,
-        about::MAX_MHZ,
-        about::FLAGS,
-        crate::storage::flash_size(),
-        about::SRAM,
-        crate::stack::size(),
+        mac_text,
+        "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+        mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
     );
-    let _ =
-        write!(
-        c,
-        "mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}\nboard={}\nfirmware={}\nbuild={}{}{}{}\n\
-         uptime_ms={}\nreset={}\n",
-        mac[0],
-        mac[1],
-        mac[2],
-        mac[3],
-        mac[4],
-        mac[5],
-        chip::BOARD,
-        env!("CARGO_PKG_VERSION"),
+    let mut build = crate::stack_text::<32>();
+    let _ = write!(
+        build,
+        "{}{}{}{}{}",
         level,
         if cfg!(feature = "wifi") { " wifi" } else { "" },
         if cfg!(feature = "tft") { " tft" } else { "" },
-        if cfg!(feature = "float32") { " float32" } else { "" },
-        now_ms(),
-        reset_cause(),
+        if cfg!(feature = "psram") {
+            " psram"
+        } else {
+            ""
+        },
+        if cfg!(feature = "float32") {
+            " float32"
+        } else {
+            ""
+        },
     );
-    let _ = write!(
-        c,
-        "psram={}\n",
-        crate::PSRAM_SIZE.load(core::sync::atomic::Ordering::Relaxed)
-    );
+    let reset = match reset_cause() {
+        PWRON_RESET => "power on",
+        WDT_RESET => "watchdog",
+        DEEPSLEEP_RESET => "deep sleep",
+        SOFT_RESET => "soft reset",
+        _ => "hard reset",
+    };
+    let psram = crate::PSRAM_SIZE.load(core::sync::atomic::Ordering::Relaxed) as i64;
+    out.begin_dict()?;
+    let text = |out: &mut Returns<'_>, key: &str, value: &str| -> Result<(), Error> {
+        out.str(key)?;
+        out.str(value)
+    };
+    text(out, "Architecture", about::ARCH)?;
+    text(out, "Byte Order", "Little Endian")?;
+    out.str("CPU(s)")?;
+    out.int(about::CORES as i64)?;
+    text(out, "Vendor ID", "Espressif")?;
+    text(out, "Model name", chip::NAME)?;
+    text(out, "CPU core", about::CORE)?;
+    text(out, "Revision", revision.as_str())?;
+    for (key, value) in [
+        ("CPU MHz", CPU_CLOCK as i64),
+        ("CPU max MHz", about::MAX_MHZ as i64),
+    ] {
+        out.str(key)?;
+        out.int(value)?;
+    }
+    text(out, "Flags", about::FLAGS)?;
+    for (key, value) in [
+        ("Flash size", crate::storage::flash_size() as i64),
+        ("SRAM size", about::SRAM as i64),
+        ("PSRAM size", psram),
+        ("Stack size", crate::stack::size() as i64),
+    ] {
+        out.str(key)?;
+        out.int(value)?;
+    }
+    for key in ["Python heap size", "Python heap free"] {
+        out.str(key)?;
+        out.none()?;
+    }
     #[cfg(feature = "wifi")]
-    let _ = write!(
-        c,
-        "wifi_heap={}\nwifi_heap_free={}\n",
-        esp_alloc::HEAP.used() + esp_alloc::HEAP.free(),
-        esp_alloc::HEAP.free()
-    );
-    c.1
+    for (key, value) in [
+        (
+            "Wi-Fi heap size",
+            (esp_alloc::HEAP.used() + esp_alloc::HEAP.free()) as i64,
+        ),
+        ("Wi-Fi heap free", esp_alloc::HEAP.free() as i64),
+    ] {
+        out.str(key)?;
+        out.int(value)?;
+    }
+    text(out, "MAC address", mac_text.as_str())?;
+    text(out, "Board", chip::BOARD)?;
+    text(out, "Firmware", env!("CARGO_PKG_VERSION"))?;
+    text(out, "Build", build.as_str())?;
+    out.str("Uptime (ms)")?;
+    out.int(now_ms() as i64)?;
+    text(out, "Reset cause", reset)?;
+    out.end()
 }
 
 /// Why the chip started, as one of the `*_RESET` constants.

@@ -3276,16 +3276,13 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
                     Value::Int(v)
                 }
                 TAG_FLOAT => {
-                    let v = f64::from_le_bytes(read(self, at, 8));
-                    at += 8;
+                    #[cfg(not(feature = "float"))]
+                    return Err(Error::NotEnabled);
                     #[cfg(feature = "float")]
                     {
+                        let v = f64::from_le_bytes(read(self, at, 8));
+                        at += 8;
                         Value::Float(v as crate::Float)
-                    }
-                    #[cfg(not(feature = "float"))]
-                    {
-                        let _ = v;
-                        return Err(Error::NotEnabled);
                     }
                 }
                 TAG_STR | TAG_BYTES => {

@@ -28,7 +28,7 @@ use esp_radio::wifi::{
     AccessPointConfig, AuthMethod, ClientConfig, ModeConfig, ScanConfig, ScanTypeConfig,
     WifiController, WifiDevice,
 };
-use micropython_rs::Error;
+use micropython_rs::{Error, Returns};
 use smoltcp::iface::{Config as IfaceConfig, Interface, SocketHandle, SocketSet, SocketStorage};
 use smoltcp::socket::{dhcpv4, dns, udp};
 use smoltcp::wire::{
@@ -464,7 +464,7 @@ impl Wifi {
 
     /// `WLAN(STA_IF).ifconfig()`: address, netmask, gateway and DNS as 16
     /// bytes.
-    pub fn ifconfig(&mut self, out: &mut [u8]) -> usize {
+    pub fn ifconfig(&mut self) -> [Ipv4Address; 4] {
         self.poll();
         let zero = Ipv4Address::new(0, 0, 0, 0);
         let (ip, mask, gw, dns) = match self.ip {
@@ -476,15 +476,15 @@ impl Wifi {
             ),
             None => (zero, zero, zero, zero),
         };
-        write_addresses(out, [ip, mask, gw, dns])
+        [ip, mask, gw, dns]
     }
 
     /// `WLAN(AP_IF).ifconfig()`: 192.168.4.1/24, the access point is also the
     /// gateway (there's no DNS server).
-    pub fn ap_ifconfig(&mut self, out: &mut [u8]) -> usize {
+    pub fn ap_ifconfig(&mut self) -> [Ipv4Address; 4] {
         self.poll();
         let mask = Ipv4Cidr::new(AP_IP, AP_PREFIX).netmask();
-        write_addresses(out, [AP_IP, mask, AP_IP, Ipv4Address::new(0, 0, 0, 0)])
+        [AP_IP, mask, AP_IP, Ipv4Address::new(0, 0, 0, 0)]
     }
 
     /// `WLAN(AP_IF).status('stations')`: the MAC addresses of the devices
@@ -502,7 +502,9 @@ impl Wifi {
 
     /// `wlan.scan()`: one record per access point:
     /// `len, ssid[len], bssid[6], channel, rssi (i8), authmode`.
-    pub fn scan(&mut self, out: &mut [u8]) -> Result<usize, Error> {
+    /// `wlan.scan()`: a list of (ssid, bssid, channel, RSSI, security,
+    /// hidden) tuples, as MicroPython gives them (ssid and bssid as bytes).
+    pub fn scan(&mut self, out: &mut Returns<'_>) -> Result<(), Error> {
         self.require_sta()?;
         // Up to 120 ms per channel, like ESP-IDF's default (which MicroPython
         // uses): the driver's 10-20 ms miss access points that answer slowly
@@ -514,24 +516,18 @@ impl Wifi {
             .controller
             .scan_with_config(ScanConfig::default().with_scan_type(scan_type))
             .map_err(io)?;
-        let mut n = 0;
+        out.begin_list()?;
         for ap in &found {
-            let ssid = ap.ssid.as_bytes();
-            let len = ssid.len().min(32);
-            let record = 1 + len + 6 + 3;
-            if n + record > out.len() {
-                break;
-            }
-            out[n] = len as u8;
-            out[n + 1..n + 1 + len].copy_from_slice(&ssid[..len]);
-            let at = n + 1 + len;
-            out[at..at + 6].copy_from_slice(&ap.bssid);
-            out[at + 6] = ap.channel;
-            out[at + 7] = ap.signal_strength as u8;
-            out[at + 8] = auth_code(ap.auth_method);
-            n += record;
+            out.begin_tuple()?;
+            out.bytes(ap.ssid.as_bytes())?;
+            out.bytes(&ap.bssid)?;
+            out.int(ap.channel as i64)?;
+            out.int(ap.signal_strength as i64)?;
+            out.int(auth_code(ap.auth_method) as i64)?;
+            out.bool(false)?;
+            out.end()?;
         }
-        Ok(n)
+        out.end()
     }
 
     /// `wlan.status('rssi')`.
@@ -668,11 +664,17 @@ fn udp_socket(packets: usize, bytes: usize) -> udp::Socket<'static> {
     )
 }
 
-fn write_addresses(out: &mut [u8], addresses: [Ipv4Address; 4]) -> usize {
-    for (i, a) in addresses.iter().enumerate() {
-        out[4 * i..4 * i + 4].copy_from_slice(&a.octets());
+/// `ifconfig()`'s tuple: four dotted addresses.
+pub fn write_addresses(out: &mut Returns<'_>, addresses: [Ipv4Address; 4]) -> Result<(), Error> {
+    use core::fmt::Write;
+    out.begin_tuple()?;
+    for a in addresses {
+        let mut text = crate::stack_text::<15>();
+        let [b0, b1, b2, b3] = a.octets();
+        let _ = write!(text, "{}.{}.{}.{}", b0, b1, b2, b3);
+        out.str(text.as_str())?;
     }
-    16
+    out.end()
 }
 
 /// MicroPython's default access point name: `ESP_` and the end of its MAC.

@@ -5,6 +5,7 @@
 #![cfg_attr(not(feature = "iram"), forbid(unsafe_code))]
 
 pub mod ast_parser;
+pub mod calendar;
 pub mod flatfs;
 pub mod heap;
 pub mod interpreter;
