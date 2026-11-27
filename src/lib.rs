@@ -9,6 +9,7 @@ pub mod flatfs;
 pub mod heap;
 pub mod interpreter;
 pub mod lexer;
+pub mod returns;
 
 pub use flatfs::FileSystem;
 
@@ -39,6 +40,7 @@ pub(crate) fn float_from_bits(bits: u64) -> Float {
 pub use ast_parser::StmtCache;
 pub use interpreter::Interpreter;
 pub use interpreter::Value;
+pub use returns::{Ret, Returns};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {
@@ -193,6 +195,9 @@ pub struct HwFn {
     pub doc: &'static str,
     /// The function returns `bytes` (see `HardwareBridge::call_bytes`).
     pub returns_bytes: bool,
+    /// The function returns any values: floats, strings, tuples, lists,
+    /// dicts (see `HardwareBridge::call_values`).
+    pub returns_values: bool,
 }
 
 impl HwFn {
@@ -218,6 +223,7 @@ impl HwFn {
             params,
             doc,
             returns_bytes: false,
+            returns_values: false,
         }
     }
 
@@ -225,6 +231,13 @@ impl HwFn {
     /// the interpreter calls `call_bytes` / `call_module_bytes` for it.
     pub const fn returning_bytes(mut self) -> Self {
         self.returns_bytes = true;
+        self
+    }
+
+    /// Marks a function that returns any values (floats, strings, tuples,
+    /// lists, dicts): the interpreter calls `call_values` for it.
+    pub const fn returning_values(mut self) -> Self {
+        self.returns_values = true;
         self
     }
 }
@@ -359,6 +372,30 @@ pub trait HardwareBridge {
         _args: &[Arg<'_>],
         _out: &mut [u8],
     ) -> Result<usize, Error> {
+        Err(Error::UnknownIdentifier)
+    }
+
+    /// Calls a function marked with `HwFn::returning_values` (`module` is
+    /// `None` for a plain function): record what it returns in `out`, any
+    /// values, nested (see `returns`). Nothing recorded gives `None`, several
+    /// values at the top level a tuple of them.
+    ///
+    /// ```ignore
+    /// "read" => {                     // bme.read() -> (21.37, 1013.2, 45.8)
+    ///     out.begin_tuple()?;
+    ///     out.float(t)?;
+    ///     out.float(p)?;
+    ///     out.float(h)?;
+    ///     out.end()
+    /// }
+    /// ```
+    fn call_values(
+        &mut self,
+        _module: Option<&str>,
+        _name: &str,
+        _args: &[Arg<'_>],
+        _out: &mut Returns<'_>,
+    ) -> Result<(), Error> {
         Err(Error::UnknownIdentifier)
     }
 }

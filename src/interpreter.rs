@@ -3099,7 +3099,7 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
 
         // Check the name and argument count against the bridge's function table
         let table = hw.functions();
-        let mut returns_bytes = false;
+        let (mut returns_bytes, mut returns_values) = (false, false);
         if !table.is_empty() {
             let spec = table
                 .iter()
@@ -3108,7 +3108,10 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
             if args.len() < spec.min_args as usize || args.len() > spec.max_args as usize {
                 return Err(Error::TypeError);
             }
-            returns_bytes = spec.returns_bytes;
+            (returns_bytes, returns_values) = (spec.returns_bytes, spec.returns_values);
+        }
+        if returns_values {
+            return self.call_bridge_values(None, name, args);
         }
         self.call_bridge(None, name, args, returns_bytes)
     }
@@ -3180,6 +3183,9 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
             if args.len() < spec.min_args as usize || args.len() > spec.max_args as usize {
                 return Err(Error::TypeError);
             }
+            if spec.returns_values {
+                return self.call_bridge_values(None, spec.name, args);
+            }
             return self.call_bridge(None, spec.name, args, spec.returns_bytes);
         }
         let m = self.module(module).ok_or(Error::UnknownIdentifier)?;
@@ -3190,7 +3196,190 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
         if (module as usize) < CORE_MODULES.len() {
             return self.core_module_call(module_name, spec.name, args);
         }
+        if spec.returns_values {
+            return self.call_bridge_values(Some(module_name), spec.name, args);
+        }
         self.call_bridge(Some(module_name), spec.name, args, spec.returns_bytes)
+    }
+
+    /// Calls a `returning_values` function of the bridge: it records its
+    /// values in a scratch area at the top of the heap (above every object
+    /// the arguments point to, so nothing moves while it runs), then the
+    /// records become Python objects (see `returns`).
+    #[inline(never)]
+    fn call_bridge_values(
+        &mut self,
+        module: Option<&str>,
+        name: &str,
+        args: &[Value<'a>],
+    ) -> Result<Value<'a>, Error> {
+        // The heap's free memory, up to 64 KB, not zeroed (it's written first)
+        if self.heap.capacity() - self.heap.used() < 256 {
+            self.collect();
+        }
+        let size = (self.heap.capacity() - self.heap.used()).min(64 * 1024);
+        let scratch = self
+            .heap
+            .alloc_unzeroed(Kind::Bytes, size)
+            .ok_or(Error::OutOfMemory)?;
+        let base = self.sp;
+        let result = (|| {
+            let (view, buf) = self.heap.view_and_dst(scratch);
+            let hw_args = bridge_args(&view, args)?;
+            let mut out = crate::returns::Returns::new(buf);
+            let hw = self.hw.as_mut().ok_or(Error::UnknownIdentifier)?;
+            hw.call_values(module, name, &hw_args[..args.len()], &mut out)?;
+            if out.depth() != 0 {
+                return Err(Error::ValueError); // a tuple, list or dict not ended
+            }
+            let len = out.len();
+            // Only the records are kept (the scratch area is the newest object)
+            self.heap.realloc(scratch, len);
+            self.push(Value::HBytes(scratch))?; // rooted while the objects are made
+            self.build_returns(scratch, len, base + 1)
+        })();
+        self.sp = base;
+        result
+    }
+
+    /// The Python value of the records in `scratch[..len]` (see `returns`):
+    /// values go on the value stack above `floor` and become containers at
+    /// their `end`; a list or dict sits on the stack from its start, and its
+    /// items are moved into it in chunks (a long list doesn't fill the stack).
+    #[inline(never)]
+    fn build_returns(
+        &mut self,
+        scratch: ObjRef,
+        len: usize,
+        floor: usize,
+    ) -> Result<Value<'a>, Error> {
+        use crate::returns::*;
+        // (tag, where its items start on the stack) of the open containers
+        let mut frames = [(0u8, 0usize); MAX_RETURN_DEPTH];
+        let mut depth = 0;
+        let mut at = 0;
+        let read = |vm: &Self, at: usize, n: usize| -> [u8; 8] {
+            let mut b = [0u8; 8];
+            b[..n].copy_from_slice(&vm.heap.bytes(scratch)[at..at + n]);
+            b
+        };
+        while at < len {
+            let tag = self.heap.bytes(scratch)[at];
+            at += 1;
+            let value = match tag {
+                TAG_NONE => Value::None,
+                TAG_FALSE => Value::Bool(false),
+                TAG_TRUE => Value::Bool(true),
+                TAG_INT => {
+                    let v = i64::from_le_bytes(read(self, at, 8));
+                    at += 8;
+                    Value::Int(v)
+                }
+                TAG_FLOAT => {
+                    let v = f64::from_le_bytes(read(self, at, 8));
+                    at += 8;
+                    #[cfg(feature = "float")]
+                    {
+                        Value::Float(v as crate::Float)
+                    }
+                    #[cfg(not(feature = "float"))]
+                    {
+                        let _ = v;
+                        return Err(Error::NotEnabled);
+                    }
+                }
+                TAG_STR | TAG_BYTES => {
+                    let n = u32::from_le_bytes(read(self, at, 4)[..4].try_into().unwrap()) as usize;
+                    at += 4;
+                    let kind = if tag == TAG_STR {
+                        Kind::Str
+                    } else {
+                        Kind::Bytes
+                    };
+                    let r = self.alloc_obj(kind, n)?;
+                    self.heap.copy_obj(scratch, at, r, 0, n);
+                    at += n;
+                    if tag == TAG_STR {
+                        Value::HStr(r)
+                    } else {
+                        Value::HBytes(r)
+                    }
+                }
+                TAG_TUPLE | TAG_LIST | TAG_DICT => {
+                    if tag != TAG_TUPLE {
+                        let kind = if tag == TAG_LIST {
+                            Kind::List
+                        } else {
+                            Kind::Dict
+                        };
+                        let r = self.new_container(kind, 0)?;
+                        self.push(Value::Obj(r))?;
+                    }
+                    frames[depth] = (tag, self.sp);
+                    depth += 1;
+                    continue;
+                }
+                TAG_END => {
+                    depth -= 1;
+                    let (kind, start) = frames[depth];
+                    match kind {
+                        TAG_TUPLE => {
+                            self.build(Kind::Tuple, self.sp - start)?;
+                        }
+                        TAG_LIST => {
+                            self.flush_into(start)?;
+                        }
+                        _ => {
+                            if self.sp != start {
+                                return Err(Error::ValueError); // a key without a value
+                            }
+                        }
+                    }
+                    // The container (now on the stack) is an item of its parent
+                    self.sp -= 1;
+                    self.stack[self.sp]
+                }
+                _ => return Err(Error::ValueError),
+            };
+            self.push(value)?;
+            // A list's items move into it in chunks; a dict's pairs at once
+            if depth > 0 {
+                let (kind, start) = frames[depth - 1];
+                if kind == TAG_LIST && self.sp - start >= 32 {
+                    self.flush_into(start)?;
+                } else if kind == TAG_DICT && self.sp - start == 2 {
+                    let Value::Obj(d) = self.stack[start - 1] else {
+                        unreachable!("a dict below its items");
+                    };
+                    let (k, v) = (self.stack[start], self.stack[start + 1]);
+                    self.dict_set(d, k, v)?;
+                    self.sp = start;
+                }
+            }
+        }
+        Ok(match self.sp - floor {
+            0 => Value::None,
+            1 => self.stack[floor],
+            n => {
+                // Several values: a tuple of them
+                self.build(Kind::Tuple, n)?;
+                self.stack[self.sp - 1]
+            }
+        })
+    }
+
+    /// Appends the values on the stack from `start` to the list just below
+    /// them, and pops them.
+    fn flush_into(&mut self, start: usize) -> Result<(), Error> {
+        let Value::Obj(list) = self.stack[start - 1] else {
+            unreachable!("a list below its items");
+        };
+        for i in start..self.sp {
+            let v = self.stack[i];
+            self.list_append(list, v)?;
+        }
+        self.sp = start;
+        Ok(())
     }
 
     /// Calls a function of the `HardwareBridge` (of a native module, or a

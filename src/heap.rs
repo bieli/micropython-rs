@@ -220,8 +220,21 @@ impl<'a> Heap<'a> {
         self.mem.len() - self.top >= len && self.live < self.table_len()
     }
 
+    /// Like `alloc`, without zeroing the bytes (they keep what was there):
+    /// a scratch area, written before it's read.
+    pub fn alloc_unzeroed(&mut self, kind: Kind, len: usize) -> Option<ObjRef> {
+        self.alloc_raw(kind, len)
+    }
+
     /// Allocates `len` zeroed bytes without collecting; `None` if it doesn't fit.
     pub fn alloc(&mut self, kind: Kind, len: usize) -> Option<ObjRef> {
+        let top = self.top;
+        let r = self.alloc_raw(kind, len)?;
+        self.mem[top..top + len].fill(0);
+        Some(r)
+    }
+
+    fn alloc_raw(&mut self, kind: Kind, len: usize) -> Option<ObjRef> {
         if self.mem.len() - self.top < len || self.live >= self.table_len() {
             return None;
         }
@@ -241,7 +254,6 @@ impl<'a> Heap<'a> {
         self.live += 1;
         self.free_hint = index + 1;
         self.high = self.high.max(index + 1);
-        self.mem[self.top..self.top + len].fill(0);
         self.top += len;
         Some(ObjRef(index as u16))
     }

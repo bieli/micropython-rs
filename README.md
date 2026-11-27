@@ -762,6 +762,47 @@ impl HardwareBridge for MyBus {
 }
 ```
 
+### Rich return values (floats, strings, tuples, lists, dicts)
+
+`call` and `call_module` return an `i64`, `call_bytes` a `bytes`. A function marked `HwFn::returning_values()` can
+return anything instead: the interpreter calls `HardwareBridge::call_values` with a `Returns` to fill, and builds the
+Python objects from it. Nothing recorded is `None`; several values at the top level are a tuple.
+
+```rust
+const SENSOR: Module = Module {
+    name: "sensor",
+    doc: "A BME280-style sensor",
+    functions: &[HwFn::new("read", "", "(°C, hPa, %)").returning_values()],
+    constants: &[],
+};
+
+impl HardwareBridge for MyBoard {
+    fn call_values(&mut self, module: Option<&str>, name: &str, args: &[Arg<'_>],
+                   out: &mut Returns<'_>) -> Result<(), Error> {
+        match (module, name) {
+            (Some("sensor"), "read") => {
+                let (t, p, h) = self.bme.read();   // -> sensor.read() == (21.37, 1013.2, 45.8)
+                out.begin_tuple()?;
+                out.float(t)?;
+                out.float(p)?;
+                out.float(h)?;
+                out.end()
+            }
+            _ => Err(Error::UnknownIdentifier),
+        }
+    }
+    // ...
+}
+```
+
+`Returns` has `none`, `bool`, `int`, `float` (in the build's precision), `str`, `bytes` (or `value(Ret::...)`), and
+`begin_tuple` / `begin_list` / `begin_dict` ... `end` (keys and values alternate in a dict), nesting up to 8 deep.
+It records the values in a scratch area at the top of the heap, above every object the arguments point to: string
+arguments stay valid while the function runs, and nothing is allocated meanwhile. The interpreter then builds the
+objects (long lists in chunks: a list of 300 tuples works with the 128-value stack). If the values don't fit the
+heap's free memory (64 KB at most), the script gets a `MemoryError` it can catch; an unended container is a
+`ValueError`, a list as a dict key a `TypeError`. `tests/returns.rs` shows all of it.
+
 ### Native modules (`import`)
 
 A bridge can also offer **modules**: groups of functions and constants written in Rust that scripts load with `import`,
