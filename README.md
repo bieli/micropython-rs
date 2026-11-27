@@ -801,7 +801,69 @@ It records the values in a scratch area at the top of the heap, above every obje
 arguments stay valid while the function runs, and nothing is allocated meanwhile. The interpreter then builds the
 objects (long lists in chunks: a list of 300 tuples works with the 128-value stack). If the values don't fit the
 heap's free memory (64 KB at most), the script gets a `MemoryError` it can catch; an unended container is a
-`ValueError`, a list as a dict key a `TypeError`. `tests/returns.rs` shows all of it.
+`ValueError`, a list as a dict key a `TypeError`. `tests/returns.rs` shows all of it, and the next section is a
+complete sensor module built on it.
+
+### A sensor module in Rust (BME280 example)
+
+[`examples/bme280.rs`](examples/bme280.rs) is a complete native module: a driver for Bosch's BME280 (temperature,
+pressure and humidity over I2C) that scripts use with `import bme280`. It uses every kind of rich return value. On a
+PC a simulated chip answers, loaded with the calibration and readings of the datasheet's worked example:
+
+```
+$ cargo run --example bme280
+BME280 at 0x76 found at [118]
+25.08 C  1006.53 hPa  43.9 %RH
+dew point 11.9 C
+['humidity', 'pressure', 'temperature'] True
+raw (519888, 415148, 28000) T1 27504
+no sensor at 0x77
+```
+
+```python
+import bme280
+t, p, h = bme280.read()     # (25.08, 1006.5325390625, 43.8564453125): °C, hPa, %RH as floats (a tuple)
+bme280.read_dict()          # {'temperature': 25.08, 'pressure': 1006.5325390625, 'humidity': 43.8564453125}
+bme280.info()               # {'chip': 'BME280', 'id': 96, 'address': 118, 'calibration': {'T1': 27504, ...}}
+bme280.scan()               # [118]: the addresses (0x76, 0x77) where a BME280 answers (a list)
+bme280.raw()                # (519888, 415148, 28000): the ADC values
+bme280.init(0x77)           # the sensor at another address; OSError if nothing answers there
+```
+
+The file has four parts, in the order to copy them:
+
+1. **The driver** (`Bme280`), written against a two-method `I2c` trait (`write_read`, `write`). It checks the chip ID,
+   reads the calibration (including the two 12-bit humidity values that share register 0xE5), and measures in forced
+   mode. It uses the datasheet's integer formulas, so it's exact without an FPU and in a `float32` build.
+2. **The module table** (`BME280_MODULE`). Functions that return values are marked `.returning_values()`. `init`
+   returns nothing, so it stays on `call_module`.
+3. **The bridge** (`Board`). `call_values` turns a reading into Python values: `out.begin_tuple()`,
+   `out.float(...)` three times, then `out.end()`. `info()` shows a dict inside a dict, and `scan()` a list. A missing
+   sensor is `Error::IoError` (an `OSError` in the script) and a bad address is `Error::ValueError`.
+4. **The simulated chip** (`SimulatedBme280`): a register file that answers at one address, for tests and the PC.
+
+The driver math stays in Rust, and the script works with ready values; the dew point above is computed in Python from
+them. `tests/bme280_example.rs` runs the example's script. It checks the driver against the datasheet's worked example
+(25.08 °C, 100653.27 Pa), and against the datasheet's separate floating-point formulas over a range of readings
+(−30…+60 °C, 300…1100 hPa, 0…100 %RH).
+
+On a board, implement `I2c` with the HAL's bus (esp-hal's blocking `I2c`, as the firmware's `i2c_*` functions use),
+add `BME280_MODULE` to the bridge's `modules()`, and handle `("bme280", ...)` in `call_module` / `call_values`:
+
+```rust
+use esp_hal::{i2c::master::I2c as HalI2c, Blocking};
+
+struct Bus<'d>(HalI2c<'d, Blocking>);
+
+impl I2c for Bus<'_> {
+    fn write_read(&mut self, addr: u8, out: &[u8], into: &mut [u8]) -> Result<(), Nack> {
+        self.0.write_read(addr, out, into).map_err(|_| Nack)
+    }
+    fn write(&mut self, addr: u8, data: &[u8]) -> Result<(), Nack> {
+        self.0.write(addr, data).map_err(|_| Nack)
+    }
+}
+```
 
 ### Native modules (`import`)
 

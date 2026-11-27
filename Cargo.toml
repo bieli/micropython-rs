@@ -49,3 +49,8 @@ stdlib = []
 # `.rwtext` section: on the ESP32 that's internal RAM (IRAM), which runs it
 # without flash cache misses. Only for targets whose linker script has it.
 iram = []
+
+# A native sensor module (README, "A sensor module in Rust")
+[[example]]
+name = "bme280"
+required-features = ["float", "format", "stdlib"]
