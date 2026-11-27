@@ -47,6 +47,11 @@ PARTITIONS   := partitions.csv
 ERASE_FILES  ?=
 ERASE_FLAG   := $(if $(ERASE_FILES),--erase-parts vfs,)
 
+# The git commit the firmware is built from (`e3f938c`, `-dirty` with
+# uncommitted changes to tracked files), taken on the host (the container may
+# have no git): lscpu(), the banner and `tools/mpy.py` show it
+GIT_COMMIT   := $(shell git -C .. describe --always --dirty --abbrev=7 --exclude='*' 2>/dev/null)
+
 # Mount the parent directory so Cargo inside Docker can resolve `micropython-rs = { path = ".." }`
 WORKSPACE_ROOT := $(abspath ..)
 
@@ -76,6 +81,7 @@ build:
 		-v "$(CARGO_CACHE)":/home/esp/.cargo/registry \
 		-e MPY_SCRIPT="$(SCRIPT)" \
 		-e MPY_CPU_MHZ="$(CPU_MHZ)" \
+		-e MPY_GIT_COMMIT="$(GIT_COMMIT)" \
 		$(if $(findstring psram,$(FEATURES)),-e ESP_HAL_CONFIG_PSRAM_MODE="$(PSRAM_MODE)") \
 		-w /workspace/$(BIN_NAME) \
 		$(DOCKER_IMAGE) \

@@ -1133,6 +1133,22 @@ mpremote connect /dev/ttyACM0 exec "print(ticks_ms())"
 mpremote connect /dev/ttyACM0 repl
 ```
 
+**Is the board's firmware up to date?** The firmware records the git commit it's built from (`make` takes it
+from git; `-dirty` when tracked files had uncommitted changes). The banner shows it
+(`micropython-rs 0.1.0 (e3f938c) REPL on ESP32`), as do `machine.lscpu()['Commit']` and the raw REPL's `#@version`.
+Before every command `tools/mpy.py` compares it with the checkout. When the firmware is older (or so old that it
+doesn't report a version), it warns and prints the `make flash` command for the board's chip, level and features:
+
+```
+mpy.py: warning: the board's firmware is from commit 1988909, 1 commit(s) older than this
+checkout (e3f938c), with changes to the firmware since (e.g. micropython-esp32/src/wifi.rs).
+  Flash the current firmware, from micropython-esp32/:
+    make flash FEATURES=tft,wifi
+```
+
+Commits that only change docs, tests, examples, `tools/` or `scripts/` don't count. The command runs anyway, and
+`--no-check` skips the comparison.
+
 **Edit-and-run workflow (`watch`).** Open the file in any editor (VS Code, Thonny as an editor, nano, ...) and run
 `tools/mpy.py watch myapp.py` in a terminal. Every time the file is saved:
 
@@ -1543,7 +1559,7 @@ ignored). The ESP32 has no battery for it: after a reset or power-up it starts a
 NTP (`ntptime.settime()`) or keep another clock (a DS3231 module on I²C). It drifts a few seconds a day.
 
 `machine.lscpu()` describes the board like Linux's `lscpu`: a dict with `Architecture`, `CPU(s)`, `Model name`,
-`Revision`, `CPU MHz`, `Flags`, `Flash size`, `PSRAM size`, `Stack size`, the Python and Wi-Fi heaps, `MAC address`, `Board`, `Build`,
+`Revision`, `CPU MHz`, `Flags`, `Flash size`, `PSRAM size`, `Stack size`, the Python and Wi-Fi heaps, `MAC address`, `Board`, `Firmware`, `Commit`, `Build`,
 `Reset cause` and more (sizes in bytes); `machine.lscpu(True)` prints it as a table instead (sizes in KiB/MiB). It's
 not in MicroPython. The firmware's `cpu_info()` gives the dict itself (built in Rust; `lscpu` adds the Python heap). On the three boards it was tried on
 (each matched what `espflash board-info` reads from the chip):
@@ -2035,7 +2051,7 @@ I2C devices: 0
 Blinking onboard LED 3 times...
 LED dimmed to 10% with PWM
 
-micropython-rs REPL on ESP32
+micropython-rs 0.1.0 (e3f938c) REPL on ESP32
 help() lists functions. Ctrl-C stops a script, Ctrl-D soft resets, Ctrl-E pastes.
 >>>
 ```
@@ -2060,7 +2076,7 @@ buttons (1 = up): 1 1
 battery ADC raw: 1565
 TFT console active!
 
-micropython-rs REPL on ESP32
+micropython-rs 0.1.0 (e3f938c) REPL on ESP32
 help() lists functions. Ctrl-C stops a script, Ctrl-D soft resets, Ctrl-E pastes.
 >>>
 ```

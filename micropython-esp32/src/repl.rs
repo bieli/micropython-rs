@@ -437,7 +437,11 @@ impl<'a, O: Output, H: HardwareBridge> Repl<'_, 'a, O, H> {
     }
 
     fn banner(&mut self) {
-        self.write("\nmicropython-rs REPL on ");
+        self.write("\nmicropython-rs ");
+        self.write(crate::VERSION);
+        self.write(" (");
+        self.write(crate::COMMIT);
+        self.write(") REPL on ");
         self.write(crate::chip::NAME);
         self.write(
             "\nhelp() lists functions. Ctrl-C stops a script, Ctrl-D soft resets, Ctrl-E pastes.\n",
@@ -737,6 +741,14 @@ impl<'a, O: Output, H: HardwareBridge> Repl<'_, 'a, O, H> {
         files: Option<&mut Files>,
         upload: &mut Option<Writer>,
     ) -> Result<(), RawError> {
+        // tools/mpy.py: which firmware this is (also without a file system)
+        if self.arena.pending().starts_with(b"#@version") {
+            let mut out = Fmt(self.vm.output());
+            let _ = write!(out, "version={} commit={} ", crate::VERSION, crate::COMMIT);
+            let _ = crate::build_options(&mut out);
+            let _ = write!(out, "\r\n");
+            return Ok(());
+        }
         let fs = files.ok_or(RawError::Fs(FsError::NoRegion))?;
         let pending = self.arena.pending();
         let (line, rest) = match pending.iter().position(|&b| b == b'\n') {

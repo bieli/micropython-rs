@@ -19,6 +19,49 @@ pub mod wifi;
 /// (checked by the interpreter between statements and inside `sleep_ms`).
 pub static ABORT: AtomicBool = AtomicBool::new(false);
 
+/// The firmware version and the git commit it's built from (`e3f938c`,
+/// `e3f938c-dirty`; `unknown` outside a checkout).
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+pub const COMMIT: &str = env!("MPY_GIT_COMMIT");
+
+/// How the firmware was built, as `make` options: `chip=esp32 level=full
+/// features=tft,wifi float=64 mhz=80` (`#@version`, `tools/mpy.py`).
+pub fn build_options(out: &mut impl core::fmt::Write) -> core::fmt::Result {
+    let chip = if cfg!(feature = "esp32s3") {
+        "esp32s3"
+    } else if cfg!(feature = "esp32c3") {
+        "esp32c3"
+    } else {
+        "esp32"
+    };
+    let level = if cfg!(feature = "minimal") {
+        "minimal"
+    } else if cfg!(feature = "medium") {
+        "medium"
+    } else {
+        "full"
+    };
+    write!(out, "chip={} level={} features=", chip, level)?;
+    let mut first = true;
+    for (on, name) in [
+        (cfg!(feature = "tft"), "tft"),
+        (cfg!(feature = "wifi"), "wifi"),
+        (cfg!(feature = "psram"), "psram"),
+    ] {
+        if on {
+            write!(out, "{}{}", if first { "" } else { "," }, name)?;
+            first = false;
+        }
+    }
+    let float = if cfg!(feature = "float32") { 32 } else { 64 };
+    write!(
+        out,
+        " float={} mhz={}",
+        float,
+        crate::board::CPU_CLOCK as u32
+    )
+}
+
 /// A small text buffer on the stack, for `write!` (addresses, versions).
 pub struct StackText<const N: usize> {
     buf: [u8; N],

@@ -1424,7 +1424,8 @@ fn cpu_info(out: &mut Returns<'_>) -> Result<(), Error> {
     }
     text(out, "MAC address", mac_text.as_str())?;
     text(out, "Board", chip::BOARD)?;
-    text(out, "Firmware", env!("CARGO_PKG_VERSION"))?;
+    text(out, "Firmware", crate::VERSION)?;
+    text(out, "Commit", crate::COMMIT)?;
     text(out, "Build", build.as_str())?;
     out.str("Uptime (ms)")?;
     out.int(now_ms() as i64)?;

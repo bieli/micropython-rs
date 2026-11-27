@@ -19,6 +19,11 @@ firmware doesn't need reflashing to try or replace a script.
     tools/mpy.py watch scripts/voltmeter.py --save  # ... and store each version as main.py
 
 Options: --port /dev/ttyUSB0 (default: /dev/ttyACM0 or $MPY_PORT), --baud 115200.
+
+Before each command it asks the board which commit its firmware is built from
+(`#@version`) and warns when that's older than this checkout (changes that
+don't reach the firmware, like docs and tests, don't count), with the
+`make flash` command that brings it up to date; --no-check skips that.
 Needs pyserial (`pip install pyserial`). Exit code 1 if the script raised an error.
 """
 
@@ -26,6 +31,7 @@ import argparse
 import codecs
 import re
 import os
+import subprocess
 import sys
 import time
 
@@ -41,6 +47,94 @@ PUT_CHUNK = 2048
 
 class FileCommandError(Exception):
     pass
+
+
+# ---- is the board's firmware up to date? ------------------------------------
+
+REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# Changes here don't reach the firmware: a commit that touched only these
+# doesn't make the board's firmware out of date
+NOT_FIRMWARE = ("tests/", "examples/", "fuzz/", ".github/", "docs/",
+                "micropython-esp32/tools/", "micropython-esp32/scripts/")
+
+
+def git(*args):
+    """git's output in this checkout ("" for success without output), or
+    None when git fails or isn't there."""
+    try:
+        out = subprocess.run(["git", "-C", REPO, *args], capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return out.stdout.strip() if out.returncode == 0 else None
+
+
+def board_version(board):
+    """{'version', 'commit', 'chip', 'level', 'features', 'float', 'mhz'}
+    from the firmware, or None when it doesn't answer `#@version` (older
+    firmware runs it as a Python comment, or rejects it)."""
+    output, error = board.execute("#@version", stream=False)
+    text = output.decode("utf-8", "replace")
+    if error or "commit=" not in text:
+        return None
+    return dict(item.split("=", 1) for item in text.split() if "=" in item)
+
+
+def flash_command(info):
+    """The `make flash` that builds firmware like the board's (from
+    micropython-esp32/)."""
+    if info is None:
+        return "make flash [CHIP=esp32s3|esp32c3] [FEATURES=tft,wifi]  (the options it was built with)"
+    parts = ["make flash"]
+    if info.get("chip", "esp32") != "esp32":
+        parts.append("CHIP=" + info["chip"])
+    if info.get("level", "full") != "full":
+        parts.append("LEVEL=" + info["level"])
+    if info.get("features"):
+        parts.append("FEATURES=" + info["features"])
+    if info.get("float") == "32":
+        parts.append("FLOAT=32")
+    if info.get("mhz", "80") != "80":
+        parts.append("CPU_MHZ=" + info["mhz"])
+    return " ".join(parts)
+
+
+def firmware_warning(info):
+    """Why the board's firmware may not match this checkout, or None."""
+    if info is None:
+        return ("the board's firmware is older than this checkout: it doesn't report its version, so it\n"
+                "predates that and may lack what scripts here use (errors like `UnexpectedToken` or\n"
+                "`ImportError` can come from that)")
+    commit = info.get("commit", "unknown")
+    base = commit[: -len("-dirty")] if commit.endswith("-dirty") else commit
+    if commit == "unknown" or git("rev-parse", "--short=7", "HEAD") is None:
+        return None  # built outside a checkout, or no git here: nothing to compare
+    if git("cat-file", "-e", base + "^{commit}") is None:
+        return f"the board's firmware is from commit {commit}, which isn't in this checkout"
+    if git("merge-base", "--is-ancestor", base, "HEAD") is None:
+        return f"the board's firmware is from commit {commit}, which isn't part of this checkout's history (another branch?)"
+    changed = (git("diff", "--name-only", base, "HEAD") or "").splitlines()
+    relevant = [f for f in changed if not f.endswith(".md") and not f.startswith(NOT_FIRMWARE)]
+    if not relevant:
+        return None
+    count = git("rev-list", "--count", base + "..HEAD") or "some"
+    head = git("rev-parse", "--short=7", "HEAD")
+    return (f"the board's firmware is from commit {commit}, {count} commit(s) older than this\n"
+            f"checkout ({head}), with changes to the firmware since (e.g. {relevant[0]})")
+
+
+def check_firmware(board):
+    """Warns (on stderr) when the board's firmware is out of date; never fails."""
+    try:
+        info = board_version(board)
+        warning = firmware_warning(info)
+    except Exception:  # an odd answer must not stop the command itself
+        return
+    if warning:
+        sys.stderr.write(f"mpy.py: warning: {warning}.\n"
+                         f"  Flash the current firmware, from micropython-esp32/:\n"
+                         f"    {flash_command(info)}\n"
+                         f"  (--no-check hides this)\n")
+        sys.stderr.flush()
 
 
 class Board:
@@ -282,6 +376,7 @@ def main():
     parser.add_argument("arg", nargs="?", help="file (run/save/watch/put/get/rm) or code (exec)")
     parser.add_argument("arg2", nargs="?", help="put/get: name on the other side")
     parser.add_argument("--save", action="store_true", help="watch: also store each version as main.py")
+    parser.add_argument("--no-check", action="store_true", help="don't compare the board's firmware with this checkout")
     args = parser.parse_args()
 
     if args.command in ("run", "save", "exec", "watch", "put", "get", "rm") and not args.arg:
@@ -301,6 +396,8 @@ def main():
             "    make flash FEATURES=tft      # TTGO T-Display (plain ESP32 boards: make flash)\n"
             "If more than one board is connected, pick the right one with --port."
         )
+    if not args.no_check:
+        check_firmware(board)
     if args.command == "watch":
         watcher = Watcher(board, args.arg, args.save)
         try:
