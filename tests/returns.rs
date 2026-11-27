@@ -150,11 +150,15 @@ impl Output for Text {
 }
 
 fn run_heap(script: &str, heap_size: usize) -> Result<String, String> {
+    // An object table for big results (300 tuples with a string each)
+    run_table(script, heap_size, 2048)
+}
+
+fn run_table(script: &str, heap_size: usize, objects: usize) -> Result<String, String> {
     let mut out = Text(String::new());
     let mut bridge = Bridge;
     let mut heap = vec![0u8; heap_size];
-    // An object table for big results (300 tuples with a string each)
-    let mut table = vec![micropython_rs::heap::HeapEntry::FREE; 2048];
+    let mut table = vec![micropython_rs::heap::HeapEntry::FREE; objects];
     let mut vm = Interpreter::with_hardware(&mut out, &mut bridge)
         .with_heap(&mut heap)
         .with_heap_table(&mut table);
@@ -259,4 +263,24 @@ fn collections_while_building() {
     )
     .unwrap();
     assert_eq!(out, "40 (39, 'ssid', 19.5) 20\n");
+}
+
+#[test]
+fn full_object_table_or_little_free_memory_collects_first() {
+    // Found on an ESP32-C3 (a small object table): a loop of calls fills the
+    // table with garbage tuples; each call must collect, not fail
+    let out = run_table(
+        "for i in range(300):\n    r = several()\nprint(r)\n",
+        16 * 1024,
+        48,
+    )
+    .unwrap();
+    assert_eq!(out, "(1, 'two')\n");
+    // Garbage leaves only a few hundred bytes free: a 2000-byte result fits
+    let out = run_heap(
+        "junk = 'x' * 7600\njunk = None\nfor i in range(20):\n    s = big(2000)\nprint(len(s))\n",
+        8 * 1024,
+    )
+    .unwrap();
+    assert_eq!(out, "2000\n");
 }

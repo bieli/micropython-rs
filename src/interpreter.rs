@@ -3213,8 +3213,11 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
         name: &str,
         args: &[Value<'a>],
     ) -> Result<Value<'a>, Error> {
-        // The heap's free memory, up to 64 KB, not zeroed (it's written first)
-        if self.heap.capacity() - self.heap.used() < 256 {
+        // The heap's free memory, up to 64 KB, not zeroed (it's written
+        // first). Garbage is collected first unless there's room for the
+        // records (4 KB, or a quarter of a small heap) and a free object
+        // entry: the call can't be repeated once the records don't fit.
+        if !self.heap.fits((self.heap.capacity() / 4).clamp(1, 4096)) {
             self.collect();
         }
         let size = (self.heap.capacity() - self.heap.used()).min(64 * 1024);
