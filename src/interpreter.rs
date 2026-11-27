@@ -2461,9 +2461,41 @@ impl<'a, O: Output, H: HardwareBridge> Interpreter<'a, O, H> {
     #[cfg_attr(feature = "iram", link_section = ".rwtext")]
     #[inline(never)]
     fn call_item(&mut self, item: Item<'a>, argc: u8, names: &[Item<'a>]) -> Result<(), Error> {
+        if !names.is_empty() {
+            return self.call_item_kw(item, argc, names);
+        }
+        // Positional arguments only (most calls): they're in order on the
+        // value stack; a small copy instead of `CallArgs` (768 bytes on a
+        // 32-bit chip, and `call_args`'s frame), which every nested Python
+        // call would otherwise keep on the native stack
+        let start = self.sp - argc as usize;
+        let mut buf = [Value::None; MAX_CALL_ARGS];
+        let n = argc as usize;
+        buf.get_mut(..n)
+            .ok_or(Error::TooManyArguments)?
+            .copy_from_slice(&self.stack[start..start + n]);
+        self.finish_call(item, start, &buf[..n], &[])
+    }
+
+    /// `call_item` with keyword arguments, `*items` or `**options`.
+    #[inline(never)]
+    fn call_item_kw(&mut self, item: Item<'a>, argc: u8, names: &[Item<'a>]) -> Result<(), Error> {
         let start = self.sp - argc as usize;
         let a = self.call_args(start, argc, names)?;
         let (args, kwargs) = (&a.args[..a.npos], &a.kwargs[..a.nkw]);
+        self.finish_call(item, start, args, kwargs)
+    }
+
+    /// Calls what `item` names with `args` (the values from `stack[start..]`)
+    /// and leaves the result on the stack in place of the callee and them.
+    #[inline(always)]
+    fn finish_call(
+        &mut self,
+        item: Item<'a>,
+        start: usize,
+        args: &[Value<'a>],
+        kwargs: Kwargs<'_, 'a>,
+    ) -> Result<(), Error> {
         let (val, below) = match item {
             Item::Call { name, .. } => (self.call_function(name, args, kwargs)?, start),
             Item::CallValue { .. } => {

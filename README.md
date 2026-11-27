@@ -572,8 +572,10 @@ The function table and the statement cache are statics of the firmware (`Interpr
 `with_stmt_cache`), not part of the `Interpreter` struct: the struct is 15 KB on the ESP32 instead of 30, and starting
 the REPL, which builds, moves and keeps it, needs about 40 KB of stack instead of 88 (`repl::run` 16 KB,
 `new_interpreter` 15 KB, `from_parts` 8.6 KB). Measured on the TTGO with Wi-Fi (`FEATURES=tft,wifi`): a top-level
-statement takes 37.8 KB of the 83.5 KB stack (before: 53.6 of 102 KB); 4 nested Python calls fit, about as many as
-before: next to the Wi-Fi driver there's no RAM to spare, only to move, and each call still takes about 7.5 KB.
+statement takes 37.6 KB of the 83.5 KB stack (before: 53.6 of 102 KB). A call with positional arguments only (most
+calls) copies them from the value stack instead of building `CallArgs` (room for 16 positional and 16 keyword
+arguments, 768 bytes) in a frame of its own: a Python call takes 5.5 KB of stack instead of 7.5, and 5 nested calls
+fit next to the Wi-Fi driver (4 before); function calls got faster too (4.4 -> 5.0 thousand a second at 80 MHz).
 Without Wi-Fi the stack is 162 KB. `make report` lists the biggest stack frames of a build.
 
 #### Statement cache
