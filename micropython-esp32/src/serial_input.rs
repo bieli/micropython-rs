@@ -120,20 +120,23 @@ pub fn output_written() {
     OUTPUT_AT_US.store(now_us().max(1), Ordering::Relaxed);
 }
 
-/// The second flush of `output_written`, 1 ms after the last write (the
-/// USB frame time, by when the previous packet has gone).
+/// The second flush of `output_written`, at least 1 ms after the last write
+/// (the USB frame time) and only once the port's previous packet has gone:
+/// while the host hasn't read it yet (`serial_in_ep_data_free` is 0, e.g.
+/// between two `mpremote` commands), a flush would be ignored again, so it
+/// waits for the next call instead of giving up.
 #[cfg(any(feature = "esp32s3", feature = "esp32c3"))]
 fn flush_pending_output() {
     let at = OUTPUT_AT_US.load(Ordering::Relaxed);
-    if at == 0 {
+    if at == 0 || now_us().wrapping_sub(at) < 1000 {
         return;
     }
-    if now_us().wrapping_sub(at) >= 1000 {
-        OUTPUT_AT_US.store(0, Ordering::Relaxed);
-        esp_hal::peripherals::USB_DEVICE::regs()
-            .ep1_conf()
-            .write(|w| w.wr_done().set_bit());
+    let ep1 = esp_hal::peripherals::USB_DEVICE::regs().ep1_conf();
+    if ep1.read().serial_in_ep_data_free().bit_is_clear() {
+        return; // the previous packet is still waiting for the host
     }
+    OUTPUT_AT_US.store(0, Ordering::Relaxed);
+    ep1.write(|w| w.wr_done().set_bit());
 }
 
 /// The next received byte, if any.

@@ -137,6 +137,10 @@ impl Port for EspPort {
 
     fn console_write(s: &str) {
         esp_println::print!("{}", s);
+        // The S3's and C3's USB-Serial/JTAG port can hold a short write back
+        // (the raw REPL's closing `\x04>`, a `#@` command's answer): flush
+        // once more while waiting for input, as for scripts' output
+        crate::serial_input::output_written();
     }
 
     /// The bottom of the main stack plus `STACK_MARGIN`.
