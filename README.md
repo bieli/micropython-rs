@@ -1528,7 +1528,7 @@ What it shows:
   less than the interpreter. `CPU_MHZ=240` (160 on the C3) runs everything 2-3x faster.
 
 Not there yet: level triggers, `Signal`, and the `*_into` methods (`readinto`, `write_readinto`,
-`readfrom_mem_into`), which need `bytearray`. The module takes 53 of the firmware's 96 function slots (128 on the S3), and each
+`readfrom_mem_into`), which need `bytearray`. The module takes 53 of the firmware's 96 function slots (112 on the C3, 128 on the S3), and each
 method call runs Python code: `led.value(1)` takes 1.2 ms
 on the ESP32 at 80 MHz (0.43 ms at 240 MHz), `pin_write(2, 1)` 0.27 ms (0.12 ms). Fine for blinking, sensors and
 buses, too slow for bit-banging.

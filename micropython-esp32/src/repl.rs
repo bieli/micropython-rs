@@ -107,8 +107,17 @@ unsafe fn take_stmt_cache<'a>() -> &'a mut [StmtCache<'a>] {
 /// function, method and lambda alive at once, about 190 bytes each. Outside
 /// the `Interpreter` struct, it no longer comes out of the stack three times
 /// while the REPL starts (the struct is built, moved and kept). `machine`,
-/// `network`, `time` and `ntptime` take 69; the S3 has room for more.
-const FUNC_SLOTS: usize = if cfg!(feature = "esp32s3") { 128 } else { 96 };
+/// `network`, `time` and `ntptime` take 69. The S3 has room for 128 (59 left
+/// for scripts) and still fits 8 nested calls with Wi-Fi, the interpreter's
+/// limit; the C3 112 (43 left; at 128 its Wi-Fi build fit 7 calls, not 8).
+/// The ESP32 keeps 96 (27 left): its stack next to the Wi-Fi driver fits 5.
+const FUNC_SLOTS: usize = if cfg!(feature = "esp32s3") {
+    128
+} else if cfg!(feature = "esp32c3") {
+    112
+} else {
+    96
+};
 
 static mut FUNCS: core::mem::MaybeUninit<[Option<FuncDef<'static>>; FUNC_SLOTS]> =
     core::mem::MaybeUninit::uninit();
