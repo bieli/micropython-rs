@@ -1,0 +1,5 @@
+[build]
+# Cortex-M4F with its single-precision FPU
+target = "thumbv7em-none-eabihf"
+# cortex-m-rt's linker script; build.rs puts memory/memory.x on its search path
+rustflags = ["-C", "link-arg=-Tlink.x"]

@@ -1,0 +1,27 @@
+[package]
+name = "micropython-nrf52"
+version = "0.1.0"
+edition = "2021"
+authors = ["Marcin Bielak <marcin.bieli+github+micropython-rs@gmail.com>"]
+license = "Apache-2.0"
+description = "micropython-rs firmware for nRF52840 boards with the Adafruit UF2 bootloader (nice!nano v2 and its SuperMini clones)"
+
+[dependencies]
+# The core's exceptions and SysTick; one core, so critical sections only
+# mask interrupts
+cortex-m = { version = "0.7.7", features = ["critical-section-single-core"] }
+# The startup code and link.x (memory/memory.x gives the memory map)
+cortex-m-rt = "0.7.5"
+# The chip's registers and its interrupt vector table
+nrf52840-pac = { version = "0.12.2", features = ["rt"] }
+
+[profile.release]
+debug = true
+opt-level = "s"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+
+[profile.dev]
+opt-level = "s"
+panic = "abort"
