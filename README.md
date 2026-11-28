@@ -995,7 +995,9 @@ What works now:
   script or a sleep), 32-bit floats (the FPU's precision; `FLOAT=64` computes in software), a 64 KB heap and about
   115 KB of stack (a stack overflow faults, MSPLIM, instead of overwriting memory; a fault prints what it was).
 * `machine` and `time`: the same functions and frozen modules as the ESP32 boards, so scripts move between them:
-  `Pin` (in, out, pull-up/-down, open drain), `I2C` on any two free pins (I2C1, 10-400 kHz), `RTC`,
+  `Pin` (in, out, pull-up/-down, open drain), `I2C` on any two free pins (10-400 kHz), `ADC` (12 bits, any
+  free pin, 0 V to AVDD; millivolts calibrated against the chip's 1.21 V bandgap), `PWM` (12 pins, up to 4
+  frequencies at once), `RTC`,
   `time.ticks_*`/`sleep*`/`time()`/`gmtime()`/`mktime()`, `unique_id()` (the chip's EUI-64), `reset()`,
   `reset_cause()`, `freq()`, `lscpu()`, `bench()`, `Pin.irq()` (12 lines: pin number `n` uses line `n`, so PA3
   and PC3 can't both have one), `Timer` (ids 0-3 and -1) and `WDT` (up to 262 s; sleeps feed it).
@@ -1015,7 +1017,15 @@ What works now:
 `machine.bench()` at 38 MHz: 27.6 M i32 adds/s, 19 M f32 multiplies/s (hardware FPU), 0.29 M f64 multiplies/s
 (software), 63 MiB/s RAM writes, 6.2 M GPIO toggles/s; Python for loops 5.4 k/s.
 
-Next: ADC, PWM, UART and SPI, the crystal at 78 MHz, and the Sense's motion sensor.
+Not every peripheral reaches every port on this chip: TIMER2/4 and EUSART0 only ports A and B, TIMER3 and I2C1 only
+C and D. The firmware picks what reaches the pins: an I²C bus on two port C/D pins (D0-D7, D18; the default D4/D5) is
+I2C1, any other I2C0 (which runs from PCLK / 2); PWM on port C/D has TIMER1 and TIMER3 (6 pins, 2 frequencies), on
+port A/B (D8-D17) TIMER1, TIMER2 and TIMER4.
+
+The Sense's motion sensor (LSM6DS3TR-C) is on I2C0, SDA PB2 and SCL PB3 (the D13/D14 pads), powered from PD5:
+`Pin(53, Pin.OUT).on()`, then `I2C(0, sda=Pin(18), scl=Pin(19))` answers at 0x6A (WHO_AM_I 0x6A).
+
+Next: UART and SPI, the crystal at 78 MHz, and a native module for the motion sensor.
 Not planned: Bluetooth, Thread and Zigbee (they need Silicon Labs' closed C stacks).
 
 #### ESP32-S3 and ESP32-C3 (`CHIP=esp32s3`, `CHIP=esp32c3`)

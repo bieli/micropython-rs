@@ -149,6 +149,11 @@ pub fn pin_mode(n: i64, mode: i64) -> Result<(), Error> {
     Ok(())
 }
 
+/// A push-pull output at `high` (a PWM, UART or SPI output).
+pub fn set_push_pull(id: PinId, high: bool) {
+    set_mode(id, MODE_PUSHPULL, high);
+}
+
 /// Open drain with the pull-up, high (an I2C line).
 pub fn open_drain_pullup(id: PinId) {
     set_mode(id, MODE_WIREDANDPULLUP, true);

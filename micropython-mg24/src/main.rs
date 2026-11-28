@@ -6,6 +6,7 @@
 #![no_std]
 #![no_main]
 
+mod adc;
 mod bench;
 mod board;
 mod clock;
@@ -13,6 +14,7 @@ mod console;
 mod events;
 mod gpio;
 mod i2c;
+mod pwm;
 mod storage;
 
 use core::cell::RefCell;

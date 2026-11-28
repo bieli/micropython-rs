@@ -2,17 +2,19 @@
 //! arguments and constants as micropython-esp32's (pin_mode, pin_write,
 //! i2c_read, sleep_ms, cpu_info, ...), so the frozen `machine` and `time`
 //! modules from micropython-esp32/modules run unchanged and scripts move
-//! between the boards. ADC, PWM, UART and SPI come later; until then those
-//! `machine` classes raise NameError.
+//! between the boards. UART and SPI come later; until then those `machine`
+//! classes raise NameError.
 
 use core::sync::atomic::Ordering;
 
 use micropython_rs::{Arg, Error, HardwareBridge, HwFn, Module, Returns};
 
+use crate::adc::Adc;
 use crate::clock;
 use crate::events::{self, Events};
 use crate::gpio::{self, PinId};
 use crate::i2c::I2c;
+use crate::pwm::Pwm;
 use efr32mg24_pac as pac;
 
 pub const PWRON_RESET: i64 = 1;
@@ -44,6 +46,34 @@ const FUNCTIONS: &[HwFn] = &[
     HwFn::new("pin_toggle", "pin", "Invert an output pin"),
     HwFn::new("led_on", "", "The orange LED on (PA7)"),
     HwFn::new("led_off", "", "The orange LED off"),
+    HwFn::new(
+        "adc_read",
+        "pin",
+        "Raw 12-bit ADC value, 0-4095 for 0 V to AVDD (any free pin)",
+    ),
+    HwFn::with_args(
+        "adc_mv",
+        1,
+        2,
+        "pin, [samples]",
+        "Calibrated millivolts, averaged (default 16 samples)",
+    ),
+    HwFn::new(
+        "adc_vref",
+        "",
+        "The ADC's reference, AVDD, measured against the 1.21 V bandgap, mV",
+    ),
+    HwFn::new(
+        "pwm",
+        "pin, freq, duty",
+        "PWM output, duty in percent (0-100)",
+    ),
+    HwFn::new(
+        "pwm_u16",
+        "pin, freq, duty",
+        "PWM output, duty 0-65535 (12 pins, 4 frequencies at once)",
+    ),
+    HwFn::new("pwm_stop", "pin", "Stop PWM on a pin"),
     HwFn::with_args(
         "i2c_init",
         2,
@@ -230,6 +260,9 @@ pub struct Board {
     /// Why the chip started (`reset_cause()`): read from EMU at boot.
     reset_cause: i64,
     i2c: Option<I2c>,
+    /// Set up on first use (its start measures AVDD)
+    adc: Option<Adc>,
+    pwm: Pwm,
     events: Events,
     /// A script enabled the watchdog: sleeps feed it (as on the ESP32 boards)
     wdt_on: bool,
@@ -260,6 +293,8 @@ impl Board {
         Self {
             reset_cause,
             i2c: None,
+            adc: None,
+            pwm: Pwm::new(mg24_hal::clock::sysclk_hz()),
             events: Events::new(),
             wdt_on: false,
         }
@@ -291,6 +326,10 @@ impl Board {
                 watchdog::feed();
             }
         }
+    }
+
+    fn adc(&mut self) -> &mut Adc {
+        self.adc.get_or_insert_with(Adc::new)
     }
 
     /// The I2C bus, on the default pins at 100 kHz unless `i2c_init` chose.
@@ -413,6 +452,41 @@ impl HardwareBridge for Board {
             "i2c_write_reg" => {
                 let (addr, reg, value) = (i2c_addr(int(0)?)?, byte(int(1)?)?, byte(int(2)?)?);
                 self.i2c()?.write(addr, &[reg, value])?;
+                Ok(None)
+            }
+            "adc_read" => {
+                let id = pin(int(0)?)?;
+                Ok(Some(self.adc().read(id)? as i64))
+            }
+            "adc_mv" => {
+                let id = pin(int(0)?)?;
+                let samples = match args.get(1) {
+                    Some(n) => u32::try_from(n.int()?)
+                        .ok()
+                        .filter(|n| (1..=1024).contains(n))
+                        .ok_or(Error::ValueError)?,
+                    None => 16,
+                };
+                Ok(Some(self.adc().read_mv(id, samples)? as i64))
+            }
+            "adc_vref" => Ok(Some(self.adc().avdd_mv() as i64)),
+            "pwm" | "pwm_u16" => {
+                let id = pin(int(0)?)?;
+                let freq = u32::try_from(int(1)?).map_err(|_| Error::ValueError)?;
+                let duty = int(2)?;
+                let duty_u16 = if name == "pwm" {
+                    if !(0..=100).contains(&duty) {
+                        return Err(Error::ValueError);
+                    }
+                    duty * 65535 / 100
+                } else {
+                    duty
+                };
+                let duty_u16 = u32::try_from(duty_u16).map_err(|_| Error::ValueError)?;
+                self.pwm.set(id, freq, duty_u16).map(|()| None)
+            }
+            "pwm_stop" => {
+                self.pwm.stop(pin(int(0)?)?);
                 Ok(None)
             }
             "pin_irq" => {

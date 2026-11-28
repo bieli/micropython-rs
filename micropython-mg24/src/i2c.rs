@@ -1,10 +1,13 @@
-//! I2C: I2C1 as the bus controller (leader), on any two free pins (the
-//! routes of Series 2 chips go to any pin), 7-bit addresses, by polling.
+//! I2C: the bus controller (leader) on two free pins, 7-bit addresses, by
+//! polling. The chip routes I2C1 to ports C and D only, I2C0 to any port: a
+//! bus on two pins of ports C/D (D0-D7, D18; the default D4/D5) is I2C1,
+//! any other I2C0.
 //! mg24-hal's driver has fixed pins (PC4/PC5) and a speed divider for 19 MHz
 //! only, so this one follows the reference manual's sequence with the
 //! flags (ACK, NACK, RXDATAV, MSTOP) and timeouts in microseconds.
 //!
-//! I2C1's clock is PCLK (the CPU clock here, below its 50 MHz limit).
+//! The clock (`clock_hz` for `init`): PCLK for I2C1, which is the CPU clock
+//! here (below its 50 MHz limit); see `I2C0_CLOCK_DIV` for I2C0.
 
 use micropython_rs::Error;
 
@@ -14,6 +17,11 @@ use efr32mg24_pac as pac;
 
 /// Longest wait for one bus step (a byte at 10 kHz takes 0.9 ms).
 const STEP_TIMEOUT_US: u64 = 25_000;
+/// I2C0 is in the low-power domain, clocked by PCLK / 2: measured on the
+/// board, with the Sense's IMU: at a divider for PCLK, a 12-byte transfer
+/// took 1550 us longer at 100 kHz than at 400 kHz instead of 750 (the bus
+/// ran at half the speed asked for).
+const I2C0_CLOCK_DIV: u32 = 2;
 
 /// Clears interrupt flags through IF's clear alias (Series 2 registers have
 /// SET/CLR/TGL aliases 0x1000/0x2000/0x3000 above them): writing a 1 clears
@@ -26,7 +34,14 @@ fn clear_flags(mask: u32) {
 
 const ALL_FLAGS: u32 = 0x001F_FFFF;
 
+/// The instance `init` chose: 0 or 1.
+static INSTANCE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(1);
+
 fn i2c() -> &'static pac::i2c1_s::RegisterBlock {
+    if INSTANCE.load(core::sync::atomic::Ordering::Relaxed) == 0 {
+        // SAFETY: I2C0 has I2C1's register layout; only this module uses it
+        return unsafe { &*(pac::I2c0S::ptr() as *const pac::i2c1_s::RegisterBlock) };
+    }
     // SAFETY: I2C1's registers; only this module uses them
     unsafe { &*pac::I2c1S::ptr() }
 }
@@ -43,26 +58,46 @@ impl I2c {
         if sda == scl || !(10_000..=400_000).contains(&hz) {
             return Err(Error::ValueError);
         }
-        // SAFETY: CMU's clock enable, the I2C1 routes and I2C1 itself are
-        // only touched here
+        let n = if sda.port >= 2 && scl.port >= 2 { 1 } else { 0 };
+        let clock_hz = if n == 0 {
+            pclk_hz / I2C0_CLOCK_DIV
+        } else {
+            pclk_hz
+        };
+        // SAFETY: CMU's clock enables, the I2C routes and the I2C
+        // controllers are only touched here
         unsafe {
             let cmu = &*pac::CmuS::ptr();
-            cmu.clken0().modify(|_, w| w.i2c1().set_bit());
+            cmu.clken0()
+                .modify(|_, w| w.i2c0().set_bit().i2c1().set_bit());
             gpio::open_drain_pullup(sda);
             gpio::open_drain_pullup(scl);
             let g = &*pac::GpioS::ptr();
-            g.i2c1_sdaroute()
-                .write(|w| w.port().bits(sda.port).pin().bits(sda.pin));
-            g.i2c1_sclroute()
-                .write(|w| w.port().bits(scl.port).pin().bits(scl.pin));
-            g.i2c1_routeen()
-                .write(|w| w.sdapen().set_bit().sclpen().set_bit());
+            // The other controller off the pins (a bus moved between them)
+            g.i2c0_routeen().write(|w| w.bits(0));
+            g.i2c1_routeen().write(|w| w.bits(0));
+            if n == 0 {
+                g.i2c0_sdaroute()
+                    .write(|w| w.port().bits(sda.port).pin().bits(sda.pin));
+                g.i2c0_sclroute()
+                    .write(|w| w.port().bits(scl.port).pin().bits(scl.pin));
+                g.i2c0_routeen()
+                    .write(|w| w.sdapen().set_bit().sclpen().set_bit());
+            } else {
+                g.i2c1_sdaroute()
+                    .write(|w| w.port().bits(sda.port).pin().bits(sda.pin));
+                g.i2c1_sclroute()
+                    .write(|w| w.port().bits(scl.port).pin().bits(scl.pin));
+                g.i2c1_routeen()
+                    .write(|w| w.sdapen().set_bit().sclpen().set_bit());
+            }
+            INSTANCE.store(n, core::sync::atomic::Ordering::Relaxed);
             let i2c = i2c();
             i2c.en().write(|w| w.en().clear_bit());
             // f_SCL = f_PCLK / ((N_low + N_high) * (DIV + 1) + 8): CLHR 0
             // is 4:4 (standard mode), 1 is 6:3 (fast mode)
             let (clhr, n) = if hz <= 100_000 { (0u8, 8) } else { (1u8, 9) };
-            let div = ((pclk_hz / hz).saturating_sub(8) / n).saturating_sub(1);
+            let div = ((clock_hz / hz).saturating_sub(8) / n).saturating_sub(1);
             i2c.ctrl().write(|w| w.clhr().bits(clhr));
             i2c.clkdiv().write(|w| w.div().bits(div.min(511) as u16));
             i2c.ien().write(|w| w.bits(0));
@@ -122,11 +157,13 @@ impl I2c {
         i2c.cmd()
             .write(|w| w.clearpc().set_bit().cleartx().set_bit());
         clear_flags(ALL_FLAGS);
-        // The address goes into TXDATA first: the controller sends it right
-        // after the START condition
+        // START first, then the address: in the middle of a transfer (a
+        // repeated START, before a register is read) the controller is
+        // still a transmitter, and a byte in TXDATA before the START would
+        // go out as data
+        i2c.cmd().write(|w| w.start().set_bit());
         i2c.txdata()
             .write(|w| unsafe { w.txdata().bits(addr << 1 | read as u8) });
-        i2c.cmd().write(|w| w.start().set_bit());
         self.wait_ack()
     }
 
