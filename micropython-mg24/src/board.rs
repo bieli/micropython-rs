@@ -13,6 +13,7 @@ use crate::clock;
 use crate::events::{self, Events};
 use crate::gpio::{self, PinId};
 use crate::i2c::I2c;
+use crate::imu::Imu;
 use crate::pwm::Pwm;
 use crate::spi::Spi;
 use crate::uart::Uart;
@@ -273,6 +274,8 @@ pub struct Board {
     adc: Option<Adc>,
     pwm: Pwm,
     uart: Option<Uart>,
+    /// The Sense's motion sensor, set up on first use (`imu` module)
+    imu: Option<Imu>,
     spi: Option<Spi>,
     events: Events,
     /// A script enabled the watchdog: sleeps feed it (as on the ESP32 boards)
@@ -307,6 +310,7 @@ impl Board {
             adc: None,
             pwm: Pwm::new(mg24_hal::clock::sysclk_hz()),
             uart: None,
+            imu: None,
             spi: None,
             events: Events::new(),
             wdt_on: false,
@@ -706,6 +710,12 @@ impl HardwareBridge for Board {
     ) -> Result<(), Error> {
         match (module, name) {
             (None, "cpu_info") => cpu_info(self.reset_cause, out),
+            (Some("imu"), _) => {
+                if self.imu.is_none() {
+                    self.imu = Some(Imu::new(pclk_hz())?);
+                }
+                self.imu.as_mut().unwrap().call(name, out)
+            }
             (Some("utime"), "gmtime" | "localtime") => {
                 let secs = match args.first() {
                     Some(arg) => arg.int()?,
@@ -781,7 +791,7 @@ impl HardwareBridge for Board {
     }
 
     fn modules(&self) -> &[Module] {
-        &[TIME_MODULE]
+        &[TIME_MODULE, crate::imu::MODULE]
     }
 
     fn constants(&self) -> &[(&'static str, i64)] {

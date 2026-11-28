@@ -26,28 +26,31 @@ const I2C0_CLOCK_DIV: u32 = 2;
 /// Clears interrupt flags through IF's clear alias (Series 2 registers have
 /// SET/CLR/TGL aliases 0x1000/0x2000/0x3000 above them): writing a 1 clears
 /// that flag for sure, where a plain write of IF may not.
-fn clear_flags(mask: u32) {
-    let at = i2c().if_() as *const _ as usize + 0x2000;
-    // SAFETY: I2C1's IF_CLR register
+fn clear_flags(n: u8, mask: u32) {
+    let at = regs(n).if_() as *const _ as usize + 0x2000;
+    // SAFETY: I2Cn's IF_CLR register
     unsafe { (at as *mut u32).write_volatile(mask) };
 }
 
 const ALL_FLAGS: u32 = 0x001F_FFFF;
 
-/// The instance `init` chose: 0 or 1.
-static INSTANCE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(1);
-
-fn i2c() -> &'static pac::i2c1_s::RegisterBlock {
-    if INSTANCE.load(core::sync::atomic::Ordering::Relaxed) == 0 {
-        // SAFETY: I2C0 has I2C1's register layout; only this module uses it
-        return unsafe { &*(pac::I2c0S::ptr() as *const pac::i2c1_s::RegisterBlock) };
+/// I2C0's or I2C1's registers (the same layout).
+fn regs(n: u8) -> &'static pac::i2c1_s::RegisterBlock {
+    // SAFETY: the controller's registers; each belongs to one `I2c` at a time
+    unsafe {
+        if n == 0 {
+            &*(pac::I2c0S::ptr() as *const pac::i2c1_s::RegisterBlock)
+        } else {
+            &*pac::I2c1S::ptr()
+        }
     }
-    // SAFETY: I2C1's registers; only this module uses them
-    unsafe { &*pac::I2c1S::ptr() }
 }
 
-/// The bus, set up by `init`.
-pub struct I2c;
+/// A bus, set up by `init`: I2C0 or I2C1 (two buses can work at once,
+/// one on each).
+pub struct I2c {
+    n: u8,
+}
 
 impl I2c {
     /// I2C1 on `sda`/`scl` at about `hz` (10 kHz to 400 kHz), from PCLK =
@@ -73,9 +76,6 @@ impl I2c {
             gpio::open_drain_pullup(sda);
             gpio::open_drain_pullup(scl);
             let g = &*pac::GpioS::ptr();
-            // The other controller off the pins (a bus moved between them)
-            g.i2c0_routeen().write(|w| w.bits(0));
-            g.i2c1_routeen().write(|w| w.bits(0));
             if n == 0 {
                 g.i2c0_sdaroute()
                     .write(|w| w.port().bits(sda.port).pin().bits(sda.pin));
@@ -91,8 +91,7 @@ impl I2c {
                 g.i2c1_routeen()
                     .write(|w| w.sdapen().set_bit().sclpen().set_bit());
             }
-            INSTANCE.store(n, core::sync::atomic::Ordering::Relaxed);
-            let i2c = i2c();
+            let i2c = regs(n);
             i2c.en().write(|w| w.en().clear_bit());
             // f_SCL = f_PCLK / ((N_low + N_high) * (DIV + 1) + 8): CLHR 0
             // is 4:4 (standard mode), 1 is 6:3 (fast mode)
@@ -105,7 +104,7 @@ impl I2c {
             // The bus state is unknown after enabling: declare it idle
             i2c.cmd().write(|w| w.abort().set_bit());
         }
-        Ok(Self)
+        Ok(Self { n })
     }
 
     /// Writes `data` to the device at `addr`.
@@ -147,7 +146,7 @@ impl I2c {
         if addr >= 0x80 {
             return Err(Error::ValueError);
         }
-        let i2c = i2c();
+        let i2c = regs(self.n);
         // A previous transfer that went wrong leaves the bus busy: free it
         if i2c.state().read().busy().bit_is_set() && i2c.state().read().state().is_idle() {
             i2c.cmd().write(|w| w.abort().set_bit());
@@ -156,7 +155,7 @@ impl I2c {
         // right after this START: drop them, the old flags and TXDATA
         i2c.cmd()
             .write(|w| w.clearpc().set_bit().cleartx().set_bit());
-        clear_flags(ALL_FLAGS);
+        clear_flags(self.n, ALL_FLAGS);
         // START first, then the address: in the middle of a transfer (a
         // repeated START, before a register is read) the controller is
         // still a transmitter, and a byte in TXDATA before the START would
@@ -169,7 +168,7 @@ impl I2c {
 
     /// Sends bytes, each acknowledged.
     fn send(&mut self, data: &[u8]) -> Result<(), Error> {
-        let i2c = i2c();
+        let i2c = regs(self.n);
         for &byte in data {
             i2c.txdata().write(|w| unsafe { w.txdata().bits(byte) });
             self.wait_ack()?;
@@ -179,7 +178,7 @@ impl I2c {
 
     /// Receives bytes: ACK after each, NACK after the last.
     fn receive(&mut self, buf: &mut [u8]) -> Result<(), Error> {
-        let i2c = i2c();
+        let i2c = regs(self.n);
         let last = buf.len().wrapping_sub(1);
         for (i, slot) in buf.iter_mut().enumerate() {
             wait(|| i2c.status().read().rxdatav().bit_is_set())?;
@@ -195,7 +194,7 @@ impl I2c {
 
     /// Waits for the device's ACK (or NACK: `IoError`) of the last byte.
     fn wait_ack(&mut self) -> Result<(), Error> {
-        let i2c = i2c();
+        let i2c = regs(self.n);
         wait(|| {
             let f = i2c.if_().read();
             f.ack().bit_is_set()
@@ -204,7 +203,7 @@ impl I2c {
                 || f.buserr().bit_is_set()
         })?;
         let f = i2c.if_().read();
-        clear_flags(f.bits());
+        clear_flags(self.n, f.bits());
         if f.ack().bit_is_set() {
             Ok(())
         } else {
@@ -214,13 +213,13 @@ impl I2c {
 
     /// STOP, and waits until it's on the bus.
     fn stop(&mut self) {
-        let i2c = i2c();
+        let i2c = regs(self.n);
         i2c.cmd().write(|w| w.stop().set_bit());
         if wait(|| i2c.if_().read().mstop().bit_is_set()).is_err() {
             // The bus is stuck (a line held low): reset the controller's state
             i2c.cmd().write(|w| w.abort().set_bit());
         }
-        clear_flags(ALL_FLAGS);
+        clear_flags(self.n, ALL_FLAGS);
     }
 }
 

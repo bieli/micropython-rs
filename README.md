@@ -1024,10 +1024,20 @@ C and D. The firmware picks what reaches the pins: an I²C bus on two port C/D p
 I2C1, any other I2C0 (which runs from PCLK / 2); PWM on port C/D has TIMER1 and TIMER3 (6 pins, 2 frequencies), on
 port A/B (D8-D17) TIMER1, TIMER2 and TIMER4.
 
-The Sense's motion sensor (LSM6DS3TR-C) is on I2C0, SDA PB2 and SCL PB3 (the D13/D14 pads), powered from PD5:
-`Pin(53, Pin.OUT).on()`, then `I2C(0, sda=Pin(18), scl=Pin(19))` answers at 0x6A (WHO_AM_I 0x6A).
+The Sense's motion sensor (an LSM6DS3TR-C accelerometer and gyroscope; I2C0 on PB2/PB3, the D13/D14 pads, powered
+from PD5) is the native module `imu`, set up on first use (its own I2C bus, next to `machine.I2C`'s):
 
-Next: the crystal at 78 MHz, and a native module for the motion sensor.
+```python
+import imu
+ax, ay, az, gx, gy, gz = imu.read()   # g (+-2 g) and degrees per second (+-250): 0.8 ms
+imu.accel(), imu.gyro()               # (x, y, z) of one of them
+imu.temperature()                     # degrees C
+```
+
+Lying still on a desk: (0.31, -0.01, 0.98) g, |g| = 1.03, the gyroscope's zero offset about (0.5, -2.5, -0.7) dps
+(the datasheet allows +-10).
+
+Next: the crystal (accurate time), then 78 MHz.
 Not planned: Bluetooth, Thread and Zigbee (they need Silicon Labs' closed C stacks).
 
 #### ESP32-S3 and ESP32-C3 (`CHIP=esp32s3`, `CHIP=esp32c3`)

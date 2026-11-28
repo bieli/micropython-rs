@@ -14,6 +14,7 @@ mod console;
 mod events;
 mod gpio;
 mod i2c;
+mod imu;
 mod pwm;
 mod spi;
 mod storage;

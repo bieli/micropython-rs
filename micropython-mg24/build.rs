@@ -7,6 +7,29 @@ fn main() {
     println!("cargo:rustc-link-search={}/memory", dir);
     println!("cargo:rerun-if-changed=memory/mg24.x");
     println!("cargo:rerun-if-env-changed=MPY_GIT_COMMIT");
+    // Without MPY_GIT_COMMIT (a plain `cargo build`) the commit comes from git:
+    // run again when HEAD, its branch or the index change, not only once
+    if let Ok(out) = std::process::Command::new("git")
+        .args([
+            "-C",
+            &dir,
+            "rev-parse",
+            "--absolute-git-dir",
+            "--symbolic-full-name",
+            "HEAD",
+        ])
+        .output()
+    {
+        let text = String::from_utf8_lossy(&out.stdout).to_string();
+        let mut lines = text.lines();
+        if let Some(git_dir) = lines.next() {
+            println!("cargo:rerun-if-changed={}/HEAD", git_dir);
+            println!("cargo:rerun-if-changed={}/index", git_dir);
+            if let Some(branch) = lines.next().filter(|b| b.starts_with("refs/")) {
+                println!("cargo:rerun-if-changed={}/{}", git_dir, branch);
+            }
+        }
+    }
     let commit = std::env::var("MPY_GIT_COMMIT")
         .ok()
         .filter(|s| !s.is_empty())
