@@ -53,7 +53,9 @@ pub extern "C" fn EUSART1_RX() {
     }
 }
 
-pub struct Uart;
+pub struct Uart {
+    pins: [PinId; 2],
+}
 
 impl Uart {
     /// EUSART1 on `tx`/`rx` at `baud` (300 to 2 000 000), from its clock `hz`.
@@ -97,7 +99,20 @@ impl Uart {
             TAIL.store(0, Ordering::Relaxed);
             mg24_hal::interrupt::enable_irq(EUSART1_RX_IRQ);
         }
-        Ok(Self)
+        Ok(Self { pins: [tx, rx] })
+    }
+
+    /// TX and RX.
+    pub fn pins(&self) -> [PinId; 2] {
+        self.pins
+    }
+
+    /// Takes EUSART1 off its pins and disconnects them.
+    pub fn release(&self) {
+        // SAFETY: the EUSART1 routes; then EUSART1's enable
+        unsafe { (&*pac::GpioS::ptr()).eusart1_routeen().write(|w| w.bits(0)) };
+        eusart().en().write(|w| w.en().clear_bit());
+        self.pins.into_iter().for_each(gpio::release);
     }
 
     pub fn write(&mut self, data: &[u8]) {

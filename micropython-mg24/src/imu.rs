@@ -77,6 +77,11 @@ impl Imu {
         Ok(Self { bus })
     }
 
+    /// The sensor's I2C bus (SDA, SCL); its power pin is PD5.
+    pub fn bus(&self) -> &I2c {
+        &self.bus
+    }
+
     /// Three signed 16-bit values from `reg` on.
     fn xyz(&mut self, reg: u8) -> Result<[i16; 3], Error> {
         let mut b = [0u8; 6];

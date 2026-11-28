@@ -308,7 +308,7 @@ impl Board {
             reset_cause,
             i2c: None,
             adc: None,
-            pwm: Pwm::new(mg24_hal::clock::sysclk_hz()),
+            pwm: Pwm::new(crate::sysclock::periph_hz()),
             uart: None,
             imu: None,
             spi: None,
@@ -349,10 +349,51 @@ impl Board {
         self.adc.get_or_insert_with(Adc::new)
     }
 
+    /// Takes `pins` from whatever uses them now: a bus loses its routes
+    /// (the whole bus is released), a PWM output stops. A pin has one job at
+    /// a time, as on MicroPython: without this, a bus left on a pin kept
+    /// driving it (an I2C1 scan on D2 left PWM on D2 stuck high).
+    fn claim(&mut self, pins: &[PinId]) {
+        let taken = |used: &[PinId]| used.iter().any(|p| pins.contains(p));
+        if self.i2c.as_ref().is_some_and(|b| taken(&b.pins())) {
+            self.i2c.take().unwrap().release();
+        }
+        if self.imu.as_ref().is_some_and(|i| taken(&i.bus().pins())) {
+            self.imu.take().unwrap().bus().release();
+        }
+        if self.uart.as_ref().is_some_and(|u| taken(&u.pins())) {
+            self.uart.take().unwrap().release();
+        }
+        if self.spi.as_ref().is_some_and(|s| taken(&s.pins())) {
+            self.spi.take().unwrap().release();
+        }
+        for &p in pins {
+            self.pwm.stop(p);
+        }
+    }
+
+    /// Releases every bus and PWM output (a soft reset, as on MicroPython).
+    fn release_all(&mut self) {
+        if let Some(b) = self.i2c.take() {
+            b.release();
+        }
+        if let Some(i) = self.imu.take() {
+            i.bus().release();
+        }
+        if let Some(u) = self.uart.take() {
+            u.release();
+        }
+        if let Some(s) = self.spi.take() {
+            s.release();
+        }
+        self.pwm.stop_all();
+    }
+
     /// The I2C bus, on the default pins at 100 kHz unless `i2c_init` chose.
     fn i2c(&mut self) -> Result<&mut I2c, Error> {
         if self.i2c.is_none() {
             let (sda, scl) = (PinId::new(gpio::I2C_SDA)?, PinId::new(gpio::I2C_SCL)?);
+            self.claim(&[sda, scl]);
             self.i2c = Some(I2c::init(sda, scl, I2C_DEFAULT_HZ, pclk_hz())?);
         }
         Ok(self.i2c.as_mut().unwrap())
@@ -360,8 +401,7 @@ impl Board {
 }
 
 fn pclk_hz() -> u32 {
-    // PCLK is the CPU clock (no prescaler below 50 MHz)
-    mg24_hal::clock::sysclk_hz()
+    crate::sysclock::pclk_hz()
 }
 
 fn non_negative(v: i64) -> Result<i64, Error> {
@@ -413,7 +453,10 @@ impl HardwareBridge for Board {
             "ticks_ms" => Ok(Some(clock::now_ms() as i64)),
             "ticks_us" => Ok(Some(clock::now_us() as i64)),
             "ticks_diff" => Ok(Some(int(0)?.wrapping_sub(int(1)?))),
-            "pin_mode" => gpio::pin_mode(int(0)?, int(1)?).map(|()| None),
+            "pin_mode" => {
+                self.claim(&[pin(int(0)?)?]);
+                gpio::pin_mode(int(0)?, int(1)?).map(|()| None)
+            }
             "pin_write" => {
                 gpio::write(pin(int(0)?)?, int(1)? != 0);
                 Ok(None)
@@ -425,6 +468,7 @@ impl HardwareBridge for Board {
             }
             "led_on" | "led_off" => {
                 let led = pin(LED_PIN)?;
+                self.claim(&[led]);
                 gpio::pin_mode(LED_PIN, gpio::OUT)?;
                 gpio::write(
                     led,
@@ -442,6 +486,10 @@ impl HardwareBridge for Board {
                     Some(a) => u32::try_from(a.int()?).map_err(|_| Error::ValueError)?,
                     None => I2C_DEFAULT_HZ,
                 };
+                if let Some(old) = self.i2c.take() {
+                    old.release();
+                }
+                self.claim(&[sda, scl]);
                 self.i2c = Some(I2c::init(sda, scl, hz, pclk_hz())?);
                 Ok(None)
             }
@@ -500,6 +548,11 @@ impl HardwareBridge for Board {
                     duty
                 };
                 let duty_u16 = u32::try_from(duty_u16).map_err(|_| Error::ValueError)?;
+                // A pin with another job loses it (a pin already on PWM keeps
+                // its timer: only the duty or frequency changes)
+                if !self.pwm.uses(id) {
+                    self.claim(&[id]);
+                }
                 self.pwm.set(id, freq, duty_u16).map(|()| None)
             }
             "pwm_stop" => {
@@ -512,7 +565,11 @@ impl HardwareBridge for Board {
                     Some(b) => u32::try_from(b.int()?).map_err(|_| Error::ValueError)?,
                     None => 115_200,
                 };
-                self.uart = Some(Uart::init(tx, rx, baud, mg24_hal::clock::sysclk_hz())?);
+                if let Some(old) = self.uart.take() {
+                    old.release();
+                }
+                self.claim(&[tx, rx]);
+                self.uart = Some(Uart::init(tx, rx, baud, crate::sysclock::periph_hz())?);
                 Ok(None)
             }
             "uart_write" => {
@@ -531,13 +588,17 @@ impl HardwareBridge for Board {
                     Some(m) => u8::try_from(m.int()?).map_err(|_| Error::ValueError)?,
                     None => 0,
                 };
+                if let Some(old) = self.spi.take() {
+                    old.release();
+                }
+                self.claim(&[sck, mosi, miso]);
                 self.spi = Some(Spi::init(
                     sck,
                     mosi,
                     miso,
                     khz,
                     mode,
-                    mg24_hal::clock::sysclk_hz(),
+                    crate::sysclock::periph_hz(),
                 )?);
                 Ok(None)
             }
@@ -592,7 +653,7 @@ impl HardwareBridge for Board {
                 }
             }
             "reset_cause" => Ok(Some(self.reset_cause)),
-            "cpu_freq" => Ok(Some(mg24_hal::clock::sysclk_hz() as i64)),
+            "cpu_freq" => Ok(Some(crate::sysclock::cpu_hz() as i64)),
             "rtc_set" => {
                 let us = match args.get(1) {
                     Some(us) => us.int()?,
@@ -712,6 +773,9 @@ impl HardwareBridge for Board {
             (None, "cpu_info") => cpu_info(self.reset_cause, out),
             (Some("imu"), _) => {
                 if self.imu.is_none() {
+                    // PB2 (SDA), PB3 (SCL), PD5 (power)
+                    let pins = [PinId::new(18)?, PinId::new(19)?, PinId::new(53)?];
+                    self.claim(&pins);
                     self.imu = Some(Imu::new(pclk_hz())?);
                 }
                 self.imu.as_mut().unwrap().call(name, out)
@@ -780,10 +844,12 @@ impl HardwareBridge for Board {
         self.sleep_for_us(remaining_ms as u64 * 1000)
     }
 
-    /// A soft reset: no more pin interrupts and timers from the last session.
+    /// A soft reset: no more pin interrupts, timers, buses and PWM outputs
+    /// from the last session.
     fn soft_reset(&mut self) {
         self.events.reset();
         self.events.on = false;
+        self.release_all();
     }
 
     fn functions(&self) -> &[HwFn] {
@@ -864,9 +930,22 @@ fn cpu_info(reset_cause: i64, out: &mut Returns<'_>) -> Result<(), Error> {
     int(
         out,
         "CPU MHz",
-        (mg24_hal::clock::sysclk_hz() / 1_000_000) as i64,
+        (crate::sysclock::cpu_hz() / 1_000_000) as i64,
     )?;
     int(out, "CPU max MHz", 78)?;
+    text(
+        out,
+        "Clock source",
+        if crate::sysclock::crystal() {
+            if crate::sysclock::cpu_hz() > 40_000_000 {
+                "78 MHz: DPLL locked to the 39 MHz crystal"
+            } else {
+                "39 MHz crystal (HFXO); the DPLL didn't lock"
+            }
+        } else {
+            "RC oscillator (HFRCODPLL): the crystal didn't start"
+        },
+    )?;
     text(out, "Flags", "fpu dsp trustzone ble 802.15.4")?;
     int(out, "Flash size", msize.flash().bits() as i64 * 1024)?;
     int(out, "SRAM size", msize.sram().bits() as i64 * 1024)?;

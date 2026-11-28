@@ -179,6 +179,25 @@ impl Pwm {
         }
     }
 
+    /// Stops every PWM output (a soft reset).
+    pub fn stop_all(&mut self) {
+        for n in 0..TIMERS {
+            for p in self.slots[n]
+                .map(|s| s.pins)
+                .unwrap_or([None; CHANNELS])
+                .into_iter()
+                .flatten()
+            {
+                self.stop(p);
+            }
+        }
+    }
+
+    /// Whether `id` is a PWM output.
+    pub fn uses(&self, id: PinId) -> bool {
+        self.find(id).is_some()
+    }
+
     fn find(&self, id: PinId) -> Option<(usize, usize)> {
         (0..TIMERS).find_map(|n| {
             let s = self.slots[n]?;

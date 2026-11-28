@@ -18,6 +18,7 @@ mod imu;
 mod pwm;
 mod spi;
 mod storage;
+mod sysclock;
 mod uart;
 
 use core::cell::RefCell;
@@ -111,7 +112,7 @@ impl Port for Mg24Port {
             "full"
         };
         let float = if cfg!(feature = "float32") { 32 } else { 64 };
-        let mhz = mg24_hal::clock::sysclk_hz() / 1_000_000;
+        let mhz = sysclock::cpu_hz() / 1_000_000;
         write!(
             out,
             "chip=mg24 level={} features= float={} mhz={}",
@@ -192,10 +193,11 @@ fn main() -> ! {
     // configured (`run` never returns)
     let _tx = Pin::new(dp.pins.pa8, Level::High, OutputConfig::default());
     let _rx = Input::new(dp.pins.pa9, InputConfig::new());
-    // PCLK and TIMER0's clock are the CPU clock (no prescalers)
-    let hz = mg24_hal::clock::sysclk_hz();
-    console::init(hz);
-    clock::init(hz);
+    // The 39 MHz crystal for the CPU, the timers and the EUSARTs (or
+    // HFRCODPLL's 38 MHz if it doesn't start), before anything uses them
+    sysclock::init(mg24_hal::clock::sysclk_hz());
+    console::init(sysclock::pclk_hz());
+    clock::init(sysclock::periph_hz());
     // The orange LED (PA7, lit when low) off
     let _ = gpio::pin_mode(7, gpio::OUT);
     gpio::write(gpio::PinId::new(7).unwrap(), true);

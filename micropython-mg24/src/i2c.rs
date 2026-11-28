@@ -50,6 +50,7 @@ fn regs(n: u8) -> &'static pac::i2c1_s::RegisterBlock {
 /// one on each).
 pub struct I2c {
     n: u8,
+    pins: [PinId; 2],
 }
 
 impl I2c {
@@ -104,7 +105,30 @@ impl I2c {
             // The bus state is unknown after enabling: declare it idle
             i2c.cmd().write(|w| w.abort().set_bit());
         }
-        Ok(Self { n })
+        Ok(Self {
+            n,
+            pins: [sda, scl],
+        })
+    }
+
+    /// SDA and SCL.
+    pub fn pins(&self) -> [PinId; 2] {
+        self.pins
+    }
+
+    /// Takes the controller off its pins (the routes) and disconnects them.
+    pub fn release(&self) {
+        // SAFETY: the routes of this bus's controller
+        unsafe {
+            let g = &*pac::GpioS::ptr();
+            if self.n == 0 {
+                g.i2c0_routeen().write(|w| w.bits(0));
+            } else {
+                g.i2c1_routeen().write(|w| w.bits(0));
+            }
+        }
+        regs(self.n).en().write(|w| w.en().clear_bit());
+        self.pins.into_iter().for_each(gpio::release);
     }
 
     /// Writes `data` to the device at `addr`.

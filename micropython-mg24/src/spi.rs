@@ -16,7 +16,9 @@ fn eusart() -> &'static pac::eusart0_s::RegisterBlock {
     unsafe { &*pac::Eusart0S::ptr() }
 }
 
-pub struct Spi;
+pub struct Spi {
+    pins: [PinId; 3],
+}
 
 impl Spi {
     /// EUSART0 on `sck`, `mosi`, `miso` at about `khz` (the fastest SCLK not
@@ -67,7 +69,22 @@ impl Spi {
             u.cmd().write(|w| w.rxen().set_bit().txen().set_bit());
             while u.syncbusy().read().bits() != 0 {}
         }
-        Ok(Self)
+        Ok(Self {
+            pins: [sck, mosi, miso],
+        })
+    }
+
+    /// SCK, MOSI and MISO.
+    pub fn pins(&self) -> [PinId; 3] {
+        self.pins
+    }
+
+    /// Takes EUSART0 off its pins and disconnects them.
+    pub fn release(&self) {
+        // SAFETY: the EUSART0 routes; then EUSART0's enable
+        unsafe { (&*pac::GpioS::ptr()).eusart0_routeen().write(|w| w.bits(0)) };
+        eusart().en().write(|w| w.en().clear_bit());
+        self.pins.into_iter().for_each(gpio::release);
     }
 
     /// Sends each byte of `buf` and replaces it with the byte received meanwhile.

@@ -154,6 +154,11 @@ pub fn set_push_pull(id: PinId, high: bool) {
     set_mode(id, MODE_PUSHPULL, high);
 }
 
+/// Disconnected (mode DISABLED): a pin a peripheral gave back.
+pub fn release(id: PinId) {
+    set_mode(id, 0, false);
+}
+
 /// An input with the pull-up (a UART or SPI input).
 pub fn input_pullup(id: PinId) {
     set_mode(id, MODE_INPUTPULL, true);

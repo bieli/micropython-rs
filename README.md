@@ -1013,11 +1013,16 @@ What works now:
   `.py` files. A 32 KB file goes up in 6.7 s (the serial link), 25 files are written in 2.7 s. The flash can't be
   read while a page is erased, so the erase/write loops, the interrupt handlers and the vector table run from RAM:
   the console keeps every byte typed meanwhile.
-* The CPU runs at 38 MHz from its RC oscillator (factory-calibrated: the clock was 0.2 % fast against a PC). 78 MHz
-  needs the 39 MHz crystal and the DPLL (next), as do accurate clocks.
+* The clocks: the 39 MHz crystal (tuning capacitance 120) runs the timers and the UART/SPI, so time is as accurate as
+  the crystal: +7 ppm against an NTP-synchronised PC over 10 minutes (under a second a day). The CPU runs at 78 MHz,
+  the chip's maximum: the DPLL locks the RC oscillator (in its 80 MHz band) to the crystal, PCLK is halved to 39 MHz.
+  If the DPLL doesn't lock the CPU stays on the crystal at 39 MHz; if the crystal doesn't start, everything stays on
+  the RC oscillator at 38 MHz. `lscpu()` says which (`Clock source`).
+* A pin has one job at a time, as on MicroPython: giving it a new one (`Pin`, `PWM`, a bus) takes it from the bus or
+  PWM output that had it, and a soft reset releases every bus and PWM output.
 
-`machine.bench()` at 38 MHz: 27.6 M i32 adds/s, 19 M f32 multiplies/s (hardware FPU), 0.29 M f64 multiplies/s
-(software), 63 MiB/s RAM writes, 6.2 M GPIO toggles/s; Python for loops 5.4 k/s.
+`machine.bench()` at 78 MHz: 56.7 M i32 adds/s, 36.7 M f32 multiplies/s (hardware FPU), 130 MiB/s RAM writes,
+7.6 M GPIO toggles/s; Python for loops 11.1 k/s, function calls 4.8 k/s (twice the 38 MHz figures).
 
 Not every peripheral reaches every port on this chip: TIMER2/4 and EUSART0 only ports A and B, TIMER3 and I2C1 only
 C and D. The firmware picks what reaches the pins: an I²C bus on two port C/D pins (D0-D7, D18; the default D4/D5) is
@@ -1037,7 +1042,8 @@ imu.temperature()                     # degrees C
 Lying still on a desk: (0.31, -0.01, 0.98) g, |g| = 1.03, the gyroscope's zero offset about (0.5, -2.5, -0.7) dps
 (the datasheet allows +-10).
 
-Next: the crystal (accurate time), then 78 MHz.
+What's left: Bluetooth, Thread and Zigbee are not planned (they need Silicon Labs' closed C stacks); low-power sleep
+modes (EM2/EM4) and the Sense's microphone are open.
 Not planned: Bluetooth, Thread and Zigbee (they need Silicon Labs' closed C stacks).
 
 #### ESP32-S3 and ESP32-C3 (`CHIP=esp32s3`, `CHIP=esp32c3`)
