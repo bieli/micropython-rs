@@ -1002,13 +1002,19 @@ What works now:
   `LED` (PA7, the orange LED, lit when low). Refused with `ValueError`: the debugger's SWD pins (PA1, PA2), the external
   flash's chip select (PA6), the console (PA8/PA9, shared with the D12/D11 pads), the antenna switch (PB4, PB5) and
   battery control/sense (PD3, PD4). `machine.I2C()` without pins uses D4 (SDA) and D5 (SCL).
+* Files in the chip's own flash: the same file system as the ESP32 boards (30 files of up to 32 KB) in the 960 KB
+  above the firmware (`memory/mg24.x` keeps the firmware to 576 KB: a bigger one fails to link instead of overwriting
+  files). `tools/mpy.py save`/`put`/`get`/`ls`/`rm`, `mpremote fs`, `main.py` at boot, `open()`, `os`, `import` of
+  `.py` files. A 32 KB file goes up in 6.7 s (the serial link), 25 files are written in 2.7 s. The flash can't be
+  read while a page is erased, so the erase/write loops, the interrupt handlers and the vector table run from RAM:
+  the console keeps every byte typed meanwhile.
 * The CPU runs at 38 MHz from its RC oscillator (factory-calibrated: the clock was 0.2 % fast against a PC). 78 MHz
   needs the 39 MHz crystal and the DPLL (next), as do accurate clocks.
 
 `machine.bench()` at 38 MHz: 27.6 M i32 adds/s, 19 M f32 multiplies/s (hardware FPU), 0.29 M f64 multiplies/s
 (software), 63 MiB/s RAM writes, 6.2 M GPIO toggles/s; Python for loops 5.4 k/s.
 
-Next: files in flash, ADC/PWM/UART/SPI/watchdog/pin interrupts, the crystal at 78 MHz, and the Sense's motion sensor.
+Next: ADC/PWM/UART/SPI/watchdog/pin interrupts, the crystal at 78 MHz, and the Sense's motion sensor.
 Not planned: Bluetooth, Thread and Zigbee (they need Silicon Labs' closed C stacks).
 
 #### ESP32-S3 and ESP32-C3 (`CHIP=esp32s3`, `CHIP=esp32c3`)

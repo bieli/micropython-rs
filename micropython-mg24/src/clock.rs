@@ -28,6 +28,7 @@ struct MainOnly(Cell<i64>);
 unsafe impl Sync for MainOnly {}
 static WALL_OFFSET_US: MainOnly = MainOnly(Cell::new(0));
 
+#[inline(always)]
 fn timer() -> &'static pac::timer0_s::RegisterBlock {
     // SAFETY: TIMER0's registers; after `init` only this module uses them
     unsafe { &*pac::Timer0S::ptr() }
@@ -53,8 +54,9 @@ pub fn init(timer_hz: u32) {
     }
 }
 
-/// TIMER0's overflow: one more wrap.
+/// TIMER0's overflow: one more wrap. From RAM, as the console's handler.
 #[unsafe(no_mangle)]
+#[link_section = ".ram_text.timer0"]
 pub extern "C" fn TIMER0() {
     let t = timer();
     if t.if_().read().of().bit_is_set() {

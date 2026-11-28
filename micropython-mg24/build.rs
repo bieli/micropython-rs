@@ -2,6 +2,10 @@
 /// code (`#@version`, the banner): set by the Makefile, else from git here,
 /// else `unknown`. As in micropython-esp32.
 fn main() {
+    // memory/mg24.x, the linker script (.cargo/config.toml: -Tmg24.x)
+    let dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
+    println!("cargo:rustc-link-search={}/memory", dir);
+    println!("cargo:rerun-if-changed=memory/mg24.x");
     println!("cargo:rerun-if-env-changed=MPY_GIT_COMMIT");
     let commit = std::env::var("MPY_GIT_COMMIT")
         .ok()

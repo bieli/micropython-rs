@@ -5,7 +5,8 @@ statics, and what's left for the stack."""
 import struct
 import sys
 
-FLASH, RAM = 1536 * 1024, 256 * 1024
+# The firmware's part of the flash (memory/mg24.x; the file system has the rest)
+FLASH, RAM = 576 * 1024, 256 * 1024
 
 
 def sections(path):

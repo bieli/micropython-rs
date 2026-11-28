@@ -35,6 +35,7 @@ static TAIL: AtomicUsize = AtomicUsize::new(0);
 /// Bytes dropped because the ring was full (the REPL reads much faster).
 static DROPPED: AtomicUsize = AtomicUsize::new(0);
 
+#[inline(always)]
 fn push(byte: u8) {
     let head = HEAD.load(Ordering::Relaxed);
     let next = (head + 1) % RING_SIZE;
@@ -43,7 +44,7 @@ fn push(byte: u8) {
         return;
     }
     // SAFETY: only the interrupt writes, and only the free slot at HEAD
-    unsafe { (*RING.0.get())[head] = byte };
+    unsafe { (*RING.0.get())[head % RING_SIZE] = byte }; // (in range: no bounds check)
     HEAD.store(next, Ordering::Release);
 }
 
@@ -73,6 +74,7 @@ pub fn dropped() -> usize {
     DROPPED.load(Ordering::Relaxed)
 }
 
+#[inline(always)]
 fn usart() -> &'static pac::usart0_s::RegisterBlock {
     // SAFETY: USART0's registers; after `init` only this module uses them
     unsafe { &*pac::Usart0S::ptr() }
@@ -109,8 +111,11 @@ pub fn init(pclk_hz: u32) {
     }
 }
 
-/// USART0's receive interrupt: moves every waiting byte into the ring.
+/// USART0's receive interrupt: moves every waiting byte into the ring. It
+/// runs from RAM: while the flash is being erased (files) it can't be read,
+/// and a handler in flash would wait, losing bytes.
 #[unsafe(no_mangle)]
+#[link_section = ".ram_text.usart0_rx"]
 pub extern "C" fn USART0_RX() {
     let usart = usart();
     // The flag first: a byte arriving while the loop runs raises it again

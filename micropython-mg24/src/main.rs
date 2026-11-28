@@ -12,14 +12,15 @@ mod clock;
 mod console;
 mod gpio;
 mod i2c;
+mod storage;
 
+use core::cell::RefCell;
 use core::mem::MaybeUninit;
 
 use mg24_hal::clock::CpuSpeed;
 use mg24_hal::gpio::{Input, InputConfig, Level, Output as Pin, OutputConfig};
 use mg24_hal::CpuConfig;
 use micropython_port::{BootScript, Memory, Port};
-use micropython_rs::flatfs::RamFlash;
 use micropython_rs::interpreter::FuncDef;
 use micropython_rs::{Output, StmtCache};
 
@@ -143,6 +144,30 @@ static BOOT_SCRIPT: BootScript = BootScript {
     name: "scripts/boot.py",
 };
 
+/// The vector table in RAM (VTOR): exception entry reads a handler's address
+/// from it, and the flash can't be read while a file's page is erased.
+/// 2 + 14 + 70 words (the initial stack pointer, the reset vector, the core's
+/// exceptions, the chip's interrupts), aligned to the next power of two.
+const VECTOR_WORDS: usize = 2 + 14 + 70;
+#[repr(C, align(512))]
+struct Vectors([u32; VECTOR_WORDS]);
+static mut RAM_VECTORS: Vectors = Vectors([0; VECTOR_WORDS]);
+
+/// Copies the vector table (at the start of the flash) into RAM and points
+/// SCB.VTOR at the copy. Before any interrupt is enabled.
+fn vectors_to_ram() {
+    // SAFETY: the table at 0x08000000 has VECTOR_WORDS words (mg24-hal's
+    // link script checks its size); only this code writes RAM_VECTORS, once
+    unsafe {
+        let table = &mut *core::ptr::addr_of_mut!(RAM_VECTORS);
+        for (i, word) in table.0.iter_mut().enumerate() {
+            *word = (0x0800_0000 as *const u32).add(i).read_volatile();
+        }
+        core::ptr::write_volatile(0xE000_ED08 as *mut u32, table as *const _ as u32);
+        core::arch::asm!("dsb", "isb", options(nomem, nostack, preserves_flags));
+    }
+}
+
 #[mg24_hal::main]
 fn main() -> ! {
     // A stack overflow faults (MSPLIM, ARMv8-M) instead of overwriting the
@@ -156,6 +181,7 @@ fn main() -> ! {
     let mut config = CpuConfig::new();
     config.cpu_speed = Some(CpuSpeed::Mhz38);
     let dp = mg24_hal::init(config).unwrap();
+    vectors_to_ram();
     // The console's TX (PA8) idle high, RX (PA9) an input; they stay
     // configured (`run` never returns)
     let _tx = Pin::new(dp.pins.pa8, Level::High, OutputConfig::default());
@@ -170,11 +196,13 @@ fn main() -> ! {
 
     let mut out = Console;
     let mut hw = board::Board::new();
-    micropython_port::run::<Mg24Port, _, _, RamFlash<'static>>(
+    // main.py and other files, in the flash above the firmware
+    let files = storage::mount().map(RefCell::new);
+    micropython_port::run::<Mg24Port, _, _, _>(
         &mut out,
         &mut hw,
         &BOOT_SCRIPT,
-        None,
+        files.as_ref(),
         take_memory(),
         None,
     )
@@ -185,12 +213,14 @@ fn main() -> ! {
 /// chip, instead of the HAL's default handler's silent loop.
 #[unsafe(no_mangle)]
 pub extern "C" fn HardFault() {
-    // SCB.CFSR (configurable fault status) and HFSR (hard fault status)
+    // SCB.CFSR (configurable fault status), HFSR (hard fault status) and
+    // BFAR (the address of a precise bus fault, when CFSR.BFARVALID)
     // SAFETY: reads of the System Control Block's fault registers
-    let (cfsr, hfsr) = unsafe {
+    let (cfsr, hfsr, bfar) = unsafe {
         (
             core::ptr::read_volatile(0xE000_ED28 as *const u32),
             core::ptr::read_volatile(0xE000_ED2C as *const u32),
+            core::ptr::read_volatile(0xE000_ED38 as *const u32),
         )
     };
     let kind = if cfsr & 0x0010_0000 != 0 {
@@ -202,6 +232,12 @@ pub extern "C" fn HardFault() {
     } else {
         "fault"
     };
+    if cfsr & 0x8000 != 0 {
+        panic!(
+            "{} at {:#010x} (CFSR {:#010x}, HFSR {:#010x})",
+            kind, bfar, cfsr, hfsr
+        );
+    }
     panic!("{} (CFSR {:#010x}, HFSR {:#010x})", kind, cfsr, hfsr);
 }
 
