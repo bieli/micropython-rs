@@ -15,6 +15,8 @@ const FUNCS: &[HwFn] = &[
     HwFn::new("unclosed", "", "").returning_values(),
     HwFn::new("bad_key", "", "").returning_values(),
     HwFn::new("big", "n", "").returning_values(),
+    HwFn::new("filled", "n", "").returning_values(),
+    HwFn::new("fill_fails", "", "").returning_values(),
     HwFn::new("plain", "", ""),
 ];
 
@@ -123,6 +125,29 @@ impl HardwareBridge for Bridge {
                 out.end()?;
                 out.int(1)?;
                 out.end()
+            }
+            (None, "filled") => {
+                let n = args[0].int()? as usize;
+                out.begin_tuple()?;
+                out.bytes_with(n, |buf| {
+                    for (i, b) in buf.iter_mut().enumerate() {
+                        *b = i as u8;
+                    }
+                    Ok(())
+                })?;
+                out.int(n as i64)?;
+                out.end()
+            }
+            (None, "fill_fails") => {
+                out.begin_list()?;
+                // A failed fill records nothing: the list stays well formed
+                let failed = out.bytes_with(4, |buf| {
+                    buf[0] = 1;
+                    Err(Error::IoError)
+                });
+                out.bool(failed == Err(Error::IoError))?;
+                out.end()?;
+                out.bytes_with(2, |_| Err(Error::IoError))
             }
             (None, "big") => {
                 let n = args[0].int()? as usize;
@@ -283,4 +308,19 @@ fn full_object_table_or_little_free_memory_collects_first() {
     )
     .unwrap();
     assert_eq!(out, "2000\n");
+}
+
+#[test]
+fn bytes_filled_in_place() {
+    assert_eq!(
+        run("b, n = filled(300)\nprint(len(b), n, b[0], b[1], b[255], b[256], b[299])"),
+        "300 300 0 1 255 0 43\n"
+    );
+    assert_eq!(run("print(filled(0))"), "(b'', 0)\n");
+    // Too big for the free memory: MemoryError, nothing half-recorded
+    let err = run_heap("filled(40000)", 32 * 1024).unwrap_err();
+    assert!(err.contains("MemoryError"), "{}", err);
+    // A fill that fails: its error reaches Python
+    let err = run_heap("fill_fails()", 32 * 1024).unwrap_err();
+    assert!(err.contains("OSError"), "{}", err);
 }

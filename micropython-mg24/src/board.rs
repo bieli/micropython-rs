@@ -277,6 +277,8 @@ pub struct Board {
     /// The Sense's motion sensor, set up on first use (`imu` module)
     imu: Option<Imu>,
     spi: Option<Spi>,
+    /// The microphone's settings and state (`mic` module)
+    mic: micropython_port::mic::Mic,
     events: Events,
     /// A script enabled the watchdog: sleeps feed it (as on the ESP32 boards)
     wdt_on: bool,
@@ -311,6 +313,12 @@ impl Board {
             pwm: Pwm::new(crate::sysclock::periph_hz()),
             uart: None,
             imu: None,
+            mic: micropython_port::mic::Mic::new(
+                crate::mic::PIN,
+                Some(crate::mic::POWER),
+                crate::mic::RATE,
+                crate::mic::SETTLE_MS,
+            ),
             spi: None,
             events: Events::new(),
             wdt_on: false,
@@ -346,7 +354,8 @@ impl Board {
     }
 
     fn adc(&mut self) -> &mut Adc {
-        self.adc.get_or_insert_with(Adc::new)
+        self.adc
+            .get_or_insert_with(|| Adc::new(crate::sysclock::periph_hz()))
     }
 
     /// Takes `pins` from whatever uses them now: a bus loses its routes
@@ -367,9 +376,26 @@ impl Board {
         if self.spi.as_ref().is_some_and(|s| taken(&s.pins())) {
             self.spi.take().unwrap().release();
         }
+        if self.mic.is_on() {
+            let (p, power) = self.mic.pins();
+            let mine = |n: i64| pins.iter().any(|q| PinId::new(n).is_ok_and(|n| n == *q));
+            if mine(p) || power.is_some_and(mine) {
+                self.mic_off();
+            }
+        }
         for &p in pins {
             self.pwm.stop(p);
         }
+    }
+
+    /// The microphone's power off (its power pin stays an output, low).
+    fn mic_off(&mut self) {
+        if let (true, (_, Some(power))) = (self.mic.is_on(), self.mic.pins()) {
+            if let Ok(id) = PinId::new(power) {
+                gpio::write(id, false);
+            }
+        }
+        self.mic.forget();
     }
 
     /// Releases every bus and PWM output (a soft reset, as on MicroPython).
@@ -387,6 +413,7 @@ impl Board {
             s.release();
         }
         self.pwm.stop_all();
+        self.mic_off();
     }
 
     /// The I2C bus, on the default pins at 100 kHz unless `i2c_init` chose.
@@ -771,6 +798,20 @@ impl HardwareBridge for Board {
     ) -> Result<(), Error> {
         match (module, name) {
             (None, "cpu_info") => cpu_info(self.reset_cause, out),
+            (Some("mic"), _) => {
+                // A call that starts the microphone takes its pins first
+                if let Some((pin, power)) = self.mic.pins_for(name, args)? {
+                    let p = PinId::new(pin)?;
+                    match power {
+                        Some(pw) => self.claim(&[p, PinId::new(pw)?]),
+                        None => self.claim(&[p]),
+                    }
+                }
+                let adc = self
+                    .adc
+                    .get_or_insert_with(|| Adc::new(crate::sysclock::periph_hz()));
+                self.mic.call(&mut crate::mic::Hw { adc }, name, args, out)
+            }
             (Some("imu"), _) => {
                 if self.imu.is_none() {
                     // PB2 (SDA), PB3 (SCL), PD5 (power)
@@ -857,7 +898,7 @@ impl HardwareBridge for Board {
     }
 
     fn modules(&self) -> &[Module] {
-        &[TIME_MODULE, crate::imu::MODULE]
+        &[TIME_MODULE, crate::imu::MODULE, crate::mic::MODULE]
     }
 
     fn constants(&self) -> &[(&'static str, i64)] {

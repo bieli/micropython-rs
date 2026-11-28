@@ -15,6 +15,7 @@ mod events;
 mod gpio;
 mod i2c;
 mod imu;
+mod mic;
 mod pwm;
 mod spi;
 mod storage;

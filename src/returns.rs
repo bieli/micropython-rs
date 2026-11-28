@@ -13,6 +13,8 @@
 //     out.bytes(&[1])?;
 //     out.end()?;
 //
+//     out.bytes_with(2 * n, |buf| record_into(buf))?;   // big bytes, filled in place
+//
 // `Returns` only records the values, as compact typed records, in a scratch
 // area at the top of the heap (the arguments' strings live below it, so they
 // stay valid: nothing is allocated, nothing moves during the call). After the
@@ -147,6 +149,26 @@ impl<'b> Returns<'b> {
 
     pub fn bytes(&mut self, b: &[u8]) -> Result<(), Error> {
         self.value(Ret::Bytes(b))
+    }
+
+    /// A `bytes` value of `len` bytes that `fill` writes in place: a big
+    /// value (a recording, a frame) without a second copy of it in memory
+    /// first. If `fill` fails, nothing is recorded and its error is returned.
+    pub fn bytes_with(
+        &mut self,
+        len: usize,
+        fill: impl FnOnce(&mut [u8]) -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        let n = u32::try_from(len).map_err(|_| Error::OutOfMemory)?;
+        if self.buf.len() - self.len < 5 + len {
+            return Err(Error::OutOfMemory);
+        }
+        let at = self.len;
+        self.buf[at] = TAG_BYTES;
+        self.buf[at + 1..at + 5].copy_from_slice(&n.to_le_bytes());
+        fill(&mut self.buf[at + 5..at + 5 + len])?;
+        self.len = at + 5 + len;
+        Ok(())
     }
 
     fn begin(&mut self, tag: u8) -> Result<(), Error> {

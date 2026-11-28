@@ -8,6 +8,9 @@
 //! script and, when it has one, a flash file system (`flatfs` on any
 //! [`Flash`](micropython_rs::flatfs::Flash)); then [`run`] never returns.
 //! `micropython-esp32` (ESP32, ESP32-S3, ESP32-C3) is one such board.
+//!
+//! Native modules a board can share: [`mic`] (an analog microphone, given
+//! the board's timed ADC sampling).
 #![no_std]
 // The protocol text spells out its line endings (`\r\n` for the raw REPL's
 // framing, `\n` for script output): `write!` with them, not `writeln!`
@@ -15,6 +18,7 @@
 
 use core::sync::atomic::AtomicBool;
 
+pub mod mic;
 pub mod repl;
 
 pub use repl::{run, BigHeap, BootScript, Memory};

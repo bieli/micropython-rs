@@ -1042,9 +1042,28 @@ imu.temperature()                     # degrees C
 Lying still on a desk: (0.31, -0.01, 0.98) g, |g| = 1.03, the gyroscope's zero offset about (0.5, -2.5, -0.7) dps
 (the datasheet allows +-10).
 
-What's left: Bluetooth, Thread and Zigbee are not planned (they need Silicon Labs' closed C stacks); low-power sleep
-modes (EM2/EM4) and the Sense's microphone are open.
-Not planned: Bluetooth, Thread and Zigbee (they need Silicon Labs' closed C stacks).
+The Sense's microphone is analog, not I²C, SPI or PDM: an MSM381ACT001 MEMS microphone with an amplifier, its output on
+PC9 (a 0.57 V bias), powered from PC8. It's the native module `mic`, a driver for any analog microphone (MAX4466,
+MAX9814, SPW2430 boards, ...) on any ADC pin; the chip-independent part is in `micropython-port` (`mic.rs`, tested on
+a simulated microphone), the board gives it timed ADC sampling (IADC0's own timer, on the crystal: no jitter, the
+rate exact to the measurement's ppm):
+
+```python
+import mic
+mic.init()                          # the Sense's: PC9, power PC8, 16 kHz (or mic.init(pin, power, rate))
+pcm = mic.record(8000)              # 0.5 s: bytes, signed 16-bit LE, bias removed (12 bits scaled to 16)
+pcm = mic.record(8000, 8)           # ... times 8 (quiet sounds; clipped at +-32767)
+open('a.wav', 'wb').write(mic.wav(8000, 8))   # a WAV file; tools/mpy.py get a.wav
+rms, peak, dc = mic.level(100)      # 100 ms in mV, no buffer: a sound level meter
+mic.raw(64); mic.rate(); mic.off()  # the ADC values; the real rate (39 MHz / whole cycles); power off
+```
+
+Rates 1-48 kHz (16 kHz: 15 996.7 Hz). A recording needs twice its size in the heap (it's recorded in place, then
+becomes a `bytes`): up to about 14 000 samples (0.9 s at 16 kHz, 1.75 s at 8 kHz). After power-on the bias settles in
+about 250 ms (the first call waits). A quiet room: about 7 mV rms.
+
+What's left: low-power sleep modes (EM2/EM4). Not planned: Bluetooth, Thread and Zigbee (they need Silicon Labs'
+closed C stacks).
 
 #### ESP32-S3 and ESP32-C3 (`CHIP=esp32s3`, `CHIP=esp32c3`)
 
