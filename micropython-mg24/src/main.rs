@@ -15,7 +15,9 @@ mod events;
 mod gpio;
 mod i2c;
 mod pwm;
+mod spi;
 mod storage;
+mod uart;
 
 use core::cell::RefCell;
 use core::mem::MaybeUninit;

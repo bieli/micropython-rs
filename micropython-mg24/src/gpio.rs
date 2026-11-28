@@ -154,6 +154,11 @@ pub fn set_push_pull(id: PinId, high: bool) {
     set_mode(id, MODE_PUSHPULL, high);
 }
 
+/// An input with the pull-up (a UART or SPI input).
+pub fn input_pullup(id: PinId) {
+    set_mode(id, MODE_INPUTPULL, true);
+}
+
 /// Open drain with the pull-up, high (an I2C line).
 pub fn open_drain_pullup(id: PinId) {
     set_mode(id, MODE_WIREDANDPULLUP, true);

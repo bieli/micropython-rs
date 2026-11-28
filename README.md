@@ -997,7 +997,9 @@ What works now:
 * `machine` and `time`: the same functions and frozen modules as the ESP32 boards, so scripts move between them:
   `Pin` (in, out, pull-up/-down, open drain), `I2C` on any two free pins (10-400 kHz), `ADC` (12 bits, any
   free pin, 0 V to AVDD; millivolts calibrated against the chip's 1.21 V bandgap), `PWM` (12 pins, up to 4
-  frequencies at once), `RTC`,
+  frequencies at once), `UART(1)` (EUSART1, 8N1 on any two free pins; received bytes buffered by interrupt), `SPI`
+  (EUSART0, modes 0-3, on port A/B pins: pass `sck=Pin(D8), mosi=Pin(D10), miso=Pin(D9)`, as `machine.SPI()`'s
+  default pins are the ESP32's), `RTC`,
   `time.ticks_*`/`sleep*`/`time()`/`gmtime()`/`mktime()`, `unique_id()` (the chip's EUI-64), `reset()`,
   `reset_cause()`, `freq()`, `lscpu()`, `bench()`, `Pin.irq()` (12 lines: pin number `n` uses line `n`, so PA3
   and PC3 can't both have one), `Timer` (ids 0-3 and -1) and `WDT` (up to 262 s; sleeps feed it).
@@ -1025,7 +1027,7 @@ port A/B (D8-D17) TIMER1, TIMER2 and TIMER4.
 The Sense's motion sensor (LSM6DS3TR-C) is on I2C0, SDA PB2 and SCL PB3 (the D13/D14 pads), powered from PD5:
 `Pin(53, Pin.OUT).on()`, then `I2C(0, sda=Pin(18), scl=Pin(19))` answers at 0x6A (WHO_AM_I 0x6A).
 
-Next: UART and SPI, the crystal at 78 MHz, and a native module for the motion sensor.
+Next: the crystal at 78 MHz, and a native module for the motion sensor.
 Not planned: Bluetooth, Thread and Zigbee (they need Silicon Labs' closed C stacks).
 
 #### ESP32-S3 and ESP32-C3 (`CHIP=esp32s3`, `CHIP=esp32c3`)

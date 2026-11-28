@@ -2,8 +2,7 @@
 //! arguments and constants as micropython-esp32's (pin_mode, pin_write,
 //! i2c_read, sleep_ms, cpu_info, ...), so the frozen `machine` and `time`
 //! modules from micropython-esp32/modules run unchanged and scripts move
-//! between the boards. UART and SPI come later; until then those `machine`
-//! classes raise NameError.
+//! between the boards.
 
 use core::sync::atomic::Ordering;
 
@@ -15,6 +14,8 @@ use crate::events::{self, Events};
 use crate::gpio::{self, PinId};
 use crate::i2c::I2c;
 use crate::pwm::Pwm;
+use crate::spi::Spi;
+use crate::uart::Uart;
 use efr32mg24_pac as pac;
 
 pub const PWRON_RESET: i64 = 1;
@@ -125,6 +126,14 @@ const FUNCTIONS: &[HwFn] = &[
     ),
     HwFn::new("wdt_feed", "", "Feed the watchdog"),
     HwFn::new("wdt_disable", "", "Turn the watchdog off"),
+    HwFn::with_args("uart_init", 2, 3, "tx, rx, [baud]", "UART on these pins (EUSART1, any port; default 115200 baud)"),
+    HwFn::new("uart_write", "data", "Send bytes or a str; returns how many"),
+    HwFn::with_args("uart_read", 0, 2, "[n], [timeout_ms]", "Up to n received bytes (default 64), waiting up to timeout_ms").returning_bytes(),
+    HwFn::new("uart_any", "", "Number of received bytes waiting"),
+    HwFn::with_args("spi_init", 3, 5, "sck, mosi, miso, [khz], [mode]", "SPI main (EUSART0, ports A/B: D8 SCK, D10 MOSI, D9 MISO; default 1000 kHz, mode 0); CS: any pin_write"),
+    HwFn::new("spi_write", "data", "Send bytes"),
+    HwFn::new("spi_transfer", "data", "Send bytes, return the bytes received meanwhile").returning_bytes(),
+    HwFn::with_args("spi_read", 1, 2, "n, [fill]", "Receive n bytes (sending fill, default 0)").returning_bytes(),
     HwFn::new("reset", "", "Restart the board"),
     HwFn::new(
         "reset_cause",
@@ -263,6 +272,8 @@ pub struct Board {
     /// Set up on first use (its start measures AVDD)
     adc: Option<Adc>,
     pwm: Pwm,
+    uart: Option<Uart>,
+    spi: Option<Spi>,
     events: Events,
     /// A script enabled the watchdog: sleeps feed it (as on the ESP32 boards)
     wdt_on: bool,
@@ -295,6 +306,8 @@ impl Board {
             i2c: None,
             adc: None,
             pwm: Pwm::new(mg24_hal::clock::sysclk_hz()),
+            uart: None,
+            spi: None,
             events: Events::new(),
             wdt_on: false,
         }
@@ -489,6 +502,50 @@ impl HardwareBridge for Board {
                 self.pwm.stop(pin(int(0)?)?);
                 Ok(None)
             }
+            "uart_init" => {
+                let (tx, rx) = (pin(int(0)?)?, pin(int(1)?)?);
+                let baud = match args.get(2) {
+                    Some(b) => u32::try_from(b.int()?).map_err(|_| Error::ValueError)?,
+                    None => 115_200,
+                };
+                self.uart = Some(Uart::init(tx, rx, baud, mg24_hal::clock::sysclk_hz())?);
+                Ok(None)
+            }
+            "uart_write" => {
+                let data = args[0].bytes()?;
+                self.uart.as_mut().ok_or(Error::IoError)?.write(data);
+                Ok(Some(data.len() as i64))
+            }
+            "uart_any" => Ok(Some(self.uart.as_ref().ok_or(Error::IoError)?.any() as i64)),
+            "spi_init" => {
+                let (sck, mosi, miso) = (pin(int(0)?)?, pin(int(1)?)?, pin(int(2)?)?);
+                let khz = match args.get(3) {
+                    Some(k) => u32::try_from(k.int()?).map_err(|_| Error::ValueError)?,
+                    None => 1000,
+                };
+                let mode = match args.get(4) {
+                    Some(m) => u8::try_from(m.int()?).map_err(|_| Error::ValueError)?,
+                    None => 0,
+                };
+                self.spi = Some(Spi::init(
+                    sck,
+                    mosi,
+                    miso,
+                    khz,
+                    mode,
+                    mg24_hal::clock::sysclk_hz(),
+                )?);
+                Ok(None)
+            }
+            "spi_write" => {
+                let spi = self.spi.as_mut().ok_or(Error::IoError)?;
+                let mut chunk = [0u8; 64];
+                for part in args[0].bytes()?.chunks(chunk.len()) {
+                    chunk[..part.len()].copy_from_slice(part);
+                    spi.transfer(&mut chunk[..part.len()])?;
+                }
+                Ok(None)
+            }
             "pin_irq" => {
                 let id = pin(int(0)?)?;
                 self.events.pin_irq(id, int(1)?).map(|()| None)
@@ -567,6 +624,51 @@ impl HardwareBridge for Board {
             "unique_id" => {
                 out[..8].copy_from_slice(&eui64());
                 Ok(8)
+            }
+            "uart_read" => {
+                let n = match args.first() {
+                    Some(n) => (non_negative(n.int()?)? as usize).min(out.len()),
+                    None => 64,
+                };
+                let timeout = match args.get(1) {
+                    Some(t) => non_negative(t.int()?)? as u64,
+                    None => 0,
+                };
+                let until = clock::now_us() + timeout * 1000;
+                let uart = self.uart.as_mut().ok_or(Error::IoError)?;
+                let mut got = 0;
+                loop {
+                    got += uart.read(&mut out[got..n]);
+                    if got == n || clock::now_us() >= until {
+                        return Ok(got);
+                    }
+                    if micropython_port::ABORT.load(Ordering::Relaxed) {
+                        return Err(Error::Interrupted);
+                    }
+                }
+            }
+            "spi_transfer" => {
+                let data = args[0].bytes()?;
+                let n = data.len().min(out.len());
+                out[..n].copy_from_slice(&data[..n]);
+                self.spi
+                    .as_mut()
+                    .ok_or(Error::IoError)?
+                    .transfer(&mut out[..n])?;
+                Ok(n)
+            }
+            "spi_read" => {
+                let n = (non_negative(int(0)?)? as usize).min(out.len());
+                let fill = match args.get(1) {
+                    Some(f) => byte(f.int()?)?,
+                    None => 0,
+                };
+                out[..n].fill(fill);
+                self.spi
+                    .as_mut()
+                    .ok_or(Error::IoError)?
+                    .transfer(&mut out[..n])?;
+                Ok(n)
             }
             "i2c_scan" => {
                 let bus = self.i2c()?;
