@@ -68,8 +68,7 @@ pub fn discard_through(byte: u8) {
     }
 }
 
-/// Bytes lost to a full ring since boot (for `lscpu`, with `machine`).
-#[allow(dead_code)]
+/// Bytes lost to a full ring since boot (for `lscpu`).
 pub fn dropped() -> usize {
     DROPPED.load(Ordering::Relaxed)
 }

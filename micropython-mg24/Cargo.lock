@@ -104,6 +104,7 @@ name = "micropython-mg24"
 version = "0.1.0"
 dependencies = [
  "efr32mg24-pac",
+ "libm",
  "mg24-hal",
  "micropython-port",
  "micropython-rs",

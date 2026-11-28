@@ -16,6 +16,8 @@ mg24-hal = { version = "=2.0.0", default-features = false }
 # Registers for what mg24-hal doesn't cover (USART0, ...); its
 # critical-section feature off, as mg24-hal has it
 efr32mg24-pac = { version = "=0.1.0", default-features = false }
+# sqrt/sin for the float speed tests (machine.bench)
+libm = "0.2"
 
 [features]
 # The interpreter's level (as in micropython-esp32): full, medium or minimal.

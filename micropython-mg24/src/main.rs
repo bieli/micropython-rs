@@ -6,16 +6,22 @@
 #![no_std]
 #![no_main]
 
+mod bench;
+mod board;
+mod clock;
 mod console;
+mod gpio;
+mod i2c;
 
 use core::mem::MaybeUninit;
 
+use mg24_hal::clock::CpuSpeed;
 use mg24_hal::gpio::{Input, InputConfig, Level, Output as Pin, OutputConfig};
 use mg24_hal::CpuConfig;
 use micropython_port::{BootScript, Memory, Port};
 use micropython_rs::flatfs::RamFlash;
 use micropython_rs::interpreter::FuncDef;
-use micropython_rs::{NoHardware, Output, StmtCache};
+use micropython_rs::{Output, StmtCache};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const COMMIT: &str = env!("MPY_GIT_COMMIT");
@@ -50,7 +56,7 @@ fn take_memory() -> Memory {
             modules: &mut *core::ptr::addr_of_mut!(MODULES),
             stmt_cache: &mut *core::ptr::addr_of_mut!(STMT_CACHE),
             func_slots: &mut *core::ptr::addr_of_mut!(FUNCS),
-            frozen: &[],
+            frozen: board::FROZEN_MODULES,
         }
     }
 }
@@ -70,8 +76,7 @@ fn stack_bottom() -> usize {
     core::ptr::addr_of!(__euninit) as usize
 }
 
-/// The main stack's size in bytes (`lscpu`, with the `machine` module).
-#[allow(dead_code)]
+/// The main stack's size in bytes (`lscpu`).
 pub fn stack_size() -> usize {
     // Only the symbols' addresses are taken
     core::ptr::addr_of!(_stack_start) as usize - stack_bottom()
@@ -145,17 +150,26 @@ fn main() -> ! {
     // SAFETY: the limit is below every frame in use (the statics' end)
     unsafe { core::arch::asm!("msr MSPLIM, {}", in(reg) stack_bottom()) };
 
-    let dp = mg24_hal::init(CpuConfig::default()).unwrap();
-    // The LED (PA7) off, the console's TX (PA8) idle high, RX (PA9) an
-    // input; they stay configured (`run` never returns)
-    let _led = Pin::new(dp.pins.pa7, Level::Low, OutputConfig::default());
+    // 38 MHz from HFRCODPLL: twice the reset clock, and below the 40 MHz
+    // where the flash needs a wait state and the 50 MHz PCLK limit (no
+    // prescalers to change). 78 MHz needs the crystal and the DPLL.
+    let mut config = CpuConfig::new();
+    config.cpu_speed = Some(CpuSpeed::Mhz38);
+    let dp = mg24_hal::init(config).unwrap();
+    // The console's TX (PA8) idle high, RX (PA9) an input; they stay
+    // configured (`run` never returns)
     let _tx = Pin::new(dp.pins.pa8, Level::High, OutputConfig::default());
     let _rx = Input::new(dp.pins.pa9, InputConfig::new());
-    // PCLK is SYSCLK at reset (HFRCODPLL's 19 MHz band, no prescaler)
-    console::init(mg24_hal::clock::sysclk_hz());
+    // PCLK and TIMER0's clock are the CPU clock (no prescalers)
+    let hz = mg24_hal::clock::sysclk_hz();
+    console::init(hz);
+    clock::init(hz);
+    // The orange LED (PA7, lit when low) off
+    let _ = gpio::pin_mode(7, gpio::OUT);
+    gpio::write(gpio::PinId::new(7).unwrap(), true);
 
     let mut out = Console;
-    let mut hw = NoHardware;
+    let mut hw = board::Board::new();
     micropython_port::run::<Mg24Port, _, _, RamFlash<'static>>(
         &mut out,
         &mut hw,
@@ -164,6 +178,31 @@ fn main() -> ! {
         take_memory(),
         None,
     )
+}
+
+/// A fault (a bus fault on a peripheral without its clock, a stack overflow
+/// past MSPLIM, ...) prints what it was on the console, then resets the
+/// chip, instead of the HAL's default handler's silent loop.
+#[unsafe(no_mangle)]
+pub extern "C" fn HardFault() {
+    // SCB.CFSR (configurable fault status) and HFSR (hard fault status)
+    // SAFETY: reads of the System Control Block's fault registers
+    let (cfsr, hfsr) = unsafe {
+        (
+            core::ptr::read_volatile(0xE000_ED28 as *const u32),
+            core::ptr::read_volatile(0xE000_ED2C as *const u32),
+        )
+    };
+    let kind = if cfsr & 0x0010_0000 != 0 {
+        "stack overflow (MSPLIM)"
+    } else if cfsr & 0xFF00 != 0 {
+        "bus fault"
+    } else if cfsr & 0xFF != 0 {
+        "memory fault"
+    } else {
+        "fault"
+    };
+    panic!("{} (CFSR {:#010x}, HFSR {:#010x})", kind, cfsr, hfsr);
 }
 
 /// A panic prints its message on the console, then resets the chip.

@@ -989,11 +989,27 @@ make size                      # flash and RAM use
 ../micropython-esp32/tools/mpy.py run myscript.py   # the same tools as the ESP32 boards (mpy.py, mpremote)
 ```
 
-What works now: the REPL and raw REPL on the USB serial port (USART0 at 115200, bytes received by interrupt,
-Ctrl-C stops a script), 32-bit floats (the FPU's precision; `FLOAT=64` computes in software), a 64 KB heap and
-about 115 KB of stack (a stack overflow faults, MSPLIM, instead of overwriting memory). The chip runs at its reset
-clock, 19 MHz. Next: `machine` and `time` (pins, the LED on PA7, I²C, clock speed), files in flash, ADC/PWM/SPI,
-and the Sense's motion sensor. Not planned: Bluetooth, Thread and Zigbee (they need Silicon Labs' closed C stacks).
+What works now:
+
+* The REPL and raw REPL on the USB serial port (USART0 at 115200, bytes received by interrupt, Ctrl-C stops a
+  script or a sleep), 32-bit floats (the FPU's precision; `FLOAT=64` computes in software), a 64 KB heap and about
+  115 KB of stack (a stack overflow faults, MSPLIM, instead of overwriting memory; a fault prints what it was).
+* `machine` and `time`: the same functions and frozen modules as the ESP32 boards, so scripts move between them:
+  `Pin` (in, out, pull-up/-down, open drain), `I2C` on any two free pins (I2C1, 10-400 kHz), `RTC`,
+  `time.ticks_*`/`sleep*`/`time()`/`gmtime()`/`mktime()`, `unique_id()` (the chip's EUI-64), `reset()`,
+  `reset_cause()`, `freq()`, `lscpu()`, `bench()`.
+* Pins are `port * 16 + pin` (PA0 = 0, PB0 = 16, PC0 = 32, PD0 = 48), and the XIAO's labels are constants: `D0`-`D18`,
+  `LED` (PA7, the orange LED, lit when low). Refused with `ValueError`: the debugger's SWD pins (PA1, PA2), the external
+  flash's chip select (PA6), the console (PA8/PA9, shared with the D12/D11 pads), the antenna switch (PB4, PB5) and
+  battery control/sense (PD3, PD4). `machine.I2C()` without pins uses D4 (SDA) and D5 (SCL).
+* The CPU runs at 38 MHz from its RC oscillator (factory-calibrated: the clock was 0.2 % fast against a PC). 78 MHz
+  needs the 39 MHz crystal and the DPLL (next), as do accurate clocks.
+
+`machine.bench()` at 38 MHz: 27.6 M i32 adds/s, 19 M f32 multiplies/s (hardware FPU), 0.29 M f64 multiplies/s
+(software), 63 MiB/s RAM writes, 6.2 M GPIO toggles/s; Python for loops 5.4 k/s.
+
+Next: files in flash, ADC/PWM/UART/SPI/watchdog/pin interrupts, the crystal at 78 MHz, and the Sense's motion sensor.
+Not planned: Bluetooth, Thread and Zigbee (they need Silicon Labs' closed C stacks).
 
 #### ESP32-S3 and ESP32-C3 (`CHIP=esp32s3`, `CHIP=esp32c3`)
 
