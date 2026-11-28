@@ -10,6 +10,7 @@ mod bench;
 mod board;
 mod clock;
 mod console;
+mod events;
 mod gpio;
 mod i2c;
 mod storage;

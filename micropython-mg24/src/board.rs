@@ -2,14 +2,15 @@
 //! arguments and constants as micropython-esp32's (pin_mode, pin_write,
 //! i2c_read, sleep_ms, cpu_info, ...), so the frozen `machine` and `time`
 //! modules from micropython-esp32/modules run unchanged and scripts move
-//! between the boards. ADC, PWM, UART, SPI, the watchdog and pin interrupts
-//! come later; until then those `machine` classes raise NameError.
+//! between the boards. ADC, PWM, UART and SPI come later; until then those
+//! `machine` classes raise NameError.
 
 use core::sync::atomic::Ordering;
 
 use micropython_rs::{Arg, Error, HardwareBridge, HwFn, Module, Returns};
 
 use crate::clock;
+use crate::events::{self, Events};
 use crate::gpio::{self, PinId};
 use crate::i2c::I2c;
 use efr32mg24_pac as pac;
@@ -76,6 +77,24 @@ const FUNCTIONS: &[HwFn] = &[
         "addr, reg, value",
         "Write one register byte",
     ),
+    HwFn::new(
+        "pin_irq",
+        "pin, trigger",
+        "Pin interrupt events: 1 rising, 2 falling, 3 both, 0 off (use Pin.irq)",
+    ),
+    HwFn::new(
+        "timer_init",
+        "id, period_us, periodic",
+        "Timer events (use machine.Timer)",
+    ),
+    HwFn::new("timer_deinit", "id", "Stop a timer"),
+    HwFn::new(
+        "wdt_enable",
+        "timeout_ms",
+        "Reset the board unless fed in time (up to 262 s)",
+    ),
+    HwFn::new("wdt_feed", "", "Feed the watchdog"),
+    HwFn::new("wdt_disable", "", "Turn the watchdog off"),
     HwFn::new("reset", "", "Restart the board"),
     HwFn::new(
         "reset_cause",
@@ -211,6 +230,9 @@ pub struct Board {
     /// Why the chip started (`reset_cause()`): read from EMU at boot.
     reset_cause: i64,
     i2c: Option<I2c>,
+    events: Events,
+    /// A script enabled the watchdog: sleeps feed it (as on the ESP32 boards)
+    wdt_on: bool,
 }
 
 impl Board {
@@ -238,19 +260,37 @@ impl Board {
         Self {
             reset_cause,
             i2c: None,
+            events: Events::new(),
+            wdt_on: false,
         }
     }
 
-    /// Busy-waits `ms`; Ctrl-C on the console stops it.
     fn sleep_ms(&mut self, ms: i64) -> Result<(), Error> {
-        let us = non_negative(ms)?.saturating_mul(1000) as u64;
+        self.sleep_for_us(non_negative(ms)?.saturating_mul(1000) as u64)
+    }
+
+    /// Busy-waits `us`: Ctrl-C on the console stops it, an event that's due
+    /// (a pin interrupt, a timer) stops it with `Error::Pending` (the
+    /// interpreter runs the callback and resumes the sleep), and it feeds
+    /// the watchdog, so a long sleep doesn't trip it.
+    fn sleep_for_us(&mut self, us: u64) -> Result<(), Error> {
         let until = clock::now_us().saturating_add(us);
-        while clock::now_us() < until {
+        loop {
             if micropython_port::ABORT.load(Ordering::Relaxed) {
                 return Err(Error::Interrupted);
             }
+            let now = clock::now_us();
+            if now >= until {
+                return Ok(());
+            }
+            if self.events.on && self.events.waiting(now) {
+                let left_ms = (until - now).div_ceil(1000);
+                return Err(Error::Pending(left_ms.min(u32::MAX as u64) as u32));
+            }
+            if self.wdt_on {
+                watchdog::feed();
+            }
         }
-        Ok(())
     }
 
     /// The I2C bus, on the default pins at 100 kHz unless `i2c_init` chose.
@@ -373,6 +413,38 @@ impl HardwareBridge for Board {
             "i2c_write_reg" => {
                 let (addr, reg, value) = (i2c_addr(int(0)?)?, byte(int(1)?)?, byte(int(2)?)?);
                 self.i2c()?.write(addr, &[reg, value])?;
+                Ok(None)
+            }
+            "pin_irq" => {
+                let id = pin(int(0)?)?;
+                self.events.pin_irq(id, int(1)?).map(|()| None)
+            }
+            "timer_init" => {
+                let slot = events::timer_slot(int(0)?)?;
+                let period = u64::try_from(int(1)?).map_err(|_| Error::ValueError)?;
+                if period == 0 {
+                    return Err(Error::ValueError);
+                }
+                self.events
+                    .start_timer(slot, period, int(2)? != 0, clock::now_us());
+                Ok(None)
+            }
+            "timer_deinit" => {
+                self.events.stop_timer(events::timer_slot(int(0)?)?);
+                Ok(None)
+            }
+            "wdt_enable" => {
+                watchdog::enable(non_negative(int(0)?)?)?;
+                self.wdt_on = true;
+                Ok(None)
+            }
+            "wdt_feed" => {
+                watchdog::feed();
+                Ok(None)
+            }
+            "wdt_disable" => {
+                watchdog::disable();
+                self.wdt_on = false;
                 Ok(None)
             }
             "reset" => {
@@ -510,6 +582,24 @@ impl HardwareBridge for Board {
         }
     }
 
+    fn poll_event(&mut self) -> Option<i64> {
+        self.events.poll(clock::now_us())
+    }
+
+    fn set_events(&mut self, on: bool) {
+        self.events.on = on;
+    }
+
+    fn resume_sleep(&mut self, remaining_ms: u32) -> Result<(), Error> {
+        self.sleep_for_us(remaining_ms as u64 * 1000)
+    }
+
+    /// A soft reset: no more pin interrupts and timers from the last session.
+    fn soft_reset(&mut self) {
+        self.events.reset();
+        self.events.on = false;
+    }
+
     fn functions(&self) -> &[HwFn] {
         FUNCTIONS
     }
@@ -639,5 +729,67 @@ impl<const N: usize> core::fmt::Write for Text<N> {
             .copy_from_slice(s.as_bytes());
         self.len = end;
         Ok(())
+    }
+}
+
+/// WDOG0: resets the chip unless fed in time. Its clock is the 32 kHz RC
+/// oscillator for timeouts up to 8 s, the 1 kHz one beyond (up to 262 s);
+/// the period is 2^(n + 3) of its cycles, the shortest that covers the
+/// timeout (so it may be up to twice as long, as MicroPython allows).
+mod watchdog {
+    use efr32mg24_pac as pac;
+    use micropython_rs::Error;
+
+    fn wdog() -> &'static pac::wdog0_s::RegisterBlock {
+        // SAFETY: WDOG0's registers; only this module uses them
+        unsafe { &*pac::Wdog0S::ptr() }
+    }
+
+    fn wait_sync() {
+        while wdog().syncbusy().read().bits() != 0 {}
+    }
+
+    pub fn enable(timeout_ms: i64) -> Result<(), Error> {
+        let (clksel, hz) = if timeout_ms <= 8_000 {
+            (1u8, 32_768u64)
+        } else {
+            (3u8, 1_000u64)
+        };
+        let cycles = (timeout_ms as u64 * hz).div_ceil(1000).max(1);
+        // The smallest PERSEL (0-15) with 2^(PERSEL + 3) cycles >= the timeout
+        let persel = (0..16u32)
+            .find(|n| 1u64 << (n + 3) >= cycles)
+            .ok_or(Error::ValueError)?;
+        // SAFETY: CMU's clock enable and WDOG0's clock select, then WDOG0;
+        // CFG can only be written while it's disabled
+        unsafe {
+            let cmu = &*pac::CmuS::ptr();
+            cmu.clken0().modify(|_, w| w.wdog0().set_bit());
+            disable();
+            cmu.wdog0clkctrl().write(|w| w.bits(clksel as u32));
+            wdog().cfg().write(|w| w.persel().bits(persel as u8));
+            wdog().en().write(|w| w.en().set_bit());
+        }
+        feed();
+        Ok(())
+    }
+
+    pub fn feed() {
+        wait_sync();
+        wdog().cmd().write(|w| w.clear().set_bit());
+    }
+
+    pub fn disable() {
+        // SAFETY: CMU's WDOG0 bus clock (it may not be on yet)
+        unsafe {
+            (&*pac::CmuS::ptr())
+                .clken0()
+                .modify(|_, w| w.wdog0().set_bit())
+        };
+        wait_sync();
+        wdog().en().write(|w| w.en().clear_bit());
+        // Disabling takes a few of its clock cycles (EN's DISABLING bit);
+        // CFG can't be written before it's done (a bus fault)
+        while wdog().en().read().bits() & 0b10 != 0 {}
     }
 }

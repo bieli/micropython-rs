@@ -997,7 +997,8 @@ What works now:
 * `machine` and `time`: the same functions and frozen modules as the ESP32 boards, so scripts move between them:
   `Pin` (in, out, pull-up/-down, open drain), `I2C` on any two free pins (I2C1, 10-400 kHz), `RTC`,
   `time.ticks_*`/`sleep*`/`time()`/`gmtime()`/`mktime()`, `unique_id()` (the chip's EUI-64), `reset()`,
-  `reset_cause()`, `freq()`, `lscpu()`, `bench()`.
+  `reset_cause()`, `freq()`, `lscpu()`, `bench()`, `Pin.irq()` (12 lines: pin number `n` uses line `n`, so PA3
+  and PC3 can't both have one), `Timer` (ids 0-3 and -1) and `WDT` (up to 262 s; sleeps feed it).
 * Pins are `port * 16 + pin` (PA0 = 0, PB0 = 16, PC0 = 32, PD0 = 48), and the XIAO's labels are constants: `D0`-`D18`,
   `LED` (PA7, the orange LED, lit when low). Refused with `ValueError`: the debugger's SWD pins (PA1, PA2), the external
   flash's chip select (PA6), the console (PA8/PA9, shared with the D12/D11 pads), the antenna switch (PB4, PB5) and
@@ -1014,7 +1015,7 @@ What works now:
 `machine.bench()` at 38 MHz: 27.6 M i32 adds/s, 19 M f32 multiplies/s (hardware FPU), 0.29 M f64 multiplies/s
 (software), 63 MiB/s RAM writes, 6.2 M GPIO toggles/s; Python for loops 5.4 k/s.
 
-Next: ADC/PWM/UART/SPI/watchdog/pin interrupts, the crystal at 78 MHz, and the Sense's motion sensor.
+Next: ADC, PWM, UART and SPI, the crystal at 78 MHz, and the Sense's motion sensor.
 Not planned: Bluetooth, Thread and Zigbee (they need Silicon Labs' closed C stacks).
 
 #### ESP32-S3 and ESP32-C3 (`CHIP=esp32s3`, `CHIP=esp32c3`)
